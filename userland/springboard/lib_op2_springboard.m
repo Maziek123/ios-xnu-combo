@@ -7,6 +7,7 @@
 #include <pthread.h>
 #include <fcntl.h>
 #include <objc/runtime.h>
+#include <objc/message.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <dlfcn.h>
 #include <spawn.h>
@@ -23,7 +24,7 @@
 
 static int g_log_fd = -1;
 
-static void sb_log(const char *fmt, ...) {
+void sb_log(const char *fmt, ...) {
     if (g_log_fd < 0) {
         g_log_fd = open("/tmp/sb_agent.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
     }
@@ -247,6 +248,201 @@ static void swizzled_launchIcon(id self, SEL _cmd, id icon, long long loc, id ct
     }
 }
 
+@interface UITouch (OP2Private)
+- (CGPoint)_locationInSceneReferenceSpace;
+- (void)_setLocationInWindow:(CGPoint)loc resetPrevious:(BOOL)reset;
+- (void)setWindow:(UIWindow *)window;
+- (void)setView:(UIView *)view;
+@end
+
+#import "../games/2048/GameViewController.h"
+static UIWindow *g_gameWindow = nil;
+static GameViewController *g_gameVC = nil;
+static void apply_homescreen_layout(void);
+
+static UIWindow *get_homescreen_window(void) {
+    for (UIWindow *w in [[UIApplication sharedApplication] windows]) {
+        if ([NSStringFromClass([w class]) isEqualToString:@"SBHomeScreenWindow"]) {
+            return w;
+        }
+    }
+    Class uic = objc_getClass("SBUIController");
+    if (uic) {
+        id ctrl = [uic performSelector:@selector(sharedInstance)];
+        if (ctrl && [ctrl respondsToSelector:@selector(window)]) {
+            UIWindow *w = [ctrl performSelector:@selector(window)];
+            if (w) return w;
+        }
+    }
+    UIWindow *kw = [[UIApplication sharedApplication] keyWindow];
+    if (kw) return kw;
+    NSArray *wins = [[UIApplication sharedApplication] windows];
+    if ([wins count] > 0) return wins[0];
+    return nil;
+}
+
+typedef void *IOHIDEventRef;
+static double (*p_IOHIDEventGetFloatValue)(IOHIDEventRef, uint32_t) = NULL;
+static CFArrayRef (*p_IOHIDEventGetChildren)(IOHIDEventRef) = NULL;
+static uint32_t (*p_IOHIDEventGetType)(IOHIDEventRef) = NULL;
+
+static CGPoint extract_point_from_hid(IOHIDEventRef hid) {
+    if (!hid) return CGPointZero;
+    if (!p_IOHIDEventGetFloatValue) {
+        p_IOHIDEventGetFloatValue = (double (*)(IOHIDEventRef, uint32_t))dlsym(RTLD_DEFAULT, "IOHIDEventGetFloatValue");
+        p_IOHIDEventGetChildren = (CFArrayRef (*)(IOHIDEventRef))dlsym(RTLD_DEFAULT, "IOHIDEventGetChildren");
+        p_IOHIDEventGetType = (uint32_t (*)(IOHIDEventRef))dlsym(RTLD_DEFAULT, "IOHIDEventGetType");
+    }
+    if (!p_IOHIDEventGetFloatValue) return CGPointZero;
+
+    double x = p_IOHIDEventGetFloatValue(hid, 0x000B0000);
+    double y = p_IOHIDEventGetFloatValue(hid, 0x000B0001);
+
+    if (x == 0.0 && y == 0.0 && p_IOHIDEventGetChildren) {
+        CFArrayRef children = p_IOHIDEventGetChildren(hid);
+        if (children) {
+            CFIndex count = CFArrayGetCount(children);
+            for (CFIndex i = 0; i < count; i++) {
+                IOHIDEventRef child = (IOHIDEventRef)CFArrayGetValueAtIndex(children, i);
+                double cx = p_IOHIDEventGetFloatValue(child, 0x000B0000);
+                double cy = p_IOHIDEventGetFloatValue(child, 0x000B0001);
+                if (cx != 0.0 || cy != 0.0) {
+                    x = cx;
+                    y = cy;
+                    break;
+                }
+            }
+        }
+    }
+    return CGPointMake(x, y);
+}
+
+static void (*orig_sendEvent)(id self, SEL _cmd, UIEvent *event) = NULL;
+static void swizzled_sendEvent(id self, SEL _cmd, UIEvent *event) {
+    if (event.type == UIEventTypeTouches) {
+        NSSet *touches = [event allTouches];
+        UIWindow *homeWin = get_homescreen_window();
+        CGFloat scale = [[UIScreen mainScreen] scale];
+        if (scale <= 0) scale = 3.0;
+
+        for (UITouch *t in touches) {
+            CGPoint *pLoc = (CGPoint *)((char *)(__bridge void *)t + 96);
+            CGPoint pt = *pLoc;
+
+            IOHIDEventRef tHid = *(void **)((char *)(__bridge void *)t + 256);
+            IOHIDEventRef evHid = NULL;
+            if ([event respondsToSelector:@selector(_hidEvent)]) {
+                evHid = ((IOHIDEventRef (*)(id, SEL))objc_msgSend)(event, sel_registerName("_hidEvent"));
+            }
+
+            CGPoint ptFromTHid = tHid ? extract_point_from_hid(tHid) : CGPointZero;
+            CGPoint ptFromEvHid = evHid ? extract_point_from_hid(evHid) : CGPointZero;
+            sb_log("[OP2SB] tHid=%p (%.2f, %.2f) evHid=%p (%.2f, %.2f) *pLoc=(%.2f, %.2f)\n",
+                   tHid, ptFromTHid.x, ptFromTHid.y, evHid, ptFromEvHid.x, ptFromEvHid.y, pLoc->x, pLoc->y);
+
+            CGPoint hidPt = (ptFromTHid.x != 0 || ptFromTHid.y != 0) ? ptFromTHid : ptFromEvHid;
+
+            sb_log("[OP2SB] Touch raw: phase=%ld *pLoc=(%.1f, %.1f) hidPt=(%.3f, %.3f)\n",
+                   (long)t.phase, pt.x, pt.y, hidPt.x, hidPt.y);
+
+            if (hidPt.x != 0 || hidPt.y != 0) {
+                // IOHIDEvent coordinates from backboardd are in Retina display pixels (1242x2208)
+                pt.x = hidPt.x / scale;
+                pt.y = hidPt.y / scale;
+            } else if (pt.x == 0 && pt.y == 0 && [t respondsToSelector:@selector(_locationInSceneReferenceSpace)]) {
+                pt = [t _locationInSceneReferenceSpace];
+                if (pt.x > 414.0 || pt.y > 736.0) {
+                    pt.x /= scale;
+                    pt.y /= scale;
+                }
+            } else if (pt.x > 414.0 || pt.y > 736.0) {
+                pt.x /= scale;
+                pt.y /= scale;
+            }
+
+            UIWindow *targetWin = nil;
+            if (g_gameVC && g_gameVC.view && !g_gameVC.view.hidden) {
+                targetWin = homeWin;
+                [t setWindow:homeWin];
+            } else {
+                if (t.window == nil && homeWin != nil) {
+                    [t setWindow:homeWin];
+                }
+                targetWin = t.window ? t.window : homeWin;
+            }
+
+            *pLoc = pt;
+            CGPoint *pPrecise = (CGPoint *)((char *)(__bridge void *)t + 128);
+            *pPrecise = pt;
+
+            if ([t respondsToSelector:@selector(_setLocationInWindow:resetPrevious:)]) {
+                ((void (*)(id, SEL, CGPoint, BOOL))objc_msgSend)(t, sel_registerName("_setLocationInWindow:resetPrevious:"), pt, (t.phase == UITouchPhaseBegan));
+            }
+
+            UIView *hitView = nil;
+            if (targetWin) {
+                hitView = [targetWin hitTest:pt withEvent:event];
+                if (hitView) {
+                    [t setView:hitView];
+                    if ([hitView isKindOfClass:[UIButton class]]) {
+                        UIButton *b = (UIButton *)hitView;
+                        sb_log("[OP2SB] Hit UIButton: '%s' (enabled=%d)\n",
+                               b.currentTitle ? [b.currentTitle UTF8String] : "", b.enabled);
+                        if (t.phase == UITouchPhaseEnded) {
+                            dispatch_async(dispatch_get_main_queue(), ^{
+                                [b sendActionsForControlEvents:UIControlEventTouchUpInside];
+                            });
+                        }
+                    }
+                }
+            }
+
+            if (targetWin && [event respondsToSelector:@selector(_addTouch:forDelayedDelivery:)]) {
+                NSSet *tw = nil;
+                if ([event respondsToSelector:@selector(touchesForWindow:)]) {
+                    tw = ((id (*)(id, SEL, id))objc_msgSend)(event, sel_registerName("touchesForWindow:"), targetWin);
+                }
+                if (!tw || [tw count] == 0) {
+                    ((void (*)(id, SEL, id, BOOL))objc_msgSend)(event, sel_registerName("_addTouch:forDelayedDelivery:"), t, NO);
+                    sb_log("[OP2SB] Registered touch with _addTouch:forDelayedDelivery:NO (phase=%ld)\n", (long)t.phase);
+                }
+            }
+
+            sb_log("[OP2SB] Touch: phase=%ld pt=(%.1f, %.1f) -> win=%s view=%s\n",
+                (long)t.phase, pt.x, pt.y,
+                targetWin ? object_getClassName(targetWin) : "nil",
+                hitView ? object_getClassName(hitView) : (t.view ? object_getClassName(t.view) : "nil"));
+        }
+
+        if ([event respondsToSelector:@selector(_windows)]) {
+            NSArray *wins = [((id (*)(id, SEL))objc_msgSend)(event, sel_registerName("_windows")) allObjects];
+            sb_log("[OP2SB] event _windows count: %lu (%s)\n", (unsigned long)[wins count],
+                   wins.description ? [wins.description UTF8String] : "nil");
+        }
+        if (homeWin && [event respondsToSelector:@selector(touchesForWindow:)]) {
+            NSSet *tw = ((id (*)(id, SEL, id))objc_msgSend)(event, sel_registerName("touchesForWindow:"), homeWin);
+            sb_log("[OP2SB] event touchesForWindow count: %lu\n", (unsigned long)[tw count]);
+
+            CFDictionaryRef dict = *(CFDictionaryRef *)((char *)(__bridge void *)event + 72);
+            if (dict) {
+                CFIndex count = CFDictionaryGetCount(dict);
+                sb_log("[OP2SB] _keyedTouchesByWindow count: %td\n", count);
+                const void *keys[16] = {0};
+                const void *values[16] = {0};
+                if (count > 16) count = 16;
+                CFDictionaryGetKeysAndValues(dict, keys, values);
+                for (CFIndex i = 0; i < count; i++) {
+                    id k = (__bridge id)keys[i];
+                    sb_log("   key[%td]: %s (%p)\n", i, k ? object_getClassName(k) : "nil", keys[i]);
+                }
+            }
+        }
+    }
+    if (orig_sendEvent) {
+        orig_sendEvent(self, _cmd, event);
+    }
+}
+
 static void install_swizzles(void) {
     dlopen("/System/Library/PrivateFrameworks/Celestial.framework/Celestial", RTLD_NOW);
     Class avsCls = objc_getClass("AVSystemController");
@@ -326,58 +522,86 @@ static void install_swizzles(void) {
             sb_log("[OP2SB] Swizzled -[SBUIController launchIcon:fromLocation:context:activationSettings:actions:]\n");
         }
     }
+
+    Class appCls = [UIApplication class];
+    Method mSend = class_getInstanceMethod(appCls, @selector(sendEvent:));
+    if (mSend) {
+        orig_sendEvent = (void (*)(id, SEL, id))method_getImplementation(mSend);
+        method_setImplementation(mSend, (IMP)swizzled_sendEvent);
+        sb_log("[OP2SB] Swizzled -[UIApplication sendEvent:]\n");
+    }
 }
 
-#import "../games/2048/GameViewController.h"
-
-static UIWindow *g_gameWindow = nil;
-static GameViewController *g_gameVC = nil;
-static void apply_homescreen_layout(void);
-
 static void show_game_window(void) {
-    if (!g_gameWindow) {
-        CGRect screenBounds = [[UIScreen mainScreen] bounds];
-        if (screenBounds.size.width <= 0) screenBounds = CGRectMake(0, 0, 414, 736);
-        g_gameWindow = [[UIWindow alloc] initWithFrame:screenBounds];
-        g_gameWindow.windowLevel = 2100.0;
-        g_gameWindow.opaque = YES;
-        g_gameWindow.backgroundColor = [UIColor colorWithRed:0.980 green:0.973 blue:0.937 alpha:1.0];
+    sb_log("[OP2SB] show_game_window executing\n");
+    UIWindow *homeWin = get_homescreen_window();
+    if (!homeWin) {
+        sb_log("[OP2SB] Error: target window not found!\n");
+        return;
+    }
+    sb_log("[OP2SB] Target window: %s (bounds: [%.1f, %.1f, %.1f, %.1f])\n",
+        object_getClassName(homeWin), homeWin.bounds.origin.x, homeWin.bounds.origin.y,
+        homeWin.bounds.size.width, homeWin.bounds.size.height);
+
+    CGRect bounds = homeWin.bounds;
+    if (bounds.size.width <= 0) bounds = CGRectMake(0, 0, 414, 736);
+
+    if (!g_gameVC) {
         g_gameVC = [[GameViewController alloc] init];
-        __weak UIWindow *weakWin = g_gameWindow;
+        g_gameVC.view.frame = bounds;
+        g_gameVC.view.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
         g_gameVC.onExitBlock = ^{
             sb_log("[OP2SB] onExitBlock triggered\n");
             dispatch_async(dispatch_get_main_queue(), ^{
-                if (weakWin) {
-                    weakWin.hidden = YES;
-                    weakWin.alpha = 0.0;
+                if (g_gameVC && g_gameVC.view) {
+                    g_gameVC.view.hidden = YES;
                     [CATransaction flush];
                 }
+                UIWindow *hw = get_homescreen_window();
+                if (hw) hw.windowLevel = 100.0;
                 apply_homescreen_layout();
             });
         };
-        g_gameWindow.rootViewController = g_gameVC;
     }
-    g_gameWindow.hidden = NO;
-    g_gameWindow.alpha = 1.0;
-    [g_gameWindow makeKeyAndVisible];
-    [g_gameWindow.layer setNeedsDisplay];
-    [g_gameWindow.layer setNeedsLayout];
-    [g_gameWindow layoutIfNeeded];
-    [CATransaction commit];
-    [CATransaction flush];
-    sb_log("[OP2SB] Game window shown and made key! (frame: [%.1f, %.1f, %.1f, %.1f])\n",
-        g_gameWindow.frame.origin.x, g_gameWindow.frame.origin.y,
-        g_gameWindow.frame.size.width, g_gameWindow.frame.size.height);
-}
 
-static void hide_game_window(void) {
+    homeWin.windowLevel = 2100.0;
+    if (g_gameVC.view.superview != homeWin) {
+        [homeWin addSubview:g_gameVC.view];
+    }
+    [homeWin bringSubviewToFront:g_gameVC.view];
+    g_gameVC.view.frame = bounds;
+    g_gameVC.view.hidden = NO;
+    g_gameVC.view.alpha = 1.0;
+    g_gameVC.view.userInteractionEnabled = YES;
+
     if (g_gameWindow) {
         g_gameWindow.hidden = YES;
         g_gameWindow.alpha = 0.0;
-        [CATransaction commit];
-        [CATransaction flush];
-        sb_log("[OP2SB] Game window hidden\n");
     }
+
+    [homeWin.layer setNeedsDisplay];
+    [homeWin.layer setNeedsLayout];
+    [homeWin layoutIfNeeded];
+    [CATransaction commit];
+    [CATransaction flush];
+    sb_log("[OP2SB] Game view attached to %s and brought to front! (bounds: [%.1f, %.1f, %.1f, %.1f])\n",
+        object_getClassName(homeWin), bounds.origin.x, bounds.origin.y, bounds.size.width, bounds.size.height);
+}
+
+static void hide_game_window(void) {
+    if (g_gameVC && g_gameVC.view) {
+        g_gameVC.view.hidden = YES;
+        g_gameVC.view.alpha = 0.0;
+    }
+    UIWindow *hw = get_homescreen_window();
+    if (hw) hw.windowLevel = 100.0;
+    if (g_gameWindow) {
+        g_gameWindow.hidden = YES;
+        g_gameWindow.alpha = 0.0;
+    }
+    [CATransaction commit];
+    [CATransaction flush];
+    sb_log("[OP2SB] Game view hidden\n");
 }
 
 static void apply_homescreen_layout(void) {

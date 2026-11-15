@@ -1,5 +1,7 @@
 #import "GameViewController.h"
 
+extern void sb_log(const char *fmt, ...);
+
 #define GRID_SIZE 4
 
 @interface GameViewController () {
@@ -108,7 +110,7 @@
     [closeBtn setTitle:@"Exit" forState:UIControlStateNormal];
     [closeBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     closeBtn.titleLabel.font = [UIFont boldSystemFontOfSize:14];
-    [closeBtn addTarget:self action:@selector(actionExit) forControlEvents:UIControlEventTouchUpInside];
+    [closeBtn addTarget:self action:@selector(actionExit) forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchDown];
     [self.view addSubview:closeBtn];
 
     /* New Game Button */
@@ -119,7 +121,7 @@
     [newGameBtn setTitle:@"New Game" forState:UIControlStateNormal];
     [newGameBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     newGameBtn.titleLabel.font = [UIFont boldSystemFontOfSize:14];
-    [newGameBtn addTarget:self action:@selector(startNewGame) forControlEvents:UIControlEventTouchUpInside];
+    [newGameBtn addTarget:self action:@selector(startNewGame) forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchDown];
     [self.view addSubview:newGameBtn];
 
     /* Board Container */
@@ -199,7 +201,7 @@
     [btn setTitle:title forState:UIControlStateNormal];
     [btn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     btn.titleLabel.font = [UIFont boldSystemFontOfSize:22];
-    [btn addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
+    [btn addTarget:self action:action forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchDown];
     return btn;
 }
 
@@ -222,6 +224,7 @@
 }
 
 - (void)startNewGame {
+    sb_log("[OP2Game] startNewGame called!\n");
     memset(board, 0, sizeof(board));
     score = 0;
     scoreLabel.text = @"0";
@@ -294,7 +297,22 @@
 
 #pragma mark - Movement Logic
 
+- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    UITouch *t = [touches anyObject];
+    CGPoint pt = [t locationInView:self.view];
+    sb_log("[OP2Game] touchesBegan at (%.1f, %.1f)\n", pt.x, pt.y);
+    [super touchesBegan:touches withEvent:event];
+}
+
+- (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    UITouch *t = [touches anyObject];
+    CGPoint pt = [t locationInView:self.view];
+    sb_log("[OP2Game] touchesEnded at (%.1f, %.1f)\n", pt.x, pt.y);
+    [super touchesEnded:touches withEvent:event];
+}
+
 - (void)actionExit {
+    sb_log("[OP2Game] Exit button tapped!\n");
     if (self.onExitBlock) {
         self.onExitBlock();
     } else {
@@ -303,6 +321,7 @@
 }
 
 - (void)actionLeft {
+    sb_log("[OP2Game] actionLeft triggered!\n");
     if ([self moveLeft]) {
         [self spawnRandomTile];
         [self renderBoard];
@@ -310,6 +329,7 @@
 }
 
 - (void)actionRight {
+    sb_log("[OP2Game] actionRight triggered!\n");
     if ([self moveRight]) {
         [self spawnRandomTile];
         [self renderBoard];
@@ -317,6 +337,7 @@
 }
 
 - (void)actionUp {
+    sb_log("[OP2Game] actionUp triggered!\n");
     if ([self moveUp]) {
         [self spawnRandomTile];
         [self renderBoard];
@@ -324,6 +345,7 @@
 }
 
 - (void)actionDown {
+    sb_log("[OP2Game] actionDown triggered!\n");
     if ([self moveDown]) {
         [self spawnRandomTile];
         [self renderBoard];
