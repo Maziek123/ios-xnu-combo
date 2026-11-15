@@ -100,6 +100,17 @@
     scoreLabel.textAlignment = NSTextAlignmentCenter;
     [scoreBox addSubview:scoreLabel];
 
+    /* Exit / Home Button */
+    UIButton *closeBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+    closeBtn.frame = CGRectMake(margin, topY + 54, 85, 34);
+    closeBtn.backgroundColor = [UIColor colorWithRed:0.85 green:0.25 blue:0.20 alpha:1.0]; /* Red #D94033 */
+    closeBtn.layer.cornerRadius = 6.0;
+    [closeBtn setTitle:@"Exit" forState:UIControlStateNormal];
+    [closeBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    closeBtn.titleLabel.font = [UIFont boldSystemFontOfSize:14];
+    [closeBtn addTarget:self action:@selector(actionExit) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:closeBtn];
+
     /* New Game Button */
     UIButton *newGameBtn = [UIButton buttonWithType:UIButtonTypeCustom];
     newGameBtn.frame = CGRectMake(rightX - 110, topY + 54, 110, 34);
@@ -282,6 +293,14 @@
 }
 
 #pragma mark - Movement Logic
+
+- (void)actionExit {
+    if (self.onExitBlock) {
+        self.onExitBlock();
+    } else {
+        [self dismissViewControllerAnimated:YES completion:nil];
+    }
+}
 
 - (void)actionLeft {
     if ([self moveLeft]) {

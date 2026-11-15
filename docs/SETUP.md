@@ -78,7 +78,7 @@ Phone back in TWRP + `adb devices` = round over.
 
 The default command line is configured in `tools/build-daily.sh`:
 ```text
--v cpus=4 keepsyms=1 op2_deadline=7200 rd=emmcroot0 emmcroot=userdata rootrw=1 emmcrw=1 cs_enforcement_disable=1 launchd_unsecure_cache=1 op2fb_client_ui=1 op2_autoinput=1 op2fb_keepon=1 op2_userlog=0 metal=3 op2fb_hwscale=0
+-v cpus=4 keepsyms=1 op2_deadline=7200 rd=emmcroot0 emmcroot=userdata rootrw=1 emmcrw=1 cs_enforcement_disable=1 launchd_unsecure_cache=1 op2fb_client_ui=1 op2_autoinput=0 op2fb_keepon=1 op2_userlog=0 metal=3 op2fb_hwscale=0
 ```
 
 If you construct a custom boot image or boot via fastboot directly without `tools/build-daily.sh`, the following boot arguments are **required** for a stable, interactive run:
@@ -88,7 +88,7 @@ If you construct a custom boot image or boot via fastboot directly without `tool
 | `op2fb_hwscale=0` | Yes | **YES** | **Bypasses Qualcomm QSEED hardware scaler.** Downscaling from Retina 1242×2208 to native 1080×1920 is performed by XNU's fixed-point SIMD bilinear downsampler into carveout slot 0 (`0x03400000`). Setting this to 0 prevents Qualcomm MDSS MDP5 hardware AXI bus underflows and fatal SMMU page faults. |
 | `op2fb_client_ui=1` | Yes | **YES** | Enables client UI fallback compositing so SpringBoard surfaces are reliably copied to scanout. |
 | `metal=3` | Yes | **YES** | Enables Level 3 Metal GPU acceleration via `OP2Metal` + Adreno 430 Mesa freedreno driver for backboardd, SpringBoard, and apps. |
-| `op2_autoinput=1` | Yes | **YES** | Hands-on interactive mode: sends a single synthetic Home button pulse at boot to wake the Lock Screen, then turns off synthetic input so the user has full physical control via touch and capacitive buttons. |
+| `op2_autoinput=0` | Yes | **YES** | Hands-on physical touch mode: synthetic micro-events are disabled completely so that all touch events on the Synaptics panel go directly to iOS UIKit views and dock icons without interference. Screen wake is maintained via `op2fb_keepon=1`. |
 | `op2fb_keepon=1` | Yes | **YES** | Keeps the physical display panel and backlight awake at all times. |
 | `op2_deadline=7200` | Yes | **YES** | Safety deadline watchdog timer in seconds (e.g. 7200 for 2-hour soak, 1800 for 30m). Automatically syncs filesystems and resets to TWRP recovery upon expiration, preventing hard-lock or battery drain. |
 | `rd=emmcroot0` | Yes | **YES** | Directs XNU root filesystem to Qualcomm SDHCI eMMC block device `/dev/emmcroot0`. |
