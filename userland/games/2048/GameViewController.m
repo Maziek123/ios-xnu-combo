@@ -104,24 +104,24 @@ extern void sb_log(const char *fmt, ...);
 
     /* Exit / Home Button */
     UIButton *closeBtn = [UIButton buttonWithType:UIButtonTypeCustom];
-    closeBtn.frame = CGRectMake(margin, topY + 54, 85, 34);
+    closeBtn.frame = CGRectMake(margin, topY + 54, 80, 32);
     closeBtn.backgroundColor = [UIColor colorWithRed:0.85 green:0.25 blue:0.20 alpha:1.0]; /* Red #D94033 */
     closeBtn.layer.cornerRadius = 6.0;
     [closeBtn setTitle:@"Exit" forState:UIControlStateNormal];
     [closeBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     closeBtn.titleLabel.font = [UIFont boldSystemFontOfSize:14];
-    [closeBtn addTarget:self action:@selector(actionExit) forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchDown];
+    [closeBtn addTarget:self action:@selector(actionExit) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:closeBtn];
 
     /* New Game Button */
     UIButton *newGameBtn = [UIButton buttonWithType:UIButtonTypeCustom];
-    newGameBtn.frame = CGRectMake(rightX - 110, topY + 54, 110, 34);
+    newGameBtn.frame = CGRectMake(rightX - 105, topY + 54, 105, 32);
     newGameBtn.backgroundColor = [UIColor colorWithRed:0.557 green:0.475 blue:0.404 alpha:1.0]; /* #8F7A66 */
     newGameBtn.layer.cornerRadius = 6.0;
     [newGameBtn setTitle:@"New Game" forState:UIControlStateNormal];
     [newGameBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     newGameBtn.titleLabel.font = [UIFont boldSystemFontOfSize:14];
-    [newGameBtn addTarget:self action:@selector(startNewGame) forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchDown];
+    [newGameBtn addTarget:self action:@selector(startNewGame) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:newGameBtn];
 
     /* Board Container */
@@ -201,7 +201,7 @@ extern void sb_log(const char *fmt, ...);
     [btn setTitle:title forState:UIControlStateNormal];
     [btn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     btn.titleLabel.font = [UIFont boldSystemFontOfSize:22];
-    [btn addTarget:self action:action forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchDown];
+    [btn addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
     return btn;
 }
 

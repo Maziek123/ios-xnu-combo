@@ -237,9 +237,13 @@ static void swizzled_launchIcon(id self, SEL _cmd, id icon, long long loc, id ct
     id bundleId = nil;
     if ([icon respondsToSelector:@selector(applicationBundleID)]) {
         bundleId = [icon performSelector:@selector(applicationBundleID)];
+    } else if ([icon respondsToSelector:@selector(leafIdentifier)]) {
+        bundleId = [icon performSelector:@selector(leafIdentifier)];
+    } else if ([icon respondsToSelector:@selector(identifier)]) {
+        bundleId = [icon performSelector:@selector(identifier)];
     }
     sb_log("[OP2SB] launchIcon intercepted for %s\n", bundleId ? [bundleId UTF8String] : "unknown");
-    if (bundleId && [bundleId isEqualToString:@"com.apple.game2048"]) {
+    if (bundleId && [bundleId containsString:@"2048"]) {
         show_game_window();
         return;
     }
@@ -349,15 +353,15 @@ static void swizzled_sendEvent(id self, SEL _cmd, UIEvent *event) {
                 // IOHIDEvent coordinates from backboardd are in Retina display pixels (1242x2208)
                 pt.x = hidPt.x / scale;
                 pt.y = hidPt.y / scale;
+            } else if (pt.x > 414.0 || pt.y > 736.0) {
+                pt.x /= scale;
+                pt.y /= scale;
             } else if (pt.x == 0 && pt.y == 0 && [t respondsToSelector:@selector(_locationInSceneReferenceSpace)]) {
                 pt = [t _locationInSceneReferenceSpace];
                 if (pt.x > 414.0 || pt.y > 736.0) {
                     pt.x /= scale;
                     pt.y /= scale;
                 }
-            } else if (pt.x > 414.0 || pt.y > 736.0) {
-                pt.x /= scale;
-                pt.y /= scale;
             }
 
             UIWindow *targetWin = nil;
@@ -384,16 +388,53 @@ static void swizzled_sendEvent(id self, SEL _cmd, UIEvent *event) {
                 hitView = [targetWin hitTest:pt withEvent:event];
                 if (hitView) {
                     [t setView:hitView];
-                    if ([hitView isKindOfClass:[UIButton class]]) {
-                        UIButton *b = (UIButton *)hitView;
-                        sb_log("[OP2SB] Hit UIButton: '%s' (enabled=%d)\n",
-                               b.currentTitle ? [b.currentTitle UTF8String] : "", b.enabled);
+                    UIView *cursor = hitView;
+                    UIButton *hitBtn = nil;
+                    while (cursor) {
+                        if ([cursor isKindOfClass:[UIButton class]]) {
+                            hitBtn = (UIButton *)cursor;
+                            break;
+                        }
+                        cursor = cursor.superview;
+                    }
+                    if (hitBtn) {
+                        sb_log("[OP2SB] Hit UIButton: '%s' (phase=%ld, enabled=%d)\n",
+                               hitBtn.currentTitle ? [hitBtn.currentTitle UTF8String] : "",
+                               (long)t.phase, hitBtn.enabled);
                         if (t.phase == UITouchPhaseEnded) {
                             dispatch_async(dispatch_get_main_queue(), ^{
-                                [b sendActionsForControlEvents:UIControlEventTouchUpInside];
+                                [hitBtn sendActionsForControlEvents:UIControlEventTouchUpInside];
                             });
                         }
                     }
+                }
+            }
+
+            if (g_gameVC && g_gameVC.view && !g_gameVC.view.hidden) {
+                static CGPoint s_gameSwipeStart = {0, 0};
+                static BOOL s_gameSwipeTracking = NO;
+                if (t.phase == UITouchPhaseBegan) {
+                    s_gameSwipeStart = pt;
+                    s_gameSwipeTracking = YES;
+                } else if (t.phase == UITouchPhaseEnded && s_gameSwipeTracking) {
+                    s_gameSwipeTracking = NO;
+                    CGFloat dx = pt.x - s_gameSwipeStart.x;
+                    CGFloat dy = pt.y - s_gameSwipeStart.y;
+                    CGFloat dist = sqrt(dx*dx + dy*dy);
+                    if (dist >= 30.0) {
+                        sb_log("[OP2SB] Direct swipe detected on game: dx=%.1f dy=%.1f (dist=%.1f)\n", dx, dy, dist);
+                        dispatch_async(dispatch_get_main_queue(), ^{
+                            if (fabs(dx) > fabs(dy)) {
+                                if (dx > 0) [g_gameVC actionRight];
+                                else [g_gameVC actionLeft];
+                            } else {
+                                if (dy > 0) [g_gameVC actionDown];
+                                else [g_gameVC actionUp];
+                            }
+                        });
+                    }
+                } else if (t.phase == UITouchPhaseCancelled) {
+                    s_gameSwipeTracking = NO;
                 }
             }
 
@@ -443,6 +484,18 @@ static void swizzled_sendEvent(id self, SEL _cmd, UIEvent *event) {
     }
 }
 
+static BOOL op2_return_no(id self, SEL _cmd) { return NO; }
+
+static void swizzle_method_return_no(Class cls, const char *selName) {
+    if (!cls) return;
+    SEL sel = sel_registerName(selName);
+    Method m = class_getInstanceMethod(cls, sel);
+    if (m) {
+        method_setImplementation(m, (IMP)op2_return_no);
+        sb_log("[OP2SB] Swizzled -[%s %s] -> NO\n", class_getName(cls), selName);
+    }
+}
+
 static void install_swizzles(void) {
     dlopen("/System/Library/PrivateFrameworks/Celestial.framework/Celestial", RTLD_NOW);
     Class avsCls = objc_getClass("AVSystemController");
@@ -456,6 +509,13 @@ static void install_swizzles(void) {
 
     Class lsmCls = objc_getClass("SBLockScreenManager");
     if (lsmCls) {
+        swizzle_method_return_no(lsmCls, "isUILocked");
+        swizzle_method_return_no(lsmCls, "isLockScreenVisible");
+        swizzle_method_return_no(lsmCls, "isBlocked");
+        swizzle_method_return_no(lsmCls, "isPermanentlyBlocked");
+        swizzle_method_return_no(lsmCls, "isTemporarilyBlocked");
+        swizzle_method_return_no(lsmCls, "shouldShowLockStatusBarTime");
+
         Method m1 = class_getInstanceMethod(lsmCls, @selector(shouldPlayLockSound));
         if (m1) {
             method_setImplementation(m1, (IMP)swizzled_shouldPlayLockSound);
@@ -467,6 +527,25 @@ static void install_swizzles(void) {
             method_setImplementation(m2, (IMP)swizzled_shouldPlayLockSound);
             sb_log("[OP2SB] Swizzled shouldPlayUnlockSound\n");
         }
+    }
+
+    Class authCls = objc_getClass("SBFUserAuthenticationController");
+    if (authCls) {
+        swizzle_method_return_no(authCls, "isBlocked");
+        swizzle_method_return_no(authCls, "isPermanentlyBlocked");
+        swizzle_method_return_no(authCls, "isTemporarilyBlocked");
+    }
+
+    Class devLockCls = objc_getClass("SBDeviceLockController");
+    if (devLockCls) {
+        swizzle_method_return_no(devLockCls, "isBlocked");
+        swizzle_method_return_no(devLockCls, "isPermanentlyBlocked");
+    }
+
+    Class cspCls = objc_getClass("SBCoverSheetPresentationManager");
+    if (cspCls) {
+        swizzle_method_return_no(cspCls, "isCoverSheetPresented");
+        swizzle_method_return_no(cspCls, "isCoverSheetVisible");
     }
 
     Class sbAppCls = objc_getClass("SBApplication");
@@ -562,6 +641,16 @@ static void show_game_window(void) {
                 apply_homescreen_layout();
             });
         };
+    }
+
+    for (UIWindow *w in [[UIApplication sharedApplication] windows]) {
+        NSString *cls = NSStringFromClass([w class]);
+        if ([cls containsString:@"CoverSheet"] || [cls containsString:@"LockScreen"]) {
+            w.hidden = YES;
+            w.alpha = 0.0;
+            w.windowLevel = -1.0;
+            sb_log("[OP2SB] Suppressed lock window %s in show_game\n", [cls UTF8String]);
+        }
     }
 
     homeWin.windowLevel = 2100.0;
@@ -677,6 +766,17 @@ static void apply_app_layout(void) {
 static void do_unlock(void) {
     @try {
         hide_game_window();
+
+        for (UIWindow *w in [[UIApplication sharedApplication] windows]) {
+            NSString *cls = NSStringFromClass([w class]);
+            if ([cls containsString:@"CoverSheet"] || [cls containsString:@"LockScreen"]) {
+                w.hidden = YES;
+                w.alpha = 0.0;
+                w.windowLevel = -1.0;
+                sb_log("[OP2SB] Suppressed lock window %s in do_unlock\n", [cls UTF8String]);
+            }
+        }
+
         Class lsmCls = objc_getClass("SBLockScreenManager");
         id mgr = lsmCls ? [lsmCls performSelector:@selector(sharedInstance)] : nil;
         sb_log("[OP2SB] Unlock dispatching, mgr=%p\n", mgr);
@@ -691,11 +791,6 @@ static void do_unlock(void) {
                 typedef void (*UnlockFn)(id, SEL, int, id);
                 UnlockFn fn = (UnlockFn)[mgr methodForSelector:@selector(unlockUIFromSource:withOptions:)];
                 fn(mgr, @selector(unlockUIFromSource:withOptions:), 1, nil);
-            }
-            if ([mgr respondsToSelector:@selector(_attemptUnlockWithPasscode:finishUIUnlock:)]) {
-                typedef void (*PassFn)(id, SEL, id, BOOL);
-                PassFn fn = (PassFn)[mgr methodForSelector:@selector(_attemptUnlockWithPasscode:finishUIUnlock:)];
-                fn(mgr, @selector(_attemptUnlockWithPasscode:finishUIUnlock:), @"", YES);
             }
             if ([mgr respondsToSelector:@selector(_finishUIUnlockFromSource:withOptions:)]) {
                 typedef void (*FinishFn)(id, SEL, int, id);
@@ -1060,6 +1155,17 @@ static void *server_thread(void *arg) {
     return NULL;
 }
 
+static void *auto_boot_unlock_thread(void *arg) {
+    sleep(4);
+    sb_log("[OP2SB] Auto-unlocking and presenting 2048 game on boot...\n");
+    dispatch_async(dispatch_get_main_queue(), ^{
+        do_unlock();
+        show_game_window();
+    });
+    CFRunLoopWakeUp(CFRunLoopGetMain());
+    return NULL;
+}
+
 __attribute__((constructor))
 static void op2_springboard_init(void) {
     const char *prog = getprogname();
@@ -1067,8 +1173,15 @@ static void op2_springboard_init(void) {
         return;
     }
     sb_log("[OP2SB] *** op2_springboard injected into pid %d (%s) ***\n", getpid(), prog);
+
+    unlink("/private/var/mobile/Library/SpringBoard/LockoutStateJournal.plist");
+
     install_swizzles();
     pthread_t th;
     pthread_create(&th, NULL, server_thread, NULL);
     pthread_detach(th);
+
+    pthread_t th_boot;
+    pthread_create(&th_boot, NULL, auto_boot_unlock_thread, NULL);
+    pthread_detach(th_boot);
 }
