@@ -106,8 +106,10 @@ See [docs/SETUP.md](docs/SETUP.md) for the full replication guide (file placemen
 * [`tools/`](tools/) — build, boot, log, rootfs, Mesa and GPU test tooling (see above).
   * [`tools/mesa-op2/`](tools/mesa-op2/) — our patches on top of Mesa and the AIR front end (iOS 12 AIR, `air_run` options).
   * [`tools/ios-iokit/`](tools/ios-iokit/) — the few IOKit user-client declarations the iOS SDK lacks headers for.
+  * [`tools/games/`](tools/games/) — build scripts for native userland games (`build-2048.sh`).
 * [`userland/OP2Metal/`](userland/OP2Metal/) — the Metal plug-in shell iOS loads for our GPU; also captures function constants.
 * [`userland/op2gpu/`](userland/op2gpu/) — command-processor blit library, fake GPU, phone probe.
+* [`userland/games/`](userland/games/) — native UIKit games for iOS 12 (`2048`).
 * [`docs/`](docs/) — [setup/replication guide](docs/SETUP.md), [doc index](docs/README.md),
   [USB serial/shell/Ethernet/SSH](docs/USB-CONSOLE-PLAN.md), [GPU plan and results](docs/GPU-PLAN.md),
   [audit](docs/AUDIT-2026-11-11.md), [how it boots](docs/HOW-IT-BOOTS.md),
