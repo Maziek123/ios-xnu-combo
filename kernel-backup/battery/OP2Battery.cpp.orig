@@ -1,0 +1,336 @@
+/*
+ * OP2Battery: MSM8994 PMI8994 fuel-gauge reader (qpnp-fg subset).
+ *
+ * Phase 1 (this file): read-only SPMI probe. Maps the PMIC arbiter, verifies
+ * its version, walks the PPID->APID table for SID 2, and reads FG status
+ * registers. Everything is logged; nothing is written except the SPMI
+ * read-command register itself (reads are side-effect free).
+ * Phase 2 (next): MEM_IF handshake + SOC/V/I + iOS power-source publishing.
+ *
+ * Hardware (LineageOS msm8994 tree, ground truth for this SoC):
+ *   SPMI arbiter core 0xFC4CF000, cnfg 0xFC4CA000, APPS channel 0.
+ *   PMI8994 = SID 2. FG peripherals: soc 0x4000, batt 0x4100, memif 0x4400.
+ *   MEM_IF offsets from mem_base: CFG 0x40, CTL 0x41, ADDR_LSB 0x42,
+ *   RD_DATA0 0x4C, WR_DATA0 0x48. SRAM words: BATT_SOC 0x56C (3B),
+ *   VOLTAGE 0x5CC+1 (2B, uV = raw*152587/1000), CURRENT 0x5CC+3 (2B, signed).
+ *   SOC% = raw24*100/0xFFFFFF (msoc byte), uV/uA direct.
+ */
+#include <libkern/c++/OSObject.h>
+#include <libkern/c++/OSDictionary.h>
+#include <IOKit/IOService.h>
+#include <IOKit/IOLib.h>
+
+extern "C" void op2_battery_probe(IOService *provider);
+
+extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+
+#define OP2_SPMI_CORE_PHYS      0xFC4CF000ULL
+#define OP2_SPMI_CNFG_PHYS      0xFC4CA000ULL
+#define OP2_SPMI_MAP_SIZE       0x1000
+#define OP2_SPMI_VERSION        0x00
+#define OP2_SPMI_MAP_TABLE      0x0800   /* v2 APID map: cnfg + 0x800 + 4*index */
+#define OP2_SPMI_V2_CH_STRIDE   0x8000   /* per-APID channel stride from core */
+#define OP2_SPMI_APID_MAX       256
+#define OP2_SPMI_CH_OFFSET      0x800
+#define OP2_SPMI_CH_STRIDE      0x80
+#define OP2_SPMI_CH_CMD         0x00
+#define OP2_SPMI_CH_STATUS      0x08
+#define OP2_SPMI_CH_RDATA0      0x18
+#define OP2_SPMI_CH_RDATA1      0x1C
+#define OP2_SPMI_ST_DONE        (1u << 0)
+#define OP2_SPMI_ST_FAILURE     (1u << 1)
+#define OP2_SPMI_ST_DENIED      (1u << 2)
+#define OP2_SPMI_OP_EXT_READL   1u
+#define OP2_SPMI_OP_EXT_WRITE   2u
+#define OP2_SPMI_CH_WDATA0      0x10
+#define OP2_SPMI_CH_WDATA1      0x14
+#define OP2_SPMI_FG_SID         2u
+#define OP2_SPMI_FG_SOC         0x4000u
+#define OP2_SPMI_FG_BATT        0x4100u
+#define OP2_SPMI_FG_MEMIF       0x4400u
+#define OP2_SPMI_INT_RT_STS     0x10u
+
+class OP2Battery : public IOService {
+	OSDeclareDefaultStructors(OP2Battery);
+
+private:
+	volatile uint32_t *fCore;
+	volatile uint32_t *fCnfg;
+
+	uint32_t apidForPpid(uint32_t ppid);
+	bool spmiRead(uint8_t sid, uint16_t addr, uint8_t *buf, uint32_t len);
+	bool spmiWrite(uint8_t sid, uint16_t addr, const uint8_t *buf, uint32_t len);
+	void fgDump(void);
+
+public:
+	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+};
+
+OSDefineMetaClassAndStructors(OP2Battery, IOService);
+
+static struct { uint32_t ppid, apid; bool valid; } gApidCache[8];
+
+uint32_t
+OP2Battery::apidForPpid(uint32_t ppid)
+{
+	for (unsigned i = 0; i < 8; i++) {
+		if (gApidCache[i].valid && gApidCache[i].ppid == ppid)
+			return gApidCache[i].apid;
+	}
+	uint32_t index = 0;
+	for (int i = 0; i < 16; i++) {
+		if (index >= OP2_SPMI_APID_MAX)
+			return 0xFFFFFFFFu;
+		uint32_t data = fCnfg[(OP2_SPMI_MAP_TABLE + 4 * index) / 4];
+		uint32_t bit = (ppid >> ((data >> 18) & 0xF)) & 1;
+		uint32_t isOne, result;
+		if (bit) {
+			isOne = (data >> 8) & 1;
+			result = data & 0xFF;
+		} else {
+			isOne = (data >> 17) & 1;
+			result = (data >> 9) & 0xFF;
+		}
+		if (isOne)
+			index = result;
+		else {
+			for (unsigned i = 0; i < 8; i++) {
+				if (!gApidCache[i].valid) {
+					gApidCache[i].ppid = ppid;
+					gApidCache[i].apid = result;
+					gApidCache[i].valid = true;
+					break;
+				}
+			}
+			return result;
+		}
+	}
+	return 0xFFFFFFFFu;
+}
+
+static volatile uint32_t *gChMap[8];
+static uint32_t gChApid[8];
+
+static volatile uint32_t *
+op2_battery_channel(uint32_t apid)
+{
+	for (unsigned i = 0; i < 8; i++) {
+		if (gChMap[i] != NULL && gChApid[i] == apid)
+			return gChMap[i];
+	}
+	for (unsigned i = 0; i < 8; i++) {
+		if (gChMap[i] == NULL) {
+			gChMap[i] = (volatile uint32_t *)ml_io_map(
+			    OP2_SPMI_CORE_PHYS + (uint64_t)OP2_SPMI_V2_CH_STRIDE * apid,
+			    0x1000);
+			if (gChMap[i] == NULL)
+				return NULL;
+			gChApid[i] = apid;
+			IOLog("OP2Battery: mapped APID %u channel\\n", apid);
+			return gChMap[i];
+		}
+	}
+	return NULL;
+}
+
+static bool gOp2BattTrace = true;
+
+bool
+OP2Battery::spmiRead(uint8_t sid, uint16_t addr, uint8_t *buf, uint32_t len)
+{
+	if (len == 0 || len > 8 || fCore == NULL)
+		return false;
+	uint32_t ppid = (((uint32_t)sid) << 8) | ((addr >> 8) & 0xFF);
+	uint32_t apid = apidForPpid(ppid);
+	if (apid == 0xFFFFFFFFu)
+		return false;
+	uint32_t bc = len - 1;
+	uint32_t cmd = (OP2_SPMI_OP_EXT_READL << 27) |
+	    (((uint32_t)addr & 0xFF) << 4) | (bc & 0x7);
+	volatile uint32_t *ch = op2_battery_channel(apid);
+	if (ch == NULL)
+		return false;
+	if (gOp2BattTrace)
+		IOLog("OP2Battery: rd sid=%u addr=0x%x apid=%u ch=%p cmd=0x%x\\n",
+		    sid, addr, apid, ch, cmd);
+	ch[OP2_SPMI_CH_CMD / 4] = cmd;
+	for (uint32_t t = 0; t < 100000; t++) {
+		uint32_t st = ch[OP2_SPMI_CH_STATUS / 4];
+		if (st & OP2_SPMI_ST_DONE) {
+			if (st & (OP2_SPMI_ST_FAILURE | OP2_SPMI_ST_DENIED))
+				return false;
+			uint32_t r0 = ch[OP2_SPMI_CH_RDATA0 / 4];
+			uint32_t r1 = ch[OP2_SPMI_CH_RDATA1 / 4];
+			for (uint32_t i = 0; i < len; i++)
+				buf[i] = (uint8_t)((i < 4 ? r0 : r1) >> (8 * (i % 4)));
+			return true;
+		}
+	}
+	return false;
+}
+
+bool
+OP2Battery::spmiWrite(uint8_t sid, uint16_t addr, const uint8_t *buf, uint32_t len)
+{
+	if (len == 0 || len > 8 || fCore == NULL)
+		return false;
+	uint32_t ppid = (((uint32_t)sid) << 8) | ((addr >> 8) & 0xFF);
+	uint32_t apid = apidForPpid(ppid);
+	if (apid == 0xFFFFFFFFu)
+		return false;
+	uint32_t bc = len - 1;
+	uint32_t cmd = (OP2_SPMI_OP_EXT_WRITE << 27) |
+	    (((uint32_t)addr & 0xFF) << 4) | (bc & 0x7);
+	volatile uint32_t *ch = op2_battery_channel(apid);
+	if (ch == NULL)
+		return false;
+	if (gOp2BattTrace)
+		IOLog("OP2Battery: wr sid=%u addr=0x%x apid=%u ch=%p cmd=0x%x\\n",
+		    sid, addr, apid, ch, cmd);
+	uint32_t w0 = 0, w1 = 0;
+	for (uint32_t i = 0; i < len; i++) {
+		if (i < 4)
+			w0 |= ((uint32_t)buf[i]) << (8 * i);
+		else
+			w1 |= ((uint32_t)buf[i]) << (8 * (i - 4));
+	}
+	ch[OP2_SPMI_CH_WDATA0 / 4] = w0;
+	if (len > 4)
+		ch[OP2_SPMI_CH_WDATA1 / 4] = w1;
+	ch[OP2_SPMI_CH_CMD / 4] = cmd;
+	for (uint32_t t = 0; t < 100000; t++) {
+		uint32_t st = ch[OP2_SPMI_CH_STATUS / 4];
+		if (st & OP2_SPMI_ST_DONE) {
+			if (st & (OP2_SPMI_ST_FAILURE | OP2_SPMI_ST_DENIED))
+				return false;
+			return true;
+		}
+	}
+	return false;
+}
+
+void
+OP2Battery::fgDump(void)
+{
+	uint8_t cfg = 0;
+	if (!spmiRead(OP2_SPMI_FG_SID, OP2_SPMI_FG_MEMIF + 0x40, &cfg, 1)) {
+		IOLog("OP2Battery: MEM_IF CFG read failed\\n");
+		return;
+	}
+	cfg |= 0x80;
+	if (!spmiWrite(OP2_SPMI_FG_SID, OP2_SPMI_FG_MEMIF + 0x40, &cfg, 1)) {
+		IOLog("OP2Battery: MEM_IF REQ set failed\\n");
+		return;
+	}
+	uint8_t sts = 0;
+	bool granted = false;
+	for (uint32_t t = 0; t < 200000; t++) {
+		if (!spmiRead(OP2_SPMI_FG_SID, OP2_SPMI_FG_MEMIF + 0x10, &sts, 1))
+			break;
+		if (sts & 0x01) {
+			granted = true;
+			break;
+		}
+	}
+	if (!granted) {
+		IOLog("OP2Battery: MEM_IF grant timeout sts=0x%02x\\n", sts);
+		cfg &= (uint8_t)~0x80;
+		spmiWrite(OP2_SPMI_FG_SID, OP2_SPMI_FG_MEMIF + 0x40, &cfg, 1);
+		return;
+	}
+	uint8_t ctl0 = 0;
+	spmiWrite(OP2_SPMI_FG_SID, OP2_SPMI_FG_MEMIF + 0x41, &ctl0, 1);
+	uint8_t soc[4] = {0, 0, 0, 0};
+	uint8_t adr[2] = {0x6C, 0x05};
+	spmiWrite(OP2_SPMI_FG_SID, OP2_SPMI_FG_MEMIF + 0x42, adr, 2);
+	if (spmiRead(OP2_SPMI_FG_SID, OP2_SPMI_FG_MEMIF + 0x4C, soc, 4)) {
+		IOLog("OP2Battery: SOC raw %02x %02x %02x %02x\\n",
+		    soc[0], soc[1], soc[2], soc[3]);
+		for (int b = 0; b < 4; b++) {
+			uint32_t msoc = soc[b];
+			uint32_t pct = (msoc >= 0xFF) ? 100 :
+			    (msoc * (100 - 2)) / (0xFF - 2) + 1;
+			IOLog("OP2Battery: SOC byte%d=0x%02x -> %u%%\\n", b, msoc, pct);
+		}
+	} else {
+		IOLog("OP2Battery: SOC read FAILED\\n");
+	}
+	uint8_t vc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+	adr[0] = 0xCC;
+	adr[1] = 0x05;
+	spmiWrite(OP2_SPMI_FG_SID, OP2_SPMI_FG_MEMIF + 0x42, adr, 2);
+	if (spmiRead(OP2_SPMI_FG_SID, OP2_SPMI_FG_MEMIF + 0x4C, vc, 8)) {
+		IOLog("OP2Battery: VC raw %02x %02x %02x %02x %02x %02x %02x %02x\\n",
+		    vc[0], vc[1], vc[2], vc[3], vc[4], vc[5], vc[6], vc[7]);
+		for (int o = 0; o <= 4; o += 2) {
+			uint32_t raw = vc[o] | (((uint32_t)vc[o + 1]) << 8);
+			uint64_t uv = ((uint64_t)raw * 152587ULL) / 1000ULL;
+			IOLog("OP2Battery: VC+%d raw=0x%04x -> %llu uV\\n", o, raw, uv);
+		}
+	} else {
+		IOLog("OP2Battery: VC read FAILED\\n");
+	}
+	cfg &= (uint8_t)~0x80;
+	spmiWrite(OP2_SPMI_FG_SID, OP2_SPMI_FG_MEMIF + 0x40, &cfg, 1);
+	IOLog("OP2Battery: MEM_IF released\\n");
+}
+
+extern "C" void
+op2_battery_probe(IOService *provider)
+{
+	OP2Battery *b = new OP2Battery;
+	if (b == NULL)
+		return;
+	if (!b->init()) {
+		b->release();
+		return;
+	}
+	if (!b->attach(provider)) {
+		b->release();
+		return;
+	}
+	if (!b->start(provider))
+		b->detach(provider);
+	/* on success b stays attached; on failure start() runs its own logging */
+}
+
+bool
+OP2Battery::start(IOService *provider)
+{
+	IOLog("OP2Battery: MARKER 3 fgDump wired\\n");
+	if (!IOService::start(provider))
+		return false;
+	fCore = (volatile uint32_t *)ml_io_map(OP2_SPMI_CORE_PHYS, OP2_SPMI_MAP_SIZE);
+	fCnfg = (volatile uint32_t *)ml_io_map(OP2_SPMI_CNFG_PHYS, OP2_SPMI_MAP_SIZE);
+	if (fCore == NULL || fCnfg == NULL) {
+		IOLog("OP2Battery: SPMI map failed\\n");
+		return false;
+	}
+	uint32_t ver = fCore[OP2_SPMI_VERSION / 4];
+	IOLog("OP2Battery: arbiter VERSION=0x%08x (expect 0x00010000 v1)\\n", ver);
+	if (ver != 0x00010000u) {
+		IOLog("OP2Battery: unexpected version, probe only\\n");
+	}
+	uint32_t apid = apidForPpid((OP2_SPMI_FG_SID << 8) | 0x40);
+	IOLog("OP2Battery: SID2:0x40 (FG soc) -> APID 0x%x\\n", apid);
+	uint8_t sts = 0;
+	if (spmiRead(OP2_SPMI_FG_SID, OP2_SPMI_FG_MEMIF + OP2_SPMI_INT_RT_STS, &sts, 1))
+		IOLog("OP2Battery: FG MEM_IF INT_RT_STS=0x%02x\\n", sts);
+	else
+		IOLog("OP2Battery: FG MEM_IF status read FAILED\\n");
+	uint8_t rev[2] = {0, 0};
+	if (spmiRead(OP2_SPMI_FG_SID, OP2_SPMI_FG_SOC + 0x00, rev, 2))
+		IOLog("OP2Battery: FG soc+0x00=0x%02x%02x\\n", rev[1], rev[0]);
+	else
+		IOLog("OP2Battery: FG soc revision read FAILED\\n");
+	uint8_t sub = 0;
+	if (spmiRead(OP2_SPMI_FG_SID, OP2_SPMI_FG_SOC + 0x05, &sub, 1))
+		IOLog("OP2Battery: FG soc subtype=0x%02x\\n", sub);
+	if (spmiRead(OP2_SPMI_FG_SID, OP2_SPMI_FG_BATT + 0x05, &sub, 1))
+		IOLog("OP2Battery: FG batt subtype=0x%02x\\n", sub);
+	if (spmiRead(OP2_SPMI_FG_SID, OP2_SPMI_FG_MEMIF + 0x05, &sub, 1))
+		IOLog("OP2Battery: FG memif subtype=0x%02x\\n", sub);
+	fgDump();
+	registerService();
+	return true;
+}

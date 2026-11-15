@@ -134,8 +134,8 @@ def rec_offs(nd):
     return [u16(nd, L - 2 * (i + 1)) for i in range(nrec + 1)]
 
 
-def find_record(parent_id, name):
-    """Walk catalog B-tree; return (record_bytes incl. key) or None."""
+def find_record_loc(parent_id, name):
+    """Walk catalog B-tree; return (node_num, record_offset, record_bytes excl. key) or None."""
     bt = cat_init()
     # key compare: parentID u32 then name bytes
     n = bt.root
@@ -153,7 +153,7 @@ def find_record(parent_id, name):
                 kpid = u32(k, 0)
                 kn = k[6:]
                 if kpid == parent_id and kn == name.encode('utf-16-be'):
-                    return rec[2 + klen:]
+                    return (n, offs[i], rec[2 + klen:])
             return None
         elif kind == 0x00:  # index
             # descend: last record with key <= target
@@ -179,31 +179,44 @@ def find_record(parent_id, name):
             raise RuntimeError('unexpected node kind %d' % kind)
 
 
-def resolve(path):
-    """Resolve absolute path -> (fileID, is_dir, data_extents, logical_size)."""
+def find_record(parent_id, name):
+    """Walk catalog B-tree; return (record_bytes incl. key) or None."""
+    loc = find_record_loc(parent_id, name)
+    return loc[2] if loc else None
+
+
+def resolve_loc(path):
+    """Resolve absolute path -> (fileID, is_dir, data_extents, logical_size, total_blocks, node_num, rec_off)."""
     parts = [p for p in path.split('/') if p]
     pid = 2  # root folder cnid
-    rec = None
     for i, part in enumerate(parts):
-        rec = find_record(pid, part)
-        if rec is None:
+        loc = find_record_loc(pid, part)
+        if loc is None:
             raise RuntimeError('not found: %s (at %s)' % (path, part))
+        n, rec_off, rec = loc
         rtype = u16(rec, 0)
         last = (i == len(parts) - 1)
         if rtype == 0x0001:  # folder
             pid = u32(rec, 8)  # folderID
             if last:
-                return (pid, True, [], 0)
+                return (pid, True, [], 0, 0, n, rec_off)
         elif rtype == 0x0002:  # file
             fid = u32(rec, 8)
             if not last:
                 raise RuntimeError('not a dir: %s' % part)
             size = fork_len(rec, 88)
+            total_blocks = u32(rec, 88 + 12)
             exts = parse_extents(rec, 88 + 16)
-            return (fid, False, exts, size)
+            return (fid, False, exts, size, total_blocks, n, rec_off)
         else:
             raise RuntimeError('bad record type %d at %s' % (rtype, part))
     raise RuntimeError('empty path')
+
+
+def resolve(path):
+    """Resolve absolute path -> (fileID, is_dir, data_extents, logical_size)."""
+    fid, isdir, exts, size, total_blocks, n, rec_off = resolve_loc(path)
+    return (fid, isdir, exts, size)
 
 
 def file_blocks(exts, size):
@@ -243,12 +256,42 @@ def read_file(path, off, length):
     return data[start_off:start_off + length]
 
 
+def set_size(path, new_size):
+    """Update logical file size in catalog B-tree, up to allocated extents limit."""
+    fid, isdir, exts, size, total_blocks, n, rec_off = resolve_loc(path)
+    if isdir:
+        raise RuntimeError('is a directory: %s' % path)
+    if new_size > total_blocks * BS:
+        raise RuntimeError('cannot grow beyond allocated blocks (%d > %d)' % (new_size, total_blocks * BS))
+    bt = cat_init()
+    nd = bytearray(bt.node(n))
+    klen = u16(nd, rec_off)
+    size_off = rec_off + 2 + klen + 88
+    struct.pack_into('>Q', nd, size_off, new_size)
+    nb = bt.blk_per_node
+    first = bt.blk(n * nb)
+    if bt.blk(n * nb + nb - 1) == first + nb - 1:
+        wrd(first, bytes(nd))
+    else:
+        for i in range(nb):
+            wrd(bt.blk(n * nb + i), bytes(nd[i * BS:(i + 1) * BS]))
+    return new_size
+
+
 def write_file(path, off, payload):
-    fid, isdir, exts, size = resolve(path)
+    fid, isdir, exts, size, total_blocks, n, rec_off = resolve_loc(path)
     if isdir:
         raise RuntimeError('is a directory')
-    if off + len(payload) > size:
-        raise RuntimeError('write past EOF')
+    target_size = max(size, off + len(payload)) if off > 0 else len(payload)
+    if target_size != size:
+        if target_size <= total_blocks * BS:
+            print('[op2hfs] Updating %s logical size %d -> %d (cap %d)' %
+                  (path, size, target_size, total_blocks * BS))
+            set_size(path, target_size)
+            size = target_size
+        else:
+            raise RuntimeError('write past EOF (%d > %d allocated)' %
+                               (target_size, total_blocks * BS))
     blocks = file_blocks(exts, size)
     # read-modify-write affected blocks
     first = off // BS
@@ -311,6 +354,10 @@ def main():
         p, off, inf = sys.argv[2], int(sys.argv[3], 0), sys.argv[4]
         write_file(p, off, open(inf, 'rb').read())
         print('wrote %d bytes at %s+%s' % (len(open(inf, 'rb').read()), p, sys.argv[3]))
+    elif a == 'set_size':
+        p, sz = sys.argv[2], int(sys.argv[3], 0)
+        new_sz = set_size(p, sz)
+        print('set %s logical size to %d' % (p, new_sz))
     else:
         sys.exit('unknown cmd')
 

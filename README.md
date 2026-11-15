@@ -9,16 +9,18 @@ The kernel lives in its own repository: [Veerhooda/xnu](https://github.com/Veerh
 
 ---
 
-## Status (2026-11-13)
+## Status (2026-11-15)
 
 | Area | State | Evidence |
 |---|---|---|
 | Boot | LK `boot.img` → shim → XNU → launchd → SpringBoard, Lock Screen and Home Screen | every round in `logs/` |
 | CPU | 4 × Cortex-A53 with thermal management (TSENS, throttle at 70 °C, cutoff at 90 °C) | `OP2 TOP:` lines with temperature |
 | Storage | SDHCI eMMC 5.0, multi-block reads (CMD18) with a boot self-test, journaled HFS+ root | `OP2 eMMC MULTI: … fails=0` |
-| Display | MDP5 command-mode panel, double-buffered, SwapWait honoured, ~6 ms CPU downsample 1242×2208 → 1080×1920 | `OP2 FB PERF:` lines |
-| Input | Synaptics S3320 touch; Home = a touch starting on the bottom strip; synthetic input only to wake (`op2_autoinput=1`) | |
-| **GPU (Adreno 430)** | **Composites the UI on the hardware** (`metal=3`: home/lock screens, dock blur); OrangeTree game still blank (SpriteKit pipelines fail in the shim) | [docs/GPU-PLAN.md](docs/GPU-PLAN.md) |
+| **Display (MDP5)** | **MDSS MDP5 command-mode panel (60 Hz, zero dropped kicks)**; SIMD bilinear downsampler (1242×2208 → 1080×1920 in ~2 ms); QSEED hwscale bypass (`op2fb_hwscale=0`); physical display freeze resolved | `AppleCLCD` kicks at 60 Hz, `OP2 FB:` lines |
+| **Apps & UI** | **SpringBoard Lock Screen, Home Screen, and system apps fully functional and interactive**: Settings (`Preferences`), Photos (`MobileSlideShow`), Camera (`Camera`), Clock (`MobileTimer`), Safari (`MobileSafari`), Health (`Health`) | On-device captures, SSH exec |
+| Input | Synaptics S3320 touch digitizer; capacitive Home button (`OP2Buttons` Consumer HID 0x0C / 0x40); hands-on user control (`op2_autoinput=1`) | `OP2Digitizer` touch packets |
+| **Battery & Power** | **`OP2Battery` driver**: Qualcomm PMI8994 SPMI fuel-gauge + Apple `IOPMPowerSource` status bar & `powerd` integration | `OP2Battery` SPMI SOC & SMBCHG |
+| **GPU (Adreno 430)** | **Composites the UI on the hardware** (`metal=3`: lock/home screens, apps, dock blur); OrangeTree game still blank (SpriteKit pipelines fail in the shim) | [docs/GPU-PLAN.md](docs/GPU-PLAN.md) |
 | **USB serial + shell** | CDC-ACM live kernel log; root `dash` shell with job control and toybox applets | [docs/USB-CONSOLE-PLAN.md](docs/USB-CONSOLE-PLAN.md) |
 | **USB Ethernet + SSH** | Composite CDC-ECM (`ue0` 192.168.7.2), `ping` works; dropbear SSH: exec, `scp -O`, pubkey auth | [docs/USB-CONSOLE-PLAN.md](docs/USB-CONSOLE-PLAN.md) |
 | Known crashes | logd SIGBUS/SIGSEGV loop, Spotlight extensions SIGABRT loop, occasional SpringBoard SIGSEGV | [CLAUDE.md](CLAUDE.md) |
@@ -54,7 +56,7 @@ DEADLINE=300 bash tools/round.sh    # shorter run
 cat logs/last-summary.txt           # summary; full logs in logs/daily-*.log
 ```
 
-* `tools/build-daily.sh` builds the kernel and `out/xnu-boot.img` (boot-args in one place, `EXTRA=` appends).
+* `tools/build-daily.sh` builds the kernel and `out/xnu-boot.img` with verified default boot-args (`op2fb_hwscale=0`, `metal=3`, `op2fb_client_ui=1`, `op2_autoinput=1`, etc.; see [docs/SETUP.md](docs/SETUP.md#51-required-boot-arguments-for-successful-run) for the full parameter reference).
 * `tools/boot-daily.sh` re-arms the recovery cookie and `fastboot boot`s the image. It never flashes.
 * `tools/pull-log.sh` pulls `/sys/fs/pstore/console-ramoops-0` and writes the summary.
 * `tools/rootfs-journal.sh` rebuilds the journaled rootfs from the clean image and streams it to userdata

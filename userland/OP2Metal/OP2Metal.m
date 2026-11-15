@@ -167,7 +167,15 @@ static op2mtl_device *gMtl;   /* NULL: no GPU, the CPU stubs */
  * pass, nor a commit land in the middle of one. Held from renderCommandEncoder to endEncoding, and around
  * commit + wait. The draw and commit counters below are kept under it too.
  */
-static pthread_mutex_t gPassLock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t gPassLock;
+static void __attribute__((constructor)) initPassLock(void)
+{
+	pthread_mutexattr_t attr;
+	pthread_mutexattr_init(&attr);
+	pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+	pthread_mutex_init(&gPassLock, &attr);
+	pthread_mutexattr_destroy(&attr);
+}
 static void gpuCommit(void);
 static void *watchdogThread(void *arg);
 
