@@ -27,10 +27,10 @@ with a placement hint when Xcode is missing.
 | Path | Tracked? | Contents |
 |---|---|---|
 | `tools/` | yes | all build/boot/deploy scripts; `tools/env.sh` host paths |
-| `userland/` | yes | `op2shell` (launcher), `op2gpu`, `OP2Metal`, `op2mtl`, `op2bench` sources |
+| `userland/` | yes | `op2shell` (launcher), `op2gpu`, `OP2Metal`, `op2mtl`, `op2bench`, `games/2048` sources |
 | `docs/` | yes | plans, status, this guide |
-| `kernel-backup/` | yes | before/after copies of every kernel file changed per round (`fable-NN/`) |
-| `xnu/` | **no** (gitignored) | XNU 4903.270.47 source + `BUILD/` objects; back up before editing |
+| `kernel-backup/` | yes | before/after copies of kernel files changed per round (`<round>/pre/` = before) |
+| `xnu/xnu-4903.270.47` | own repo ([Veerhooda/xnu](https://github.com/Veerhooda/xnu)) | the kernel; gitignored here |
 | `out/` | **no** | build products, extracted sources, Apple images, round logs stay in `logs/` |
 | `reference/` | **no** | peer trees (hakios, ios-sweet, kernel-oneplus) used as references only |
 | `logs/` | **no** | per-round kernel logs, usb-console captures, test transcripts |
@@ -49,57 +49,74 @@ with a placement hint when Xcode is missing.
 Toybox also needs `out/shell/toybox-ios-shim/sys/disk.h` (in git) on the include path —
 handled inside `tools/build-toybox.sh`.
 
-## 4. Build order
+## 4. Build order (fresh checkout → the image we run today)
 
+0. Kernel source: `git clone https://github.com/Veerhooda/xnu xnu/xnu-4903.270.47` (branch `main`; `msm8994`
+   is the same commit). It is gitignored here because it is its own repository.
 1. Kernel + boot image: `bash tools/build-daily.sh` → `out/xnu-boot.img` (refuses if the
    cmdline would exceed 250 bytes).
 2. Shell tools (each stages into `out/shell/build/`, stripped + ad-hoc signed):
    `bash tools/build-toybox.sh`, `bash tools/build-dropbear.sh`,
    then `bash tools/build-op2shell.sh` (needs dash + toybox + dropbear + scp +
    `out/shell/build/authorized_keys`, i.e. your `.pub`).
-3. GPU userland only if you touch it: `tools/mesa-host.sh`, `tools/mesa-ios.sh`,
-   `userland/OP2Metal/build.sh`, `userland/op2gpu` (`make ios`).
-4. Install the launcher while the phone is in TWRP: `bash tools/build-op2shell.sh --install`
-   (writes the 9 MB `op2-air-run` slot in place, reads back + `cmp`s).
+3. GPU userland: `bash tools/mesa-host.sh`, `bash tools/mesa-ios.sh` (→ `out/mesa-ios/out/op2mtl.dylib`),
+   `bash userland/OP2Metal/build.sh` (→ `userland/OP2Metal/build/OP2Metal.bundle`). Without these the phone
+   still boots, but CoreAnimation renders on the CPU (`metal=3` needs both).
+4. Root filesystem, phone in TWRP: `bash tools/rootfs-journal.sh`. From `out/ios12-userdata-fixA.dmg` it makes a
+   journaled copy and installs, in order: accessibility prefs (`rootfs_prefs.py`), the G3 test binary if built
+   (`rootfs_g3.py`), `op2mtl.dylib` + `OP2Metal` in growable slots (`rootfs_g5.py`), every
+   `out/games/build/*.app` (`rootfs_games.py`), and the USB shell/SSH launcher with its launchd job
+   (`rootfs_shell.py`). Then it streams the image to `userdata` and arms the recovery cookie.
+   This erases the phone's iOS userdata.
+5. `bash tools/round.sh` (section 5).
+
+Later updates go in place, without rebuilding the rootfs: `bash tools/build-op2shell.sh --install` for the
+launcher, `tools/op2hfs.py write <path> 0 <file>` for anything with a slot (OP2Metal, op2mtl).
+`op2hfs.py` grows a file only up to the blocks already allocated to it.
+
+Do not add jobs or dylibs to SpringBoard. A 2026-11 experiment that injected code into SpringBoard through the
+launchd cache (`DYLD_INSERT_LIBRARIES`) slowed the UI and locked the passcode; it was removed. The clean
+SpringBoard and job cache are what `rootfs-journal.sh` produces.
 
 ## 5. The round loop (ephemeral boot, never flash)
 
 ```bash
-DEADLINE=7200 bash tools/round.sh
+bash tools/round.sh                 # 15 min (DEADLINE=900)
+DEADLINE=1800 bash tools/round.sh   # longer
 ```
 
 Builds, re-arms the BCB recovery cookie, `fastboot boot out/xnu-boot.img`, waits for the
 phone to reset to TWRP, pulls ramoops to `logs/daily-<time>.log`. While it runs, watch the
-live USB log (`bash tools/usb-console-watch.sh 7200`) or `screen /dev/cu.usbmodem* 115200`.
-`DEADLINE` is the only escape from a hung boot (every image must carry it); default is 7200s (2 hours) or 1800s for a 30-minute test run.
+live USB log (`bash tools/usb-console-watch.sh 900`) or `screen /dev/cu.usbmodem* 115200`.
+`DEADLINE` (boot-arg `op2_deadline`) is the only escape from a hung boot; every image must carry it.
+`round.sh` defaults to 900 s; `build-daily.sh` alone defaults to 7200 s.
 Phone back in TWRP + `adb devices` = round over.
 
-### 5.1 Required Boot Arguments for Successful Run
+### 5.1 Boot arguments
 
-The default command line is configured in `tools/build-daily.sh`:
+All of them are set in `tools/build-daily.sh` (`EXTRA="..."` appends, `AUTOIN=` sets `op2_autoinput`):
 ```text
--v cpus=4 keepsyms=1 op2_deadline=7200 rd=emmcroot0 emmcroot=userdata rootrw=1 emmcrw=1 cs_enforcement_disable=1 launchd_unsecure_cache=1 op2fb_client_ui=1 op2_autoinput=0 op2fb_keepon=1 op2_userlog=0 metal=3 op2fb_hwscale=0
+-v cpus=4 keepsyms=1 op2_deadline=900 rd=emmcroot0 emmcroot=userdata rootrw=1 emmcrw=1 cs_enforcement_disable=1 launchd_unsecure_cache=1 op2fb_client_ui=0 op2_autoinput=0 op2fb_keepon=1 op2_userlog=0 metal=3 op2fb_hwscale=0
 ```
+XNU truncates the command line at 255 bytes; the script refuses at 250.
 
-If you construct a custom boot image or boot via fastboot directly without `tools/build-daily.sh`, the following boot arguments are **required** for a stable, interactive run:
-
-| Boot Argument | Default in Script | Critical? | Purpose & Impact |
-| :--- | :--- | :--- | :--- |
-| `op2fb_hwscale=0` | Yes | **YES** | **Bypasses Qualcomm QSEED hardware scaler.** Downscaling from Retina 1242×2208 to native 1080×1920 is performed by XNU's fixed-point SIMD bilinear downsampler into carveout slot 0 (`0x03400000`). Setting this to 0 prevents Qualcomm MDSS MDP5 hardware AXI bus underflows and fatal SMMU page faults. |
-| `op2fb_client_ui=1` | Yes | **YES** | Enables client UI fallback compositing so SpringBoard surfaces are reliably copied to scanout. |
-| `metal=3` | Yes | **YES** | Enables Level 3 Metal GPU acceleration via `OP2Metal` + Adreno 430 Mesa freedreno driver for backboardd, SpringBoard, and apps. |
-| `op2_autoinput=0` | Yes | **YES** | Hands-on physical touch mode: synthetic micro-events are disabled completely so that all touch events on the Synaptics panel go directly to iOS UIKit views and dock icons without interference. Screen wake is maintained via `op2fb_keepon=1`. |
-| `op2fb_keepon=1` | Yes | **YES** | Keeps the physical display panel and backlight awake at all times. |
-| `op2_deadline=7200` | Yes | **YES** | Safety deadline watchdog timer in seconds (e.g. 7200 for 2-hour soak, 1800 for 30m). Automatically syncs filesystems and resets to TWRP recovery upon expiration, preventing hard-lock or battery drain. |
-| `rd=emmcroot0` | Yes | **YES** | Directs XNU root filesystem to Qualcomm SDHCI eMMC block device `/dev/emmcroot0`. |
-| `emmcroot=userdata` | Yes | **YES** | Selects the internal `userdata` partition as the HFS+ root filesystem. |
-| `rootrw=1 emmcrw=1` | Yes | **YES** | Grants read-write access to eMMC and mounts root filesystem read-write. |
-| `cs_enforcement_disable=1` | Yes | **YES** | Disables Darwin code signing enforcement, allowing custom userland daemons and shims to execute. |
-| `launchd_unsecure_cache=1` | Yes | **YES** | Allows iOS 12 launchd to load patched `xpcd_cache.dylib` services without security cache rejection. |
-| `cpus=4` | Yes | **YES** | Boots all 4 Cortex-A53 cores on the power-efficient cluster via SCM mailbox bootstrap. |
-| `-v` | Yes | Optional | Verbose kernel boot logging to console. |
-| `keepsyms=1` | Yes | Optional | Retains kernel symbol table in RAM for stack backtraces. |
-| `op2_userlog=0` | Yes | Optional | Suppresses noisy userland logs from wrapping the 260 KB ramoops ring buffer. |
+| Boot-arg | Value | What it does |
+| :--- | :--- | :--- |
+| `op2_deadline` | seconds | Syncs the filesystems and resets into TWRP after this long. Required. |
+| `rd=emmcroot0 emmcroot=userdata` | | Root filesystem: the HFS+ image on the `userdata` partition. |
+| `rootrw=1 emmcrw=1` | | Mount root read-write; allow eMMC writes. |
+| `cs_enforcement_disable=1` | | Lets our ad-hoc-signed binaries run. |
+| `launchd_unsecure_cache=1` | | launchd accepts the job cache we edited (`xpcd-cache-add.py`). |
+| `cpus=4` | | Brings up all four A53 cores. |
+| `metal=3` | 0–3 | 3: CoreAnimation renders through OP2Metal on the Adreno. 0: CPU rendering. 2: function-constant capture (blank screen). |
+| `op2fb_hwscale` | 0 | 0: CPU downsample. 1: MDP5 hardware scaler (needs the source inside the LK carveout; not used). |
+| `op2fb_double` | 1 (default) | Double-buffered panel. 0 makes the copy write the buffer the panel is reading. |
+| `op2fb_client_ui` | 0 | 1 makes the framebuffer scan client surfaces itself; it was part of the slow path, keep 0. |
+| `op2fb_swapwait` | 1 (default) | SwapWait blocks the render server until its frame is copied (50 ms cap). |
+| `op2_autoinput` | 0 | 0: no synthetic input. 1: one wake tap. Higher values are old scripted tests; do not use them to claim anything works. |
+| `op2fb_keepon=1` | | Keeps the panel and backlight on. |
+| `op2_userlog=0` | | Keeps userland logs out of the 260 KB ramoops ring. |
+| `-v keepsyms=1` | | Verbose boot, symbols kept for backtraces. |
 
 ## 6. Bring-up map (verify each stage before moving on)
 
@@ -126,11 +143,10 @@ If you construct a custom boot image or boot via fastboot directly without `tool
 - **`setup` lines stop at 40**: intentional cap; the periodic lines carry on.
 - **Phone hot**: space rounds out (see `CLAUDE.md` heat rule); Low Power Mode helps.
 
-## 8. Current state (2026-11-15)
+## 8. Current state (2026-11-17)
 
-- **Display & Panel Scanout:** Native MDSS MDP5 command-mode panel refreshing at 60 Hz with zero dropped kicks. SIMD subpixel bilinear downsampling (1242×2208 → 1080×1920 in ~2 ms) bypasses Qualcomm QSEED hardware downscaler (`op2fb_hwscale=0`), completely eliminating physical display freezes and AXI bus faults.
-- **Interactive UI & System Apps:** SpringBoard Lock Screen and Home Screen are fully interactive and hands-on (`op2_autoinput=1` sends only 1 pulse to wake display, then leaves 100% control to user). Virtual Home strip is sized to center-third (`x: 420..660, y >= 1885`) directly above the physical ceramic sensor so all 4 dock icons can be clicked and tapped cleanly. System applications launch and navigate cleanly: Settings (`Preferences.app`), Photos (`MobileSlideShow.app`), Camera (`Camera.app`), Clock (`MobileTimer.app`), Safari (`MobileSafari.app`), Health (`Health.app`), and 2048 Game (`Game2048.app`).
-- **Native Games:** Playable UIKit 2048 game (`/Applications/Game2048.app`) with full 4-way swipe gestures and tactile on-screen arrow buttons (▲, ▼, ◀, ▶) for responsive gameplay.
-- **GPU (Adreno 430):** Full Level 3 Metal acceleration (`metal=3`) active across backboardd, SpringBoard, and userland applications via `OP2Metal` + Mesa freedreno driver.
-- **Input & Power:** Synaptics S3320 touch digitizer, capacitive Home button (`OP2Buttons` Consumer HID 0x0C / 0x40), and battery fuel-gauge power telemetry (`OP2Battery` via Qualcomm PMI8994 SPMI).
-- **USB & Networking:** Composite CDC-ACM serial console + CDC-ECM Ethernet (`ue0` 192.168.7.2); Dropbear SSH server with pubkey authentication and `scp -O` file transfer.
+Boots to the Lock Screen and Home Screen, unlocks, touch and Home work, the UI is composited on the Adreno
+(`metal=3`). ~8 ms per present, SwapWait timeouts 0, ~1 % kernel CPU when idle, ~61 °C at 768 MHz.
+Serial shell + SSH over USB work. Open: brief partial frames while scrolling (being re-checked with double
+buffering back on), no internet yet (USB tethering next, then Wi-Fi), no RTC, the crash loops listed in
+`CLAUDE.md`. Next work: `docs/NEXT-PLAN.md`.

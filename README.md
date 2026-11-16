@@ -5,25 +5,32 @@ Qualcomm Snapdragon 810 / MSM8994) through a custom port of Apple's open-source 
 Qualcomm's own bootloader into a small shim, XNU takes over, mounts a real HFS+ root on the eMMC, and runs
 launchd, backboardd and SpringBoard to the Lock Screen and Home Screen.
 
-The kernel lives in its own repository: [Veerhooda/xnu](https://github.com/Veerhooda/xnu) (branch `msm8994`).
+The kernel lives in its own repository: [Veerhooda/xnu](https://github.com/Veerhooda/xnu) (branches `main` and `msm8994`, kept identical);
+clone it to `xnu/xnu-4903.270.47` inside this checkout.
 
 ---
 
-## Status (2026-11-15)
+## Status (2026-11-17)
 
 | Area | State | Evidence |
 |---|---|---|
 | Boot | LK `boot.img` → shim → XNU → launchd → SpringBoard, Lock Screen and Home Screen | every round in `logs/` |
 | CPU | 4 × Cortex-A53 with thermal management (TSENS, throttle at 70 °C, cutoff at 90 °C) | `OP2 TOP:` lines with temperature |
 | Storage | SDHCI eMMC 5.0, multi-block reads (CMD18) with a boot self-test, journaled HFS+ root | `OP2 eMMC MULTI: … fails=0` |
-| **Display (MDP5)** | **MDSS MDP5 command-mode panel (60 Hz, zero dropped kicks)**; SIMD bilinear downsampler (1242×2208 → 1080×1920 in ~2 ms); QSEED hwscale bypass (`op2fb_hwscale=0`); physical display freeze resolved | `AppleCLCD` kicks at 60 Hz, `OP2 FB:` lines |
-| **Apps & UI** | **SpringBoard Lock Screen, Home Screen, 2048 Game, and system apps fully functional and interactive**: Settings (`Preferences`), Photos (`MobileSlideShow`), Camera (`Camera`), Clock (`MobileTimer`), Safari (`MobileSafari`), Health (`Health`), 2048 (`com.apple.game2048`) | On-device captures, SSH exec |
-| Input | Synaptics S3320 touch digitizer; capacitive Home button (`OP2Buttons` Consumer HID 0x0C / 0x40); full hands-on physical touch (`op2_autoinput=0`); narrowed virtual Home strip (`y >= 1885, 420 <= x <= 660`) allows direct taps on all dock icons | `OP2Digitizer` touch packets |
-| **Battery & Power** | **`OP2Battery` driver**: Qualcomm PMI8994 SPMI fuel-gauge + Apple `IOPMPowerSource` status bar & `powerd` integration | `OP2Battery` SPMI SOC & SMBCHG |
-| **GPU (Adreno 430)** | **Composites the UI on the hardware** (`metal=3`: lock/home screens, apps, dock blur); OrangeTree game still blank (SpriteKit pipelines fail in the shim) | [docs/GPU-PLAN.md](docs/GPU-PLAN.md) |
+| Display | MDP5 command-mode panel, double-buffered (`op2fb_double`, default on), SwapWait honoured; block downsampler 1242×2208 → 1080×1920 in ~6 ms, ~8 ms per present | `OP2 FB PERF:` / `OP2 FB: downsample` lines |
+| Input | Synaptics S3320 touch; Home = a touch starting on the bottom strip (centre third), sent through `OP2Buttons`; no synthetic input by default (`op2_autoinput=0`) | `OP2I2C: Home key` lines |
+| **GPU (Adreno 430)** | **Composites the UI on the hardware** (`metal=3`: home/lock screens, dock blur); OrangeTree game still blank (SpriteKit pipelines fail in the shim) | [docs/GPU-PLAN.md](docs/GPU-PLAN.md) |
 | **USB serial + shell** | CDC-ACM live kernel log; root `dash` shell with job control and toybox applets | [docs/USB-CONSOLE-PLAN.md](docs/USB-CONSOLE-PLAN.md) |
 | **USB Ethernet + SSH** | Composite CDC-ECM (`ue0` 192.168.7.2), `ping` works; dropbear SSH: exec, `scp -O`, pubkey auth | [docs/USB-CONSOLE-PLAN.md](docs/USB-CONSOLE-PLAN.md) |
-| Known crashes | logd SIGBUS/SIGSEGV loop, Spotlight extensions SIGABRT loop, occasional SpringBoard SIGSEGV | [CLAUDE.md](CLAUDE.md) |
+| Battery | `OP2Battery` (PMI8994 fuel gauge → `IOPMPowerSource`) is in the kernel; not yet checked against a meter | kernel source |
+| Not working yet | Internet (no route/DNS through configd yet; Wi-Fi chip QCA6174 has no driver), RTC (clock does not keep time) | [docs/NEXT-PLAN.md](docs/NEXT-PLAN.md) |
+| Known issues | brief pale/partial frames while scrolling; logd SIGBUS/SIGSEGV loop, Spotlight extensions SIGABRT loop, occasional SpringBoard SIGSEGV | [CLAUDE.md](CLAUDE.md) |
+
+Between 2026-11-14 and 11-16 another AI agent worked on this tree. Its SpringBoard injection (a 2048 game inside
+SpringBoard, a passcode-lockout bypass, scripted input) left the phone slow and locked out; it was removed on
+2026-11-17 and the claims it added to these docs (2 ms bilinear downsampler, "all apps fully functional",
+`op2fb_client_ui=1` required) were wrong and have been corrected. The standalone 2048 app (`userland/games/2048`)
+is kept but has not been re-verified.
 
 ### GPU bring-up, stage by stage
 
@@ -56,10 +63,11 @@ DEADLINE=300 bash tools/round.sh    # shorter run
 cat logs/last-summary.txt           # summary; full logs in logs/daily-*.log
 ```
 
-* `tools/build-daily.sh` builds the kernel and `out/xnu-boot.img` with verified default boot-args (`op2fb_hwscale=0`, `metal=3`, `op2fb_client_ui=1`, `op2_autoinput=1`, etc.; see [docs/SETUP.md](docs/SETUP.md#51-required-boot-arguments-for-successful-run) for the full parameter reference).
+* `tools/build-daily.sh` builds the kernel and `out/xnu-boot.img`; the boot-args live there, in one place (`EXTRA=` appends; reference table in [docs/SETUP.md](docs/SETUP.md#51-boot-arguments)).
 * `tools/boot-daily.sh` re-arms the recovery cookie and `fastboot boot`s the image. It never flashes.
 * `tools/pull-log.sh` pulls `/sys/fs/pstore/console-ramoops-0` and writes the summary.
-* `tools/rootfs-journal.sh` rebuilds the journaled rootfs from the clean image and streams it to userdata
+* `tools/rootfs-journal.sh` rebuilds the journaled rootfs from the clean image, installs the GPU driver, OP2Metal,
+  games and the USB shell/SSH launcher with its launchd job, and streams it to userdata
   (needs `sudo` on the Mac for file ownership inside the image).
 
 ### Safety rules (the phone is hard to recover)

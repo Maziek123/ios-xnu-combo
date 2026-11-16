@@ -26,6 +26,8 @@ fi
 sudo python3 tools/rootfs_g5.py "$MNT"
 # games: every out/games/build/*.app into /Applications (tools/games/build-*.sh)
 sudo python3 tools/rootfs_games.py "$MNT"
+# USB root shell + SSH: the op2shell launcher and its launchd job (after G3: it reuses the op2-air-run path)
+sudo python3 tools/rootfs_shell.py "$MNT"
 sync
 hdiutil detach "$MNT"
 trap - EXIT

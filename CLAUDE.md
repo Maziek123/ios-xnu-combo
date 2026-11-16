@@ -20,19 +20,29 @@ claims were wrong ("0 crashes", "verified" milestones driven by a scripted fake 
 Build errors land in logs/last-build-errors.txt. kprintf does NOT reach ramoops (no serial=3);
 use printf/IOLog for anything you need to see.
 
-## State (2026-11-13; see docs/SETUP.md for replication, docs/USB-CONSOLE-PLAN.md stages 2-3)
-- Quad-core SMP (cpus=4); thermal thread: TSENS, throttle at 70 C, cutoff 90 C (logs show ~768 MHz at low 60s C).
+## State (2026-11-17; see docs/SETUP.md for replication, docs/USB-CONSOLE-PLAN.md stages 2-3)
+- Quad-core SMP (cpus=4); thermal thread: TSENS, throttle at 70 C, cutoff 90 C (~768 MHz at low 60s C).
 - eMMC CMD18 multi-block reads with self-test; 0 failures so far.
-- Double-buffered panel, SwapWait, immediate present; ~6 ms CPU downsample 1242x2208->1080x1920.
-- Home = touch starting on bottom 40 px strip (centre third), consumed; sent once via OP2Buttons.
-- Synthetic input: op2_autoinput=1 (wake-only). Rootfs journaled, synced before deadline.
+- Panel: double-buffered (op2fb_double, default 1 again), SwapWait, immediate present, block downsample
+  1242x2208->1080x1920 ~6 ms, ~8 ms/present. A frame that arrives inside the 15.6 ms kick spacing is copied
+  at once into the back buffer and only the flip+kick waits (presentPending/flipAndKick, `early=` in FB PERF).
+  Surfaces in the uncached carveout: panel-sized (1080x1920) only - 1242x2208 there made the copy ~183 ms.
+- Home = touch starting on bottom strip (centre third), consumed; sent once via OP2Buttons.
+- No synthetic input (op2_autoinput=0). op2fb_client_ui=0. Rootfs journaled, synced before deadline.
 - USB serial console (CDC-ACM, live kernel log) + root dash shell on /dev/op2usb with job control
   (d_type D_TTY: iOS 12 isatty checks FIODTYPE, not TIOCGETA) + toybox applets (/usr/local/bin and /bin).
 - Composite CDC-ECM: phone ue0 192.168.7.2/24, Mac 192.168.7.1/24, ping verified; SSH exec + scp -O +
-  pubkey auth verified (dropbear, host keys via -R, /tmp/dropbear.log on phone).
+  pubkey auth verified (dropbear, host keys via -R, /tmp/dropbear.log on phone). SSH PATH lacks
+  /usr/local/bin: use full paths. No sleep/sort/chown on the phone (/usr/local/bin/op2chown exists).
 - GPU G0-G3 pass; G4d/G4e SMMU + pvtmem fix; G5 metal=3 composites home/lock/dock on the Adreno
   (see docs/GPU-PLAN.md). OrangeTree game still blank (SpriteKit pipelines return NULL in the shim) - open.
-- Open crashes: logd SIGBUS/SIGSEGV loop (stack probe), Spotlight extensions SIGABRT loop,
-  occasional SpringBoard SIGSEGV.
+- Internet: not yet. configd's KernelEventMonitor/IPMonitor do not publish ue0, so no default route/DNS.
+  Wi-Fi (QCA6174 on PCIe) has no driver.
+- Open: partial frames while scrolling (recheck with dbl=1), logd SIGBUS/SIGSEGV loop (stack probe),
+  Spotlight extensions SIGABRT loop, occasional SpringBoard SIGSEGV, no RTC.
+- 2026-11-14..16 another agent injected lib_op2_springboard/lib_op2_app_fix into SpringBoard via the
+  xpcd cache, patched SpringBoard, and made the slow bilinear downsampler + 1242x2208 carveout surfaces.
+  All reverted 2026-11-17 (phone: stock SpringBoard, xpcd_cache = backup/rootfs/xpcd_cache.dylib.op2shell,
+  the two dylibs replaced by an empty one; originals backup/rootfs/*.otherai*). Do not reintroduce.
 - Reference for GPU: hakios (MIT) github.com/oosexgang/hakios-xnu-kernel (Metal driver,
   AIR->NIR front end tools/mesa/air). Mesa 25.0.x needed (ir3 for chip 0x04030002).
