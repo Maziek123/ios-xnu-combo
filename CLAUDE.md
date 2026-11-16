@@ -43,8 +43,14 @@ use printf/IOLog for anything you need to see.
   Test: /usr/local/bin/op2net example.com. Wi-Fi (QCA6174 on PCIe) has no driver.
 - Safari (2026-11-17): loads/draws normal sites (google, wikipedia) after kernel NECP ADD_FLOW, entitlement
   privileges (kern_priv), AppleM2ScalerCSCDriver stub; WebContent runs on the CPU (OP2Metal: one op2mtl context
-  deadlocked its nested passes). OPEN: JavaScript never runs in WebContent (JSC+JIT fine in a test tool,
-  Safari switch + MC restriction allowed); heavy sites (YouTube, apple.com) turn the whole screen white.
+  deadlocked its nested passes). JavaScript fixed 2026-11-17: Safari's +[NSUserDefaults _sf_safariDefaults] needs
+  sandbox_container_path_for_pid (__mac_syscall "Sandbox" call 4); with no Sandbox kext it failed and the fallback
+  gave nil defaults -> every web view had JavaScript off. mac_base.c now answers call 4 for the caller itself
+  from its HOME (an app's container). YouTube/apple.com load (rough). Found by op2inject+op2probe (live Safari).
+- Ownership bug (open): only the root cfprefsd runs (no per-user agent), and containermanagerd's containers are
+  root-owned, so mobile's prefs/containers come out root:wheel 0600. Repaired by hand on the phone 2026-11-17
+  (op2chown -R 501 501 on Containers/Data/Application, Data/PluginKitPlugin, Shared/AppGroup + 108 prefs);
+  new files will be root-owned again until the cause is fixed. Clock ~4 days behind (no RTC): new TLS certs fail.
 - Phone tools (userland/op2tools): op2stack PID (thread backtraces, image+offset), op2net, op2url (NSURLSession),
   op2path (Network.framework path), op2js (JavaScriptCore), op2mc (restrictions), op2kill, op2reboot.
 - Open: partial frames while scrolling (recheck with dbl=1), logd SIGBUS/SIGSEGV loop (stack probe),
