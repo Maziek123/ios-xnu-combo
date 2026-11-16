@@ -22,6 +22,7 @@ clang -target arm64-apple-ios12.0 -isysroot "$SDK" -O2 -Wall -Wextra \
   -DDASH_BIN="\"$PWD/out/shell/build/dash\"" -DTOYBOX_BIN="\"$PWD/out/shell/build/toybox\"" \
   -DDROPBEAR_BIN="\"$PWD/out/shell/build/dropbear\"" -DSCP_BIN="\"$PWD/out/shell/build/scp\"" \
   -DAUTHKEYS_BIN="\"$PWD/out/shell/build/authorized_keys\"" \
+  -framework SystemConfiguration -framework CoreFoundation \
   -o out/shell/build/op2shell userland/op2shell/op2shell.c
 strip -x out/shell/build/op2shell && codesign -s - -i com.op2.air-run --force out/shell/build/op2shell
 ls -l out/shell/build/dash out/shell/build/op2shell

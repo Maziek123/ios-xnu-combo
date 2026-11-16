@@ -23,7 +23,9 @@ clone it to `xnu/xnu-4903.270.47` inside this checkout.
 | **USB serial + shell** | CDC-ACM live kernel log; root `dash` shell with job control and toybox applets | [docs/USB-CONSOLE-PLAN.md](docs/USB-CONSOLE-PLAN.md) |
 | **USB Ethernet + SSH** | Composite CDC-ECM (`ue0` 192.168.7.2), `ping` works; dropbear SSH: exec, `scp -O`, pubkey auth | [docs/USB-CONSOLE-PLAN.md](docs/USB-CONSOLE-PLAN.md) |
 | Battery | `OP2Battery` (PMI8994 fuel gauge → `IOPMPowerSource`) is in the kernel; not yet checked against a meter | kernel source |
-| Not working yet | Internet (no route/DNS through configd yet; Wi-Fi chip QCA6174 has no driver), RTC (clock does not keep time) | [docs/NEXT-PLAN.md](docs/NEXT-PLAN.md) |
+| **Internet over USB** | Through the Mac's NAT: configd makes `ue0` primary, DNS + HTTP verified from the phone ([setup](docs/SETUP.md)) | `op2net example.com` → `200 OK` |
+| Safari | Loads and draws normal sites (Google, Wikipedia over HTTPS); JavaScript does not run yet; heavy sites turn the screen white | photos on the phone |
+| Not working yet | Wi-Fi (QCA6174 on PCIe has no driver), RTC (clock does not keep time) | [docs/NEXT-PLAN.md](docs/NEXT-PLAN.md) |
 | Known issues | brief pale/partial frames while scrolling; logd SIGBUS/SIGSEGV loop, Spotlight extensions SIGABRT loop, occasional SpringBoard SIGSEGV | [CLAUDE.md](CLAUDE.md) |
 
 Between 2026-11-14 and 11-16 another AI agent worked on this tree. Its SpringBoard injection (a 2048 game inside

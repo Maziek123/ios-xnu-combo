@@ -36,8 +36,17 @@ use printf/IOLog for anything you need to see.
   /usr/local/bin: use full paths. No sleep/sort/chown on the phone (/usr/local/bin/op2chown exists).
 - GPU G0-G3 pass; G4d/G4e SMMU + pvtmem fix; G5 metal=3 composites home/lock/dock on the Adreno
   (see docs/GPU-PLAN.md). OrangeTree game still blank (SpriteKit pipelines return NULL in the shim) - open.
-- Internet: not yet. configd's KernelEventMonitor/IPMonitor do not publish ue0, so no default route/DNS.
-  Wi-Fi (QCA6174 on PCIe) has no driver.
+- Internet over USB works (2026-11-17): kernel publishes IOPlatformUUID (OP2PlatformExpert; without it
+  gethostuuid() blocked configd's IPConfiguration plugin forever, so NO network plugin ever ran). op2shell
+  publishes service op2usb (State:/Network/Service/op2usb/IPv4+DNS, router 192.168.7.1, DNS 1.1.1.1/8.8.8.8;
+  re-published every 15 s if configd loses it). Mac must NAT: pfctl anchor com.apple/op2nat (docs/SETUP.md 6).
+  Test: /usr/local/bin/op2net example.com. Wi-Fi (QCA6174 on PCIe) has no driver.
+- Safari (2026-11-17): loads/draws normal sites (google, wikipedia) after kernel NECP ADD_FLOW, entitlement
+  privileges (kern_priv), AppleM2ScalerCSCDriver stub; WebContent runs on the CPU (OP2Metal: one op2mtl context
+  deadlocked its nested passes). OPEN: JavaScript never runs in WebContent (JSC+JIT fine in a test tool,
+  Safari switch + MC restriction allowed); heavy sites (YouTube, apple.com) turn the whole screen white.
+- Phone tools (userland/op2tools): op2stack PID (thread backtraces, image+offset), op2net, op2url (NSURLSession),
+  op2path (Network.framework path), op2js (JavaScriptCore), op2mc (restrictions), op2kill, op2reboot.
 - Open: partial frames while scrolling (recheck with dbl=1), logd SIGBUS/SIGSEGV loop (stack probe),
   Spotlight extensions SIGABRT loop, occasional SpringBoard SIGSEGV, no RTC.
 - 2026-11-14..16 another agent injected lib_op2_springboard/lib_op2_app_fix into SpringBoard via the

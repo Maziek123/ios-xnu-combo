@@ -2122,7 +2122,22 @@ commandBufferRenderEncoder(id self, __unused SEL _cmd, MTLRenderPassDescriptor *
 	}
 	if (!any)
 		return enc;
-	pthread_mutex_lock(&gPassLock);
+	/* 2026-11-17: never wait forever. One global op2mtl context means one pass at a time; WebKit's
+	 * WebContent started a pass on one thread and, mid-pass, dispatch_sync'ed to a queue that wanted
+	 * its own pass: deadlock, white page. After 100 ms this pass is dropped instead (draws skipped). */
+	{
+		int tries = 0;
+		while (pthread_mutex_trylock(&gPassLock) != 0) {
+			if (++tries > 100) {
+				static unsigned sSkipLogged;
+				if (sSkipLogged++ < 5)
+					op2_log(@"G pass skipped: another thread held the GPU pass lock for 100 ms");
+				gStat.skipped++;
+				return enc;
+			}
+			usleep(1000);
+		}
+	}
 	busyBegin("a render pass");   /* until endEncoding */
 	if (!M.pass_begin(gMtl, att)) {
 		busyEnd();
@@ -2847,6 +2862,12 @@ shownToThisProcess(void)
 	}
 	if (level == 2 && strcmp(prog, "backboardd") != 0 && strcmp(prog, "metal_test") != 0 &&
 	    strcmp(prog, "tzinit") != 0) {
+		return NO;
+	}
+	/* WebKit's web content process renders with the CPU: its CoreAnimation nests passes across threads,
+	 * which our single op2mtl context cannot do (deadlocked: Safari showed white pages). */
+	if (level >= 3 && strcmp(prog, "com.apple.WebKit.WebContent") == 0) {
+		op2_log(@"Process %s kept on the CPU (nested passes across threads)", prog);
 		return NO;
 	}
 	if (level >= 2) {

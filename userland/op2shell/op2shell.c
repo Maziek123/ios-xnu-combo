@@ -164,6 +164,65 @@ install_toybox_links(void)
 	install_link("/bin", "scp", "/usr/local/bin/scp");
 }
 
+/*
+ * USB internet: publish a network service for ue0 (the kernel already set 192.168.7.2/24) into configd,
+ * so IPMonitor makes ue0 primary with the Mac (192.168.7.1, NAT) as router and gives apps DNS. ue0 has no
+ * IOKit object, so IPConfiguration never adopts it; we publish the service's State: keys ourselves. Keys
+ * survive our session, not a configd restart, so this child re-publishes every 15 s when they are gone.
+ */
+#include <CoreFoundation/CoreFoundation.h>
+/* Exported by iOS's SystemConfiguration but marked unavailable in the SDK header: declared here. */
+typedef struct __SCDynamicStore *SCDynamicStoreRef;
+SCDynamicStoreRef SCDynamicStoreCreate(CFAllocatorRef, CFStringRef, void *, void *);
+CFPropertyListRef SCDynamicStoreCopyValue(SCDynamicStoreRef, CFStringRef);
+Boolean SCDynamicStoreSetMultiple(SCDynamicStoreRef, CFDictionaryRef, CFArrayRef, CFArrayRef);
+
+static CFDictionaryRef
+dict(int n, const void **k, const void **v)
+{
+	return CFDictionaryCreate(NULL, k, v, n, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+}
+
+static CFArrayRef
+arr(int n, const void **v)
+{
+	return CFArrayCreate(NULL, v, n, &kCFTypeArrayCallBacks);
+}
+
+static void
+publish_net(void)
+{
+	SCDynamicStoreRef st = NULL;
+	for (;;) {
+		if (st == NULL)
+			st = SCDynamicStoreCreate(NULL, CFSTR("op2shell"), NULL, NULL);
+		if (st != NULL) {
+			CFPropertyListRef ifv4 = SCDynamicStoreCopyValue(st, CFSTR("State:/Network/Interface/ue0/IPv4"));
+			CFPropertyListRef have = SCDynamicStoreCopyValue(st, CFSTR("State:/Network/Service/op2usb/IPv4"));
+			if (ifv4 != NULL && have == NULL) {   /* KernelEventMonitor sees ue0 and our service is missing */
+				const void *a[] = { CFSTR("192.168.7.2") }, *m[] = { CFSTR("255.255.255.0") };
+				const void *dns[] = { CFSTR("1.1.1.1"), CFSTR("8.8.8.8") }, *order[] = { CFSTR("op2usb") };
+				const void *k4[] = { CFSTR("Addresses"), CFSTR("SubnetMasks"), CFSTR("Router"), CFSTR("InterfaceName") };
+				const void *v4[] = { arr(1, a), arr(1, m), CFSTR("192.168.7.1"), CFSTR("ue0") };
+				const void *kd[] = { CFSTR("ServerAddresses") }, *vd[] = { arr(2, dns) };
+				const void *ko[] = { CFSTR("ServiceOrder") }, *vo[] = { arr(1, order) };
+				const void *kk[] = { CFSTR("State:/Network/Service/op2usb/IPv4"), CFSTR("State:/Network/Service/op2usb/DNS"),
+				    CFSTR("Setup:/Network/Global/IPv4") };
+				const void *vv[] = { dict(4, k4, v4), dict(1, kd, vd), dict(1, ko, vo) };
+				CFDictionaryRef all = dict(3, kk, vv);
+				if (SCDynamicStoreSetMultiple(st, all, NULL, NULL))
+					say("op2shell: ue0 published as primary network (router 192.168.7.1, DNS 1.1.1.1)\n");
+				CFRelease(all);
+			}
+			if (ifv4 != NULL)
+				CFRelease(ifv4);
+			if (have != NULL)
+				CFRelease(have);
+		}
+		sleep(15);
+	}
+}
+
 int
 main(void)
 {
@@ -197,6 +256,10 @@ main(void)
 		} else if (db > 0) {
 			waitpid(db, NULL, 0);   /* reap the starter; the daemon lives on */
 		}
+	}
+	if (fork() == 0) {
+		publish_net();
+		_exit(0);
 	}
 	say(ok ? "op2shell: dash+toybox+ssh ready, waiting for /dev/op2usb\n" :
 	    "op2shell: cannot install shell\n");

@@ -131,6 +131,16 @@ XNU truncates the command line at 255 bytes; the script refuses at 250.
 4. **SSH** (stage 3): `ssh root@192.168.7.2` (pubkey, host keys auto-created on the
    phone by `dropbear -R`); `scp -O` both ways (legacy protocol: no sftp-server on device).
    Server log: `/tmp/dropbear.log` on the phone.
+5. **Internet over USB**: the phone publishes `ue0` to configd itself (op2shell) with the Mac as router and
+   1.1.1.1/8.8.8.8 as DNS. The Mac must forward and NAT (both reset when the Mac reboots):
+   ```bash
+   sudo sysctl -w net.inet.ip.forwarding=1
+   echo "nat on en0 inet from 192.168.7.0/24 to any -> (en0)" | sudo pfctl -a com.apple/op2nat -f - && sudo pfctl -E
+   ```
+   (`en0` = the Mac's internet interface: `route -n get default`.) Check on the phone:
+   `/usr/local/bin/op2net example.com` → `http HTTP/1.1 200 OK`; `scutil --nwi` shows `ue0` reachable.
+   If `scutil` shows no `Plugin:`/`Setup:` keys at all, configd's plugins are stuck: the kernel must publish
+   `IOPlatformUUID` (`OP2: IOPlatformUUID` in the boot log).
 
 ## 7. Troubleshooting
 
@@ -148,5 +158,5 @@ XNU truncates the command line at 255 bytes; the script refuses at 250.
 Boots to the Lock Screen and Home Screen, unlocks, touch and Home work, the UI is composited on the Adreno
 (`metal=3`). ~8 ms per present, SwapWait timeouts 0, ~1 % kernel CPU when idle, ~61 °C at 768 MHz.
 Serial shell + SSH over USB work. Open: brief partial frames while scrolling (being re-checked with double
-buffering back on), no internet yet (USB tethering next, then Wi-Fi), no RTC, the crash loops listed in
+buffering back on), internet over USB works through the Mac's NAT (Wi-Fi has no driver yet), no RTC, the crash loops listed in
 `CLAUDE.md`. Next work: `docs/NEXT-PLAN.md`.
