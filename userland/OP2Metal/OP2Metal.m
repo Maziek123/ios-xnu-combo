@@ -2369,6 +2369,10 @@ textureUploadYUV(struct op2_texture *t)
 		}
 	}
 	IOSurfaceUnlock(s, kIOSurfaceLockReadOnly, NULL);
+	/* the decoder reuses its buffers: if a new frame landed while we read this one, the copy is half old, half
+	 * new (a tear); keep the previous picture and convert again at the next bind */
+	if (IOSurfaceGetSeed(s) != seed)
+		return;
 	M.texture_replace(t->gpu, 0, 0, 0, w, h, t->yuvBuf, (size_t)w * 4);
 	t->yuvSeed = seed;
 }
