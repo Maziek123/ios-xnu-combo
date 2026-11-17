@@ -3096,6 +3096,9 @@ __attribute__((constructor)) static void
 registerOP2Metal(void)
 {
 	if (!shownToThisProcess()) {
+		/* still report crashes there (stacks + abort messages in the kernel log); no Metal device */
+		if (getprogname() && strcmp(getprogname(), "mediaserverd") == 0)
+			installCrashReports();
 		return;
 	}
 	installCrashReports();

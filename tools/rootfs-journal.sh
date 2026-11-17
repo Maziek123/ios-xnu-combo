@@ -26,6 +26,8 @@ fi
 sudo python3 tools/rootfs_g5.py "$MNT"
 # games: every out/games/build/*.app into /Applications (tools/games/build-*.sh)
 sudo python3 tools/rootfs_games.py "$MNT"
+# audio: silent built-in device so mediaserverd runs (userland/op2audio/build.sh)
+sudo python3 tools/rootfs_audio.py "$MNT"
 # USB root shell + SSH: the op2shell launcher and its launchd job (after G3: it reuses the op2-air-run path)
 sudo python3 tools/rootfs_shell.py "$MNT"
 sync

@@ -51,22 +51,20 @@ use printf/IOLog for anything you need to see.
   root-owned, so mobile's prefs/containers come out root:wheel 0600. Repaired by hand on the phone 2026-11-17
   (op2chown -R 501 501 on Containers/Data/Application, Data/PluginKitPlugin, Shared/AppGroup + 108 prefs);
   new files will be root-owned again until the cause is fixed. Clock ~4 days behind (no RTC): new TLS certs fail.
-- Media / YouTube (2026-11-17, step 1 started): mediaserverd is disabled in launchd's disabled.plist and
-  VirtualAudio.plugin (the built-in audio device) was moved to /Library/Audio/Plug-Ins/HAL.disabled at rootfs build
-  (mkop2root.py: "crashes without real DSP"). Re-enabled, mediaserverd hangs at startup: the HAL plugins in
-  /Library/Audio/Plug-Ins/HAL (AirPlay/CarPlay/Octavia Halogen, BTAudio, TimeSync, NetworkUplinkClock) block on sync
-  XPC to absent daemons; with those moved aside it still waits on IDS (identityservicesd) and in CoreAudio.
-  Step 1 so far: userland/op2audio = OP2NullAudio.driver (AudioServerPlugIn, silent 48 kHz stereo output); it loads.
-  CoreMedia's CMSession waits for VirtualAudio's devices ("Going to wait on vadInitialization"), so VirtualAudio must
-  run; with OP2NullAudio present it now loads too. mediaserverd still crash-loops at startup in the camera/video side:
-  HDR.videoprocessor bus error (likely an unbacked mapping, e.g. the AppleM2ScalerCSCDriver stub maps nothing) and an
-  abort after opening OP2GPU user client type 1 (selectors 7, 2 unhandled). OP2Metal keeps mediaserverd on the CPU.
-  Phone state: /Library/Audio/Plug-Ins/HAL = OP2NullAudio + VirtualAudio, the six Halogen/BT/clock plugins in
-  HAL.op2-off; mediaserverd disabled again at boot (disabled.plist, backup/rootfs/disabled.plist.2026-11-17).
-  Plan: (1) mediaserverd up with a silent built-in device (what VirtualAudio.plugin needs from the kernel),
-  (2) software H.264 VideoToolbox decoder plugin, (3) YUV video surfaces in OP2Metal/CA, (4) real Qualcomm audio.
+- Media / YouTube: step 1 DONE 2026-11-17 - mediaserverd runs (enabled in launchd's disabled.plist) and audio
+  plays: AVAudioSession activates, AudioQueue output starts and its clock advances (op2tone). Pieces:
+  OP2NullAudio.driver (userland/op2audio, silent 48 kHz stereo AudioServerPlugIn) + VirtualAudio.plugin back in
+  /Library/Audio/Plug-Ins/HAL (CMSession waits on its devices); AirPlay/CarPlay/Octavia Halogen, BTAudio, TimeSync,
+  NetworkUplinkClock moved to HAL.op2-off (they block on absent daemons); tools/rootfs_audio.py does all of it.
+  The startup crash was a kernel IOSurface bug: plane records in the create reply had bytesPerRow at 0x08 and size
+  at 0x10; iOS 12 reads offset 0x0c, bytesPerRow 0x10, size 0x14 -> every YUV surface reported plane size as stride
+  (HDR.videoprocessor overflowed). OP2Metal and OP2GPU keep mediaserverd off the GPU. Route list is empty (no
+  "Speaker" route name yet). Next: (2) software H.264 VideoToolbox decoder, (3) YUV surfaces drawn by CA/OP2Metal,
+  (4) real Qualcomm audio. Crash hunting in short-lived daemons: op2inject + op2crash.dylib (DYLD_INSERT is ignored
+  for entitled binaries).
 - Phone tools (userland/op2tools): op2stack PID (thread backtraces, image+offset), op2net, op2url (NSURLSession),
-  op2path (Network.framework path), op2js (JavaScriptCore), op2mc (restrictions), op2kill, op2reboot.
+  op2path (Network.framework path), op2js (JavaScriptCore), op2mc (restrictions), op2kill, op2reboot,
+  op2inject/op2probe/op2crash (load a dylib into a running process; Safari probe; crash reports), op2tone (audio).
 - Open: partial frames while scrolling (recheck with dbl=1), logd SIGBUS/SIGSEGV loop (stack probe),
   Spotlight extensions SIGABRT loop, occasional SpringBoard SIGSEGV, no RTC.
 - 2026-11-14..16 another agent injected lib_op2_springboard/lib_op2_app_fix into SpringBoard via the
