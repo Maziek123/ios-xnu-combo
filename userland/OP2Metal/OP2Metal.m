@@ -2870,6 +2870,12 @@ shownToThisProcess(void)
 		op2_log(@"Process %s kept on the CPU (nested passes across threads)", prog);
 		return NO;
 	}
+	/* mediaserverd's video processors (HDR.videoprocessor and friends) use Metal paths and GPU user-client
+	 * selectors the shim does not have: bus error / abort at startup (2026-11-17). Video there stays on the CPU. */
+	if (level >= 3 && strcmp(prog, "mediaserverd") == 0) {
+		op2_log(@"Process %s kept on the CPU (video processors need more than the shim)", prog);
+		return NO;
+	}
 	if (level >= 2) {
 		return YES;
 	}

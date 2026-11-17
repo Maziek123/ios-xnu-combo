@@ -44,6 +44,10 @@ static void load_images(task_t t)
 		nimg++;
 	}
 	printf("images %d, shared cache slide 0x%llx\n", nimg, (unsigned long long)aii.sharedCacheSlide);
+	if (getenv("OP2_IMAGES"))
+		for (int i = 0; i < nimg; i++)
+			if (imgs[i].base < 0x180000000ULL)   /* not in the shared cache */
+				printf("image 0x%llx %s\n", (unsigned long long)imgs[i].base, imgs[i].path);
 }
 
 static void sym(uint64_t a)
