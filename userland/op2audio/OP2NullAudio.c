@@ -11,6 +11,8 @@
  * Objects: plug-in (1) -> device (2) -> output stream (3). No controls.
  */
 #include <CoreAudio/AudioServerPlugIn.h>
+#include <dlfcn.h>
+#include <stdlib.h>
 #include <mach/mach_time.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -454,4 +456,16 @@ OP2NullAudio_Create(CFAllocatorRef alloc, CFUUIDRef type)
 	if (!CFEqual(type, kAudioServerPlugInTypeUUID))
 		return NULL;
 	return &gInterfacePtr;
+}
+
+/*
+ * mediaserverd is where iOS 12 decodes video for apps (remote VideoToolbox sessions), and it loads this plug-in at
+ * startup: bring the software H.264 decoder along (userland/op2video, registers itself for 'avc1' when loaded).
+ */
+__attribute__((constructor)) static void
+op2_load_video_decoders(void)
+{
+	const char *p = getprogname();
+	if (p && strcmp(p, "mediaserverd") == 0)
+		dlopen("/usr/local/lib/libop2h264.dylib", RTLD_NOW);
 }

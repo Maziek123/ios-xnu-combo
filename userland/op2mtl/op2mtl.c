@@ -1378,13 +1378,21 @@ OP2MTL_API op2mtl_texture *
 op2mtl_texture_from_iosurface(op2mtl_device *dev, uint32_t surface_id, uint32_t mtl_format, uint32_t w,
                               uint32_t h, uint32_t stride)
 {
+   return op2mtl_texture_from_iosurface_plane(dev, surface_id, mtl_format, w, h, stride, 0);
+}
+
+OP2MTL_API op2mtl_texture *
+op2mtl_texture_from_iosurface_plane(op2mtl_device *dev, uint32_t surface_id, uint32_t mtl_format, uint32_t w,
+                                    uint32_t h, uint32_t stride, uint32_t offset)
+{
    enum pipe_format f = pixel_format(mtl_format);
    if (f == PIPE_FORMAT_NONE)
       return fail("iosurface %u: MTLPixelFormat %u is not mapped", surface_id, mtl_format);
    /* freedreno's dmabuf import is the IOSurface import on this port (fd_bo_from_dmabuf -> hakios-drm ->
     * OP2GPU kOP2Surface): the "fd" is the IOSurface's ID */
+   /* freedreno takes the plane's offset into the BO (slice->offset = handle->offset) */
    struct winsys_handle wh = { .type = WINSYS_HANDLE_TYPE_FD, .handle = surface_id, .stride = stride,
-                               .format = f };
+                               .offset = offset, .format = f };
    pthread_mutex_lock(&dev->lock);
    struct pipe_resource *res = dev->screen->resource_from_handle(dev->screen, &(struct pipe_resource){
       .target = PIPE_TEXTURE_2D, .format = f, .width0 = w, .height0 = h, .depth0 = 1, .array_size = 1,
@@ -1393,8 +1401,8 @@ op2mtl_texture_from_iosurface(op2mtl_device *dev, uint32_t surface_id, uint32_t 
    op2mtl_texture *t = res ? texture_wrap(dev, res, w, h) : NULL;
    pthread_mutex_unlock(&dev->lock);
    if (!t)
-      return fail("iosurface %u: %ux%u %s stride %u could not be imported", surface_id, w, h,
-                  util_format_short_name(f), stride);
+      return fail("iosurface %u: %ux%u %s stride %u offset %u could not be imported", surface_id, w, h,
+                  util_format_short_name(f), stride, offset);
    return t;
 }
 

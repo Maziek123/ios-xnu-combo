@@ -5,6 +5,7 @@
  * signal context, the frame-pointer chain, every image's crash annotation (__DATA,__crash_info: abort and
  * assertion messages) and the image list; then lets the signal kill the process as before.
  */
+#import <Foundation/Foundation.h>
 #include <dlfcn.h>
 #include <mach/mach.h>
 #include <fcntl.h>
@@ -134,9 +135,24 @@ handler(int sig, siginfo_t *si, void *ucv)
 	raise(sig);
 }
 
+/* uncaught Objective-C exceptions: name, reason and the THROW site's stack (the abort frames lose it) */
+static void
+exc(NSException *e)
+{
+	char path[64];
+	snprintf(path, sizeof path, "/private/var/tmp/crash-%d.txt", getpid());
+	gFd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0666);
+	out("=== %s pid %d uncaught %s: %s\n", getprogname(), getpid(), e.name.UTF8String, e.reason.UTF8String);
+	for (NSNumber *n in e.callStackReturnAddresses)
+		sym("  throw", n.unsignedLongLongValue);
+	close(gFd);
+	gFd = -1;
+}
+
 __attribute__((constructor)) static void
 op2crash_init(void)
 {
+	NSSetUncaughtExceptionHandler(exc);
 	static char stack[64 * 1024];
 	stack_t ss = { .ss_sp = stack, .ss_size = sizeof stack, .ss_flags = 0 };
 	sigaltstack(&ss, NULL);

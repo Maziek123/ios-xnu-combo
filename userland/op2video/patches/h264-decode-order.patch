@@ -1,0 +1,65 @@
+--- a/libavcodec/h264_slice.c
++++ b/libavcodec/h264_slice.c
+@@ -1291,8 +1291,12 @@
+     cur->mmco_reset = h->mmco_reset;
+     h->mmco_reset = 0;
+ 
+-    if (sps->bitstream_restriction_flag ||
+-        h->avctx->strict_std_compliance >= FF_COMPLIANCE_STRICT) {
++    /* OP2 (OnePlus 2 iOS port): AV_CODEC_FLAG_LOW_DELAY = decode-order output, every frame at once, never held
++     * for reordering (VideoToolbox decoder: a held frame is only released by a flush, which drops references) */
++    const int op2_decode_order = !!(h->avctx->flags & AV_CODEC_FLAG_LOW_DELAY);
++
++    if (!op2_decode_order && (sps->bitstream_restriction_flag ||
++        h->avctx->strict_std_compliance >= FF_COMPLIANCE_STRICT)) {
+         h->avctx->has_b_frames = FFMAX(h->avctx->has_b_frames, sps->num_reorder_frames);
+     }
+ 
+@@ -1315,7 +1319,7 @@
+             h->last_pocs[i] = INT_MIN;
+         h->last_pocs[0] = cur->poc;
+         cur->mmco_reset = 1;
+-    } else if(h->avctx->has_b_frames < out_of_order && !sps->bitstream_restriction_flag){
++    } else if(!op2_decode_order && h->avctx->has_b_frames < out_of_order && !sps->bitstream_restriction_flag){
+         int loglevel = h->avctx->frame_num > 1 ? AV_LOG_WARNING : AV_LOG_VERBOSE;
+         av_log(h->avctx, loglevel, "Increasing reorder buffer to %d\n", out_of_order);
+         h->avctx->has_b_frames = out_of_order;
+@@ -1341,10 +1345,17 @@
+             out     = h->delayed_pic[i];
+             out_idx = i;
+         }
++    if (op2_decode_order) {
++        /* this picture, now, whatever its POC */
++        h->avctx->has_b_frames = 0;
++        out     = cur;
++        out_idx = pics - 1;
++        h->next_outputed_poc = INT_MIN;
++    }
+     if (h->avctx->has_b_frames == 0 &&
+         ((h->delayed_pic[0]->f->flags & AV_FRAME_FLAG_KEY) || h->delayed_pic[0]->mmco_reset))
+         h->next_outputed_poc = INT_MIN;
+-    out_of_order = out->poc < h->next_outputed_poc;
++    out_of_order = op2_decode_order ? 0 : out->poc < h->next_outputed_poc;
+ 
+     if (out_of_order || pics > h->avctx->has_b_frames) {
+         out->reference &= ~DELAYED_PIC_REF;
+@@ -1398,7 +1409,7 @@
+ 
+     sps = h->ps.sps;
+ 
+-    if (sps->bitstream_restriction_flag &&
++    if (!(h->avctx->flags & AV_CODEC_FLAG_LOW_DELAY) && sps->bitstream_restriction_flag &&
+         h->avctx->has_b_frames < sps->num_reorder_frames) {
+         h->avctx->has_b_frames = sps->num_reorder_frames;
+     }
+--- a/libavcodec/h264dec.c
++++ b/libavcodec/h264dec.c
+@@ -415,7 +415,7 @@
+         }
+     }
+ 
+-    if (h->ps.sps && h->ps.sps->bitstream_restriction_flag &&
++    if (!(h->avctx->flags & AV_CODEC_FLAG_LOW_DELAY) && h->ps.sps && h->ps.sps->bitstream_restriction_flag &&
+         h->avctx->has_b_frames < h->ps.sps->num_reorder_frames) {
+         h->avctx->has_b_frames = h->ps.sps->num_reorder_frames;
+     }

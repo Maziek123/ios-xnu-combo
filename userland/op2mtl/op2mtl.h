@@ -107,6 +107,11 @@ OP2MTL_API op2mtl_texture *op2mtl_texture_new(op2mtl_device *dev, uint32_t pixel
 OP2MTL_API op2mtl_texture *op2mtl_texture_from_iosurface(op2mtl_device *dev, uint32_t surface_id,
                                                          uint32_t pixel_format, uint32_t width,
                                                          uint32_t height, uint32_t stride);
+/* one plane of a multi-plane IOSurface (e.g. 420v: plane 0 R8 luma, plane 1 RG8 chroma): offset = the plane's
+ * byte offset in the surface, stride = the plane's bytes per row */
+OP2MTL_API op2mtl_texture *op2mtl_texture_from_iosurface_plane(op2mtl_device *dev, uint32_t surface_id,
+                                                               uint32_t pixel_format, uint32_t width,
+                                                               uint32_t height, uint32_t stride, uint32_t offset);
 OP2MTL_API bool op2mtl_texture_replace(op2mtl_texture *tex, uint32_t level, uint32_t x, uint32_t y,
                                        uint32_t w, uint32_t h, const void *bytes, size_t bytes_per_row);
 OP2MTL_API bool op2mtl_texture_read(op2mtl_texture *tex, uint32_t level, uint32_t x, uint32_t y,

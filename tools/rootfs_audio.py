@@ -8,6 +8,8 @@ mediaserverd (all audio/video playback) needs a built-in audio device. There is 
    HAL.op2-off/                                      AirPlay/CarPlay/Octavia Halogen, BTAudio, TimeSync and
                                                      NetworkUplinkClock: they block startup on absent daemons
    /private/var/db/com.apple.xpc.launchd/disabled.plist   com.apple.mediaserverd enabled
+   /usr/local/lib/libop2h264.dylib                   software H.264 VideoToolbox decoder (userland/op2video), loaded
+                                                     into mediaserverd by OP2NullAudio
 Skips with a message when OP2NullAudio has not been built.
 """
 import os
@@ -49,4 +51,14 @@ if os.path.exists(dp):
     d = plistlib.loads(raw)
     d['com.apple.mediaserverd'] = False
     open(dp, 'wb').write(plistlib.dumps(d, fmt=fmt))
+dec = os.path.join(here, '..', 'out', 'op2video', 'libop2h264.dylib')
+if os.path.exists(dec):
+    d = os.path.join(root, 'usr/local/lib/libop2h264.dylib')
+    os.makedirs(os.path.dirname(d), exist_ok=True)
+    shutil.copy(dec, d)
+    os.chown(d, 0, 0)
+    os.chmod(d, 0o755)
+    print('  [video] libop2h264.dylib (software H.264 decoder) installed')
+else:
+    print('  [video] out/op2video/libop2h264.dylib not built (userland/op2video/build.sh): no video decoding')
 print('  [audio] OP2NullAudio + VirtualAudio in HAL, blocking plug-ins in HAL.op2-off, mediaserverd enabled')

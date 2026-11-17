@@ -51,17 +51,19 @@ use printf/IOLog for anything you need to see.
   root-owned, so mobile's prefs/containers come out root:wheel 0600. Repaired by hand on the phone 2026-11-17
   (op2chown -R 501 501 on Containers/Data/Application, Data/PluginKitPlugin, Shared/AppGroup + 108 prefs);
   new files will be root-owned again until the cause is fixed. Clock ~4 days behind (no RTC): new TLS certs fail.
-- Media / YouTube: step 1 DONE 2026-11-17 - mediaserverd runs (enabled in launchd's disabled.plist) and audio
-  plays: AVAudioSession activates, AudioQueue output starts and its clock advances (op2tone). Pieces:
-  OP2NullAudio.driver (userland/op2audio, silent 48 kHz stereo AudioServerPlugIn) + VirtualAudio.plugin back in
-  /Library/Audio/Plug-Ins/HAL (CMSession waits on its devices); AirPlay/CarPlay/Octavia Halogen, BTAudio, TimeSync,
-  NetworkUplinkClock moved to HAL.op2-off (they block on absent daemons); tools/rootfs_audio.py does all of it.
-  The startup crash was a kernel IOSurface bug: plane records in the create reply had bytesPerRow at 0x08 and size
-  at 0x10; iOS 12 reads offset 0x0c, bytesPerRow 0x10, size 0x14 -> every YUV surface reported plane size as stride
-  (HDR.videoprocessor overflowed). OP2Metal and OP2GPU keep mediaserverd off the GPU. Route list is empty (no
-  "Speaker" route name yet). Next: (2) software H.264 VideoToolbox decoder, (3) YUV surfaces drawn by CA/OP2Metal,
-  (4) real Qualcomm audio. Crash hunting in short-lived daemons: op2inject + op2crash.dylib (DYLD_INSERT is ignored
-  for entitled binaries).
+- Media / YouTube: VIDEO PLAYS (2026-11-17): youtube.com videos play in Safari (silent; "Me at the zoo" ran to the
+  end, test clips loop). Chain: AVPlayer -> mediaserverd (remote VideoToolbox) -> userland/op2video libop2h264.dylib
+  (FFmpeg 6.1.2 H.264, LGPL, patched for decode-order output: patches/h264-decode-order.patch; VTRegisterVideoDecoder
+  'avc1', loaded by OP2NullAudio's constructor) -> NV12 IOSurfaces -> backboardd: CA asks for MTLPixelFormat 500
+  (two-plane YCbCr, AGX-native) which OP2Metal emulates as BGRA converted on the CPU per new frame (IOSurface seed),
+  bound via the private setFragmentTexture:atTextureIndex:samplerState:atSamplerIndex:. Kernel fixes on the way:
+  IOSurface plane record layout (offset 0x0c, bpr 0x10, size 0x14), IOSurface use-count methods 14/15 (+5/11/20/22/26
+  answered), AppleCLCD DisplayPipePlaneBaseAlignment must be a dictionary {PlaneBaseAlignmentLinear}. mediaserverd
+  runs (OP2NullAudio silent device + VirtualAudio; blocking HAL plug-ins in HAL.op2-off; tools/rootfs_audio.py).
+  Open: heavy pages can turn the whole screen white = GPU pool (512 MB) exhausted -> surfaces off-pool -> GPU fence
+  timeouts (OP2 GPU POOL lines now log free/largest/extents); real audio (Qualcomm WCD9330); YUV->RGB is scalar C.
+- Driving the phone without hands: op2home N (Home presses: wake+unlock, no passcode), op2open URL (Safari etc.),
+  op2fbshot OUT.png (panel scanout via AppleCLCD debug selector 96), test pages from a Range-capable server.
 - Phone tools (userland/op2tools): op2stack PID (thread backtraces, image+offset), op2net, op2url (NSURLSession),
   op2path (Network.framework path), op2js (JavaScriptCore), op2mc (restrictions), op2kill, op2reboot,
   op2inject/op2probe/op2crash (load a dylib into a running process; Safari probe; crash reports), op2tone (audio).

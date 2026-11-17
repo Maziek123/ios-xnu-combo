@@ -970,6 +970,12 @@ struct op2_texture {
 	NSUInteger srcLen, srcBpr;
 	void (^srcDealloc)(void *, NSUInteger);
 	uint64_t srcUploaded;    /* gFrameGen of the last copy */
+	/* 2026-11-17: Apple's two-plane YCbCr texture formats (500.., what CA asks for video, sampled as RGB by AGX's
+	 * own hardware) have no Adreno equivalent: the texture is BGRA on the GPU, filled from the surface's Y and
+	 * CbCr planes on the CPU whenever the surface changed (IOSurface seed) and the texture is bound */
+	BOOL yuv;
+	uint32_t yuvSeed;
+	uint8_t *yuvBuf;
 };
 static volatile uint64_t gFrameGen = 1;   /* bumped by every GPU commit */
 
@@ -1023,6 +1029,7 @@ textureFree(void *state)
 		if (t->bytes) {
 			free(t->bytes);
 		}
+		free(t->yuvBuf);
 		t->device = nil;
 		t->descriptor = nil;
 		free(t);
@@ -1326,11 +1333,46 @@ deviceNewTextureIOSurface(id self, SEL _cmd, id descriptor, void *surface, NSUIn
 	*slot = t;
 	/* G5b: the kernel imports the surface's own pages (kOP2Surface), so GPU draws land in it directly */
 	op2mtl_device *dev = mtl();
-	if (dev && surface && plane == 0) {
+	if (dev && surface) {
 		IOSurfaceRef s = (IOSurfaceRef)surface;
+		size_t planes = IOSurfaceGetPlaneCount(s);
 		busyBegin("texture_from_iosurface");
-		t->gpu = M.texture_from_iosurface(dev, IOSurfaceGetID(s), (uint32_t)t->pixelFormat, (uint32_t)t->width,
-		                                  (uint32_t)t->height, (uint32_t)IOSurfaceGetBytesPerRow(s));
+		if (planes == 2 && t->pixelFormat >= 500 && t->pixelFormat < 600) {
+			t->gpu = M.texture_new(dev, 80 /* BGRA8Unorm */, (uint32_t)t->width, (uint32_t)t->height, 1, 1);
+			t->yuv = t->gpu != NULL;
+			t->yuvSeed = 0xffffffffu;
+			op2_log(@"G iosurface %u: YCbCr texture fmt %lu %lux%lu emulated as BGRA (%s)", IOSurfaceGetID(s),
+			        (unsigned long)t->pixelFormat, (unsigned long)t->width, (unsigned long)t->height,
+			        t->gpu ? "ok" : M.last_error());
+		} else if (planes == 0 && plane == 0) {
+			t->gpu = M.texture_from_iosurface(dev, IOSurfaceGetID(s), (uint32_t)t->pixelFormat, (uint32_t)t->width,
+			                                  (uint32_t)t->height, (uint32_t)IOSurfaceGetBytesPerRow(s));
+		} else if (plane < planes) {
+			/* 2026-11-17: multi-plane surfaces (video, 420v/420f: R8 luma + RG8 chroma). Each plane is its own
+			 * texture at the plane's offset and stride; before, only plane 0 existed (with the whole surface's
+			 * stride), so CA's YCbCr shader had no chroma: video showed black. */
+			static op2mtl_texture *(*fromPlane)(op2mtl_device *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+			                                     uint32_t);
+			static int looked;
+			if (!looked) {
+				fromPlane = dlsym(RTLD_DEFAULT, "op2mtl_texture_from_iosurface_plane");
+				looked = 1;
+			}
+			uint32_t off = (uint32_t)((uintptr_t)IOSurfaceGetBaseAddressOfPlane(s, plane) -
+			                          (uintptr_t)IOSurfaceGetBaseAddress(s));
+			uint32_t stride = (uint32_t)IOSurfaceGetBytesPerRowOfPlane(s, plane);
+			if (fromPlane)
+				t->gpu = fromPlane(dev, IOSurfaceGetID(s), (uint32_t)t->pixelFormat, (uint32_t)t->width,
+				                   (uint32_t)t->height, stride, off);
+			else if (plane == 0)
+				t->gpu = M.texture_from_iosurface(dev, IOSurfaceGetID(s), (uint32_t)t->pixelFormat,
+				                                  (uint32_t)t->width, (uint32_t)t->height, stride);
+			static unsigned sLogged;
+			if (sLogged++ < 12)
+				op2_log(@"G iosurface %u plane %lu/%zu fmt %lu %lux%lu offset %u stride %u -> %s", IOSurfaceGetID(s),
+				        (unsigned long)plane, planes, (unsigned long)t->pixelFormat, (unsigned long)t->width,
+				        (unsigned long)t->height, off, stride, t->gpu ? "GPU" : "none");
+		}
 		busyEnd();
 		if (!t->gpu)
 			op2_log(@"G iosurface texture not on the GPU: %s", M.last_error());
@@ -2289,6 +2331,48 @@ encSetFragmentBytes(id self, __unused SEL _cmd, const void *bytes, NSUInteger le
 	encSetBytes(self, 1, bytes, length, index);
 }
 
+/* the surface's current 4:2:0 frame (Y plane + interleaved CbCr) -> BGRA, into the texture's GPU copy */
+static void
+textureUploadYUV(struct op2_texture *t)
+{
+	IOSurfaceRef s = (IOSurfaceRef)t->iosurface;
+	uint32_t seed = IOSurfaceGetSeed(s);
+	if (seed == t->yuvSeed)
+		return;
+	uint32_t w = (uint32_t)t->width, h = (uint32_t)t->height;
+	if (!t->yuvBuf)
+		t->yuvBuf = malloc((size_t)w * h * 4);
+	if (!t->yuvBuf || IOSurfaceLock(s, kIOSurfaceLockReadOnly, NULL) != 0)
+		return;
+	const uint8_t *yp = IOSurfaceGetBaseAddressOfPlane(s, 0), *cp = IOSurfaceGetBaseAddressOfPlane(s, 1);
+	size_t ys = IOSurfaceGetBytesPerRowOfPlane(s, 0), cs = IOSurfaceGetBytesPerRowOfPlane(s, 1);
+	uint32_t pw = (uint32_t)IOSurfaceGetWidthOfPlane(s, 0), ph = (uint32_t)IOSurfaceGetHeightOfPlane(s, 0);
+	if (pw < w) w = pw;
+	if (ph < h) h = ph;
+	OSType fmt = IOSurfaceGetPixelFormat(s);
+	BOOL full = (fmt == '420f');
+	/* BT.709 for HD, BT.601 below 720 lines; 16.16 fixed point */
+	BOOL hd = h >= 720;
+	int crv = hd ? 103206 : 91881, cbu = hd ? 121609 : 116130, cgu = hd ? 12276 : 22554, cgv = hd ? 30679 : 46802;
+	int ym = full ? 65536 : 76309, yo = full ? 0 : 16;
+	if (!full) { crv = crv * 255 / 224; cbu = cbu * 255 / 224; cgu = cgu * 255 / 224; cgv = cgv * 255 / 224; }
+	for (uint32_t y = 0; y < h; y++) {
+		const uint8_t *yr = yp + y * ys, *cr = cp + (y / 2) * cs;
+		uint8_t *o = t->yuvBuf + (size_t)y * w * 4;
+		for (uint32_t x = 0; x < w; x++) {
+			int Y = (yr[x] - yo) * ym, U = cr[(x & ~1u)] - 128, V = cr[(x & ~1u) + 1] - 128;
+			int r = (Y + crv * V) >> 16, g = (Y - cgu * U - cgv * V) >> 16, b = (Y + cbu * U) >> 16;
+			o[4 * x + 0] = (uint8_t)(b < 0 ? 0 : b > 255 ? 255 : b);
+			o[4 * x + 1] = (uint8_t)(g < 0 ? 0 : g > 255 ? 255 : g);
+			o[4 * x + 2] = (uint8_t)(r < 0 ? 0 : r > 255 ? 255 : r);
+			o[4 * x + 3] = 255;
+		}
+	}
+	IOSurfaceUnlock(s, kIOSurfaceLockReadOnly, NULL);
+	M.texture_replace(t->gpu, 0, 0, 0, w, h, t->yuvBuf, (size_t)w * 4);
+	t->yuvSeed = seed;
+}
+
 static void
 encSetTexture(id self, unsigned st, id texture, NSUInteger index)
 {
@@ -2299,6 +2383,8 @@ encSetTexture(id self, unsigned st, id texture, NSUInteger index)
 		gTraceTex[st][index] = texture;
 	if (t && t->src && t->srcUploaded != gFrameGen)
 		textureUploadSource(t);
+	if (t && t->yuv && t->iosurface)
+		textureUploadYUV(t);
 	/* which textures draws sample (each distinct binding once): round g5b-11 has the ASTC wallpaper on the GPU
 	 * but not on the screen */
 	if (t) {
@@ -2338,6 +2424,15 @@ encSetFragmentSampler(id self, __unused SEL _cmd, id sampler, NSUInteger index)
 {
 	if (encOf(self))
 		M.set_sampler(gMtl, 1, (unsigned)index, samplerOf(sampler));
+}
+
+/* private MTLRenderCommandEncoder SPI CA uses for video (YCbCr) layers: texture + sampler in one call.
+ * Unimplemented before 2026-11-17: the video texture was never bound and video layers drew black. */
+static void
+encSetFragmentTextureSampler(id self, SEL _cmd, id texture, NSUInteger tindex, id sampler, NSUInteger sindex)
+{
+	encSetFragmentTexture(self, _cmd, texture, tindex);
+	encSetFragmentSampler(self, _cmd, sampler, sindex);
 }
 
 /* the first draws of a process: which pipeline, which buffers, and the first bytes of each (CA's constants) */
@@ -3270,6 +3365,8 @@ registerOP2Metal(void)
 		class_addMethod(E, sel_registerName("setFragmentTexture:atIndex:"), (IMP)encSetFragmentTexture, "v@:@Q");
 		class_addMethod(E, sel_registerName("setVertexSamplerState:atIndex:"), (IMP)encSetVertexSampler, "v@:@Q");
 		class_addMethod(E, sel_registerName("setFragmentSamplerState:atIndex:"), (IMP)encSetFragmentSampler, "v@:@Q");
+		class_addMethod(E, sel_registerName("setFragmentTexture:atTextureIndex:samplerState:atSamplerIndex:"),
+		                (IMP)encSetFragmentTextureSampler, "v@:@Q@Q");
 		class_addMethod(E, sel_registerName("drawPrimitives:vertexStart:vertexCount:"), (IMP)encDraw1, "v@:QQQ");
 		class_addMethod(E, sel_registerName("drawPrimitives:vertexStart:vertexCount:instanceCount:"), (IMP)encDraw, "v@:QQQQ");
 		class_addMethod(E, sel_registerName("drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:"),
