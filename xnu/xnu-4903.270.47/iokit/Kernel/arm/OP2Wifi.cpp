@@ -366,15 +366,30 @@ step2a(void)
 		summary(line);
 		return;
 	}
-	wr(gConf, 0x10, (uint32_t)W_BARS_PHYS | (mask & 0xFu));
+	/* A BAR is aligned to its own size: 2 MB here, so the first usable address in the window is 0xf8a00000
+	 * (0xf8900000 is not 2 MB-aligned; the chip dropped bit 20 and put BAR0 at 0xf8800000). PCI bus address =
+	 * CPU address (pci-msm: mem_offset 0; the window is passed to PCIe untranslated). */
+	uint64_t addr = (W_BARS_PHYS + size - 1u) & ~(size - 1u);
+	if (addr + size > W_BARS_PHYS + W_BARS_SIZE) {
+		snprintf(line, sizeof(line), "STEP 2a FAIL: no %llu KB-aligned slot for BAR0 in the window", size / 1024);
+		summary(line);
+		return;
+	}
+	wr(gConf, 0x10, (uint32_t)addr | (mask & 0xFu));
 	if ((mask & 0x6u) == 0x4u) {
 		wr(gConf, 0x14, 0u);
 	}
 	wr(gConf, 0x04, (rd(gConf, 0x04) & ~0x7u) | 0x2u);   /* memory space only */
-	W_LOG("BAR0 at 0x%08x, ep command %08x, rp command %08x, rp window %08x", rd(gConf, 0x10), rd(gConf, 0x04),
-	    rd(gDbi, 0x04), rd(gDbi, 0x20));
+	uint32_t got = rd(gConf, 0x10);
+	W_LOG("BAR0 at 0x%08x (wanted 0x%08llx), ep command %08x, rp command %08x, rp window %08x", got, addr,
+	    rd(gConf, 0x04), rd(gDbi, 0x04), rd(gDbi, 0x20));
+	if ((got & ~0xFu) != (uint32_t)addr) {
+		snprintf(line, sizeof(line), "STEP 2a FAIL: BAR0 reads back %08x, wrote %08llx", got, addr);
+		summary(line);
+		return;
+	}
 
-	gBar0 = (volatile uint32_t *)ml_io_map(W_BARS_PHYS, (vm_size_t)size);
+	gBar0 = (volatile uint32_t *)ml_io_map((vm_offset_t)addr, (vm_size_t)size);
 	if (gBar0 == NULL) {
 		summary("STEP 2a FAIL: cannot map BAR0");
 		return;
