@@ -155,8 +155,33 @@ op2_rpm_kick(void)
 	__asm__ volatile("dsb sy" ::: "memory");
 }
 
+/*
+ * 2026-11-23: op2_rpm_init used to race (OP2GPU and the CPU boost both called it; `initialized` was set before
+ * any lock existed, so the second caller saw ready == false: "RPM did not ack"). Now exactly one caller runs
+ * the init; the others wait for it (<= 5 s). That race was the only reason the boost waited 20 s.
+ */
+static bool op2_rpm_init_once(void);
+static volatile uint32_t op2_rpm_init_state;   /* 0 not started, 1 running, 2 finished */
+
 bool
 op2_rpm_init(void)
+{
+	if (op2_rpm_dev.ready) return true;
+	if (__sync_bool_compare_and_swap(&op2_rpm_init_state, 0, 1)) {
+		bool ok = op2_rpm_init_once();
+		__sync_synchronize();
+		op2_rpm_init_state = 2;
+		return ok;
+	}
+	for (int i = 0; i < 5000 && op2_rpm_init_state != 2; i++) {
+		delay(1000);
+	}
+	__sync_synchronize();
+	return op2_rpm_dev.ready;
+}
+
+static bool
+op2_rpm_init_once(void)
 {
 	if (op2_rpm_dev.ready) return true;
 	if (op2_rpm_dev.initialized) return op2_rpm_dev.ready;

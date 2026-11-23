@@ -369,11 +369,21 @@ op2_fb_kick_panel_external(void)
 }
 
 static void op2_cpu_boost(void);
+extern "C" void op2_boot_mark(const char *what);   /* bsd_init.c */
 static void
 op2_cpu_boost_thread(__unused void *param, __unused wait_result_t wr)
 {
-	IOSleep(20000);
+	/* 2026-11-23: was a fixed 20 s, to dodge the op2_rpm_init race (fixed in op2_rpm.c); the A53s ran at
+	 * 768 MHz until then. 1 s, then RPM up (or wait for whoever is bringing it up). op2_boostms overrides. */
+	uint32_t ms = 1000;
+	PE_parse_boot_argn("op2_boostms", &ms, sizeof(ms));
+	IOSleep(ms);
+	if (!op2_rpm_init()) {
+		IOLog("OP2 BOOST: RPM not ready, boost skipped\n");
+		return;
+	}
 	op2_cpu_boost();
+	op2_boot_mark("CPU boost done (1536 MHz unless an OP2 BOOST abort line says otherwise)");
 	/* returning from a kernel thread's entry terminates it */
 }
 
@@ -1482,6 +1492,7 @@ AppleCLCD::present(const uint8_t *rec)
 
 	if (!fUserlandTookOver && target_id >= 2) {
 		fUserlandTookOver = true;
+		op2_boot_mark("first userland frame on the panel");
 		IOLog("OP2 FB: *** DISPLAY HAND-OFF TO USERLAND (surface %u, %ux%u) ***\n",
 		    target_id, s->width, s->height);
 	}

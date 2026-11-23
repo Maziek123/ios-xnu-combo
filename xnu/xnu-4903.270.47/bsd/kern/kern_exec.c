@@ -800,6 +800,20 @@ set_proc_name(struct image_params *imgp, proc_t p)
 	bcopy((caddr_t)imgp->ip_ndp->ni_cnd.cn_nameptr, (caddr_t)p->p_comm,
 	    (unsigned)imgp->ip_ndp->ni_cnd.cn_namelen);
 	p->p_comm[imgp->ip_ndp->ni_cnd.cn_namelen] = '\0';
+	{
+		/* boot timeline: the first exec of the processes that gate the UI */
+		extern void op2_boot_mark(const char *what);
+		static const char *const names[] = { "launchd", "backboardd", "SpringBoard", "logd", "configd" };
+		static uint8_t seen;
+		for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+			if (!(seen & (1u << i)) && strcmp(p->p_comm, names[i]) == 0) {
+				seen |= (uint8_t)(1u << i);
+				char line[48];
+				snprintf(line, sizeof(line), "exec %s (pid %d)", names[i], p->p_pid);
+				op2_boot_mark(line);
+			}
+		}
+	}
 }
 
 /*

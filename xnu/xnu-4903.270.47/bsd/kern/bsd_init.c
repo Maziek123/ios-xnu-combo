@@ -436,9 +436,22 @@ bsd_early_init(void)
  * used like any other.
  */
 
+/*
+ * 2026-11-23 boot timeline: "OP2 BOOT: <s> <what>" lines. Seconds are the generic timer (19.2 MHz), which counts
+ * from SoC power-on, so they include PBL + LK + shim. Grep a round's log for "OP2 BOOT:" to see where time goes.
+ */
+void op2_boot_mark(const char *what);
+void
+op2_boot_mark(const char *what)
+{
+	uint64_t ms = mach_absolute_time() / 19200;
+	printf("OP2 BOOT: %5llu.%03llu s  %s\n", ms / 1000, ms % 1000, what);
+}
+
 void
 bsd_init(void)
 {
+	op2_boot_mark("bsd_init");
 	struct uthread *ut;
 	unsigned int i;
 	struct vfs_context context;
@@ -942,6 +955,7 @@ bsd_init(void)
 
 		bsd_init_kprintf("vfs_mountroot\n");
 		if (0 == (err = vfs_mountroot())) {
+			op2_boot_mark("root filesystem mounted");
 			break;
 		}
 		rootdevice[0] = '\0';
@@ -1080,6 +1094,7 @@ bsdinit_task(void)
 
 	bsd_init_kprintf("bsd_do_post - done");
 
+	op2_boot_mark("starting launchd");
 	load_init_program(p);
 	lock_trace = 1;
 }
