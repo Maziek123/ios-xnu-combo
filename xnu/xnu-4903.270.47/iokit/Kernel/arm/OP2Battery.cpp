@@ -84,6 +84,10 @@ public:
 	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
 	virtual void stop(IOService *provider) APPLE_KEXT_OVERRIDE;
 	virtual void free(void) APPLE_KEXT_OVERRIDE;
+	/* Other drivers (OP2Wifi: PM8994 GPIO 9 and LDO status) use the PMICs through these, so every SPMI command
+	 * goes through the one arbiter channel under the one lock. */
+	static bool sharedRead(uint8_t sid, uint16_t addr, uint8_t *buf, uint32_t len);
+	static bool sharedWrite(uint8_t sid, uint16_t addr, const uint8_t *buf, uint32_t len);
 
 private:
 	volatile uint32_t  *fCore;
@@ -116,6 +120,37 @@ private:
 };
 
 OSDefineMetaClassAndStructors(OP2Battery, IOPMPowerSource);
+
+static OP2Battery *volatile gOP2SpmiOwner = NULL;
+
+bool
+OP2Battery::sharedRead(uint8_t sid, uint16_t addr, uint8_t *buf, uint32_t len)
+{
+	OP2Battery *b = gOP2SpmiOwner;
+	return b != NULL && b->spmiRead(sid, addr, buf, len);
+}
+
+bool
+OP2Battery::sharedWrite(uint8_t sid, uint16_t addr, const uint8_t *buf, uint32_t len)
+{
+	OP2Battery *b = gOP2SpmiOwner;
+	return b != NULL && b->spmiWrite(sid, addr, buf, len);
+}
+
+extern "C" bool op2_spmi_read(uint8_t sid, uint16_t addr, uint8_t *buf, uint32_t len);
+extern "C" bool op2_spmi_write(uint8_t sid, uint16_t addr, const uint8_t *buf, uint32_t len);
+
+extern "C" bool
+op2_spmi_read(uint8_t sid, uint16_t addr, uint8_t *buf, uint32_t len)
+{
+	return OP2Battery::sharedRead(sid, addr, buf, len);
+}
+
+extern "C" bool
+op2_spmi_write(uint8_t sid, uint16_t addr, const uint8_t *buf, uint32_t len)
+{
+	return OP2Battery::sharedWrite(sid, addr, buf, len);
+}
 
 bool
 OP2Battery::init(OSDictionary *dictionary)
@@ -558,6 +593,9 @@ OP2Battery::start(IOService *provider)
 
 	uint32_t ver = fCore[0];
 	IOLog("OP2Battery: SPMI arbiter VERSION=0x%08x\n", ver);
+	if (fSpmiLock != NULL) {
+		gOP2SpmiOwner = this;
+	}
 
 	int enable = 1;
 	(void)PE_parse_boot_argn("op2battery", &enable, sizeof(enable));
@@ -597,6 +635,9 @@ OP2Battery::start(IOService *provider)
 void
 OP2Battery::stop(IOService *provider)
 {
+	if (gOP2SpmiOwner == this) {
+		gOP2SpmiOwner = NULL;
+	}
 	if (fLoop && fTimerAdded) {
 		(void)fLoop->runAction(&OP2Battery::stopPolling, this);
 		fLoop->removeEventSource(fTimer);

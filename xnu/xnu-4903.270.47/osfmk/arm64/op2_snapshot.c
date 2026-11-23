@@ -31,6 +31,7 @@ extern void IOSleep(unsigned milliseconds);
 extern int op2_temp_max, op2_temp_throttled;   /* op2_thermal_thread, below */
 
 void op2_threaddump_start(void);
+extern void op2_wifi_start(void);   /* iokit/Kernel/arm/OP2Wifi.cpp: boot-arg wifi=1/2, otherwise a no-op */
 
 #define OP2_SNAP_MAX_THREADS 48
 #define OP2_SNAP_MAX_SHOTS   8
@@ -600,6 +601,7 @@ op2_threaddump_start(void)
 			thread_deallocate(thth);
 		}
 	}
+	op2_wifi_start();
 	PE_parse_boot_argn("op2_top", &op2_top_interval, sizeof(op2_top_interval));
 	if (op2_top_interval != 0) {
 		thread_t topth;
