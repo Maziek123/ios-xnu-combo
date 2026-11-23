@@ -21,9 +21,8 @@
  *   18 IsMainDisplay, 28 GetDotPitch,
  *   72 Enable/DisableNotifications [func, refcon, type, 0]
  *
- * SwapEnd records the swap; vsync timer presents frames into panel memory
- * at a throttled rate (boot-arg op2fb_hz, default 15 Hz) to prevent single-core
- * CPU starvation.
+ * SwapEnd records the swap and presents at once (op2fb_hz < 60 throttles
+ * to the vsync timer instead). Kicks are paced on MDP5 PP0_DONE (fbsync).
  */
 #include "OP2Surface.h"
 #include "OP2GPU.h"
@@ -103,6 +102,101 @@ static uint8_t op2_fb_last_rec[0x278];    /* last swap record, for deadline dump
 static uint32_t op2_fb_last_nz = 0;       /* its sampled content */
 static uint64_t op2_fb_last_pc = 0;
 
+/*
+ * fbsync (2026-11-23): pace the panel on the MDP5 ping-pong instead of a
+ * fixed 15.6 ms spacing. Boot-arg fbsync, default 1:
+ *   bit 0  wait for PP0_DONE (end of the DSI transfer) before the next
+ *          START, and release a directly scanned-out client surface to
+ *          SwapWait only after its transfer has finished
+ *   bit 1  program PP0 tear check, so each transfer starts on the panel's
+ *          TE and never overtakes the panel's own GRAM read (tear line)
+ * fbsync=0 is the old timing. MDP top registers (0xfd900000) are the
+ * downstream mdss_mdp_hwio.h / Linux mdp5.xml.h ones; INTR_STATUS is raw
+ * (not masked by INTR_EN), so polling needs no GIC routing and INTR_EN
+ * is never touched.
+ */
+#define OP2_MDP_INTR_EN        0x110
+#define OP2_MDP_INTR_STATUS    0x114
+#define OP2_MDP_INTR_CLEAR     0x118
+#define OP2_MDP_IRQ_PP0_DONE   (1u << 8)
+#define OP2_MDP_IRQ_PP0_RDPTR  (1u << 12)
+#define OP2_FB_PP_TIMEOUT_TICKS (34ULL * 19200ULL)   /* 34 ms: two panel frames */
+/* vdisplay + vertical porches + pulse. Only sets the internal counter used
+ * when TE is missing; TE resyncs it every frame.
+ */
+#define OP2_FB_PANEL_VTOTAL    1932u   /* JD35695: 1920 + vbp 7 + vfp 3 + vpw 2 (Android live.dts) */
+
+static volatile uint32_t *op2_fb_mdp_top = NULL;
+static uint32_t op2_fb_sync = 1;
+static uint32_t op2_fb_flush_mask = 0x00020041;  /* CTL | LM0 | VIG0; start() adds the real pipe bit */
+static bool     op2_fb_pp_outstanding = false;
+static uint64_t op2_fb_ppdone_count, op2_fb_ppdone_timeouts, op2_fb_ppdone_max_us, op2_fb_te_seen;
+static uint32_t op2_fb_pp_misses;   /* consecutive PP_DONE timeouts; 8 in a row = the status bit is not ours */
+static uint64_t op2_fb_fps_swaps, op2_fb_fps_completed;
+
+/* Non-blocking: true while the last START's DSI transfer is still running. */
+static bool
+op2_fb_pp_busy(void)
+{
+	if (!(op2_fb_sync & 1) || op2_fb_mdp_top == NULL || !op2_fb_pp_outstanding) {
+		return false;
+	}
+	uint64_t el = mach_absolute_time() - op2_fb_last_kick;
+	if (op2_fb_mdp_top[OP2_MDP_INTR_STATUS / 4] & OP2_MDP_IRQ_PP0_DONE) {
+		op2_fb_mdp_top[OP2_MDP_INTR_CLEAR / 4] = OP2_MDP_IRQ_PP0_DONE;
+		op2_fb_pp_outstanding = false;
+		op2_fb_ppdone_count++;
+		op2_fb_pp_misses = 0;
+		uint64_t us = (el * 10) / 192;
+		if (us > op2_fb_ppdone_max_us) {
+			op2_fb_ppdone_max_us = us;
+		}
+		return false;
+	}
+	if (el > OP2_FB_PP_TIMEOUT_TICKS) {
+		/* PP_DONE never came (START lost, or status not raw on this MDP):
+		 * fall back to time-based pacing for this frame, never hang. */
+		op2_fb_ppdone_timeouts++;
+		op2_fb_pp_outstanding = false;
+		if (++op2_fb_pp_misses >= 8) {
+			/* Never seen a DONE: wrong register or bit on this MDP. Back to the timed spacing for good
+			 * (bit 2, GPU scale-out, depends on bit 0 and goes with it). */
+			op2_fb_sync &= ~5u;
+			IOLog("OP2 FB: fbsync: PP0_DONE never arrived (8 timeouts in a row), back to timed kicks\n");
+		}
+		return false;
+	}
+	return true;
+}
+
+/* PP0 tear check, as Linux mdp5_cmd_encoder.c pingpong_tearcheck_setup()
+ * and downstream mdss_mdp_cmd_tearcheck_cfg(). Leaves LK's setup alone. */
+static void
+op2_fb_setup_tearcheck(volatile uint32_t *pp, uint32_t vdisp)
+{
+	uint32_t was = pp[0x00 / 4];
+	if (was & 1) {
+		IOLog("OP2 FB: tear check already on (LK): SYNC_CFG=0x%08x THRESH=0x%08x START_POS=%u\n",
+		    pp[0x04 / 4], pp[0x18 / 4], pp[0x1c / 4]);
+		return;
+	}
+	uint32_t vclks_line = 19200000u / (OP2_FB_PANEL_VTOTAL * 60u);
+	pp[0x00 / 4] = 0;                                    /* TEAR_CHECK_EN off while programming */
+	__asm__ volatile("dsb sy" ::: "memory");
+	pp[0x04 / 4] = (1u << 20) | (1u << 19) | (vclks_line & 0x7ffffu); /* VSYNC_IN_EN | COUNTER_EN | count */
+	pp[0x08 / 4] = 0xfff0;                               /* SYNC_CONFIG_HEIGHT */
+	pp[0x10 / 4] = vdisp;                                /* VSYNC_INIT_VAL */
+	pp[0x20 / 4] = vdisp + 1;                            /* RD_PTR_IRQ */
+	pp[0x1c / 4] = vdisp;                                /* START_POS */
+	pp[0x18 / 4] = (4u << 16) | 4u;                      /* SYNC_THRESH continue 4, start 4 */
+	pp[0x30 / 4] = 0;                                    /* AUTOREFRESH off: we kick every frame */
+	__asm__ volatile("dsb sy" ::: "memory");
+	pp[0x00 / 4] = 1;                                    /* TEAR_CHECK_EN */
+	__asm__ volatile("dsb sy" ::: "memory");
+	IOLog("OP2 FB: tear check on: vclks_line=%u vdisp=%u SYNC_CFG=0x%08x\n",
+	    vclks_line, vdisp, pp[0x04 / 4]);
+}
+
 static void
 op2_fb_kick_panel(volatile uint32_t *ctl)
 {
@@ -110,8 +204,15 @@ op2_fb_kick_panel(volatile uint32_t *ctl)
 		return;
 	}
 	uint64_t now = mach_absolute_time();
-	/* Spacing to ensure previous DSI transfer finished (60 Hz = ~16.6 ms = 320,000 ticks) */
-	if (op2_fb_last_kick != 0) {
+	if ((op2_fb_sync & 1) && op2_fb_mdp_top != NULL) {
+		/* Previous transfer must be done, or this START is dropped. Callers
+		 * on the workloop already checked op2_fb_pp_busy(), so this spins
+		 * only for the boot splash / external kicks. Bounded at 34 ms. */
+		while (op2_fb_pp_busy()) {
+			IODelay(50);
+		}
+	} else if (op2_fb_last_kick != 0) {
+		/* Spacing to ensure previous DSI transfer finished (60 Hz = ~16.6 ms = 320,000 ticks) */
 		uint64_t diff = now - op2_fb_last_kick;
 		if (diff < 280000ULL) {
 			uint64_t wait_ticks = 280000ULL - diff;
@@ -128,8 +229,13 @@ op2_fb_kick_panel(volatile uint32_t *ctl)
 	op2_fb_kick_count++;
 
 	__asm__ volatile("dsb sy" ::: "memory");
-	ctl[0x18 / 4] = 0x00020041;              /* CTL0_FLUSH: VIG0 (bit 0) | LM0 (bit 6) | CTL (bit 17) */
+	ctl[0x18 / 4] = op2_fb_flush_mask;       /* CTL0_FLUSH: active pipe | LM0 (bit 6) | CTL (bit 17) */
 	__asm__ volatile("dsb sy" ::: "memory");
+	if ((op2_fb_sync & 1) && op2_fb_mdp_top != NULL) {
+		op2_fb_mdp_top[OP2_MDP_INTR_CLEAR / 4] = OP2_MDP_IRQ_PP0_DONE; /* drop a stale DONE */
+		__asm__ volatile("dsb sy" ::: "memory");
+		op2_fb_pp_outstanding = true;
+	}
 	ctl[0x1c / 4] = 1;                       /* CTL0_START: kick DSI command-mode transfer */
 	__asm__ volatile("dsb sy" ::: "memory");
 }
@@ -274,6 +380,17 @@ public:
 	uintptr_t           fFlipPixels;
 	uint64_t            fFlipPhys;
 	void flipAndKick(void);
+
+	/* fbsync bit 0: a frame the MDP reads straight from the client's
+	 * surface (direct scanout / hw scaler) is released to SwapWait at
+	 * PP_DONE, not at kick time. */
+	bool                fPresentScansClient;   /* set by present() */
+	bool                fScanoutWait;
+	uint32_t            fScanoutSwapID;
+	uint64_t            fFpsLastTime;
+	uint64_t            fFpsLast[6];
+	void completeSwap(uint32_t swapID);
+	void retireScanout(void);
 
 	static void presentNowFired(OSObject *owner, IOTimerEventSource *sender);
 	void presentPending(void);
@@ -706,7 +823,7 @@ AppleCLCD::start(IOService *provider)
 		pipeName = "VIG0";
 	} else if (dma0 != NULL && dma0[0x14 / 4] != 0) {
 		fActivePipe = dma0;
-		fPipeFlushBit = 1u << 6; /* DMA0 bit 6 */
+		fPipeFlushBit = 1u << 11; /* DMA0 bit 11 (bit 6 is LM0) */
 		pipeName = "DMA0";
 	}
 
@@ -828,6 +945,24 @@ AppleCLCD::start(IOService *provider)
 		__asm__ volatile("dsb sy" ::: "memory");
 		IOLog("OP2 FB: authentic Apple boot splash rendered to framebuffer (0x%llx)\n", fPhys);
 	}
+
+	/* fbsync: MDP top interrupt status + optional PP0 tear check. */
+	PE_parse_boot_argn("fbsync", &op2_fb_sync, sizeof(op2_fb_sync));
+	op2_fb_flush_mask = 0x00020040u | (fPipeFlushBit != 0 ? fPipeFlushBit : 1u);
+	op2_fb_mdp_top = (volatile uint32_t *)ml_io_map(0xfd900000, 0x1000);
+	if (op2_fb_mdp_top != NULL) {
+		IOLog("OP2 FB: fbsync=0x%x flush=0x%08x MDP INTR_EN=0x%08x STATUS=0x%08x PP0 TE_EN=0x%x SYNC_CFG=0x%08x\n",
+		    op2_fb_sync, op2_fb_flush_mask, op2_fb_mdp_top[OP2_MDP_INTR_EN / 4],
+		    op2_fb_mdp_top[OP2_MDP_INTR_STATUS / 4],
+		    fMdpPP != NULL ? fMdpPP[0x00 / 4] : 0, fMdpPP != NULL ? fMdpPP[0x04 / 4] : 0);
+		op2_fb_mdp_top[OP2_MDP_INTR_CLEAR / 4] = OP2_MDP_IRQ_PP0_DONE | OP2_MDP_IRQ_PP0_RDPTR;
+	}
+	if ((op2_fb_sync & 2) && fMdpPP != NULL) {
+		op2_fb_setup_tearcheck(fMdpPP, fHeight);
+	}
+	fPresentScansClient = false;
+	fScanoutWait = false;
+	fFpsLastTime = 0;
 
 	/* Kick command-mode panel to replace the LK splash logo with iOS boot screen */
 	op2_fb_kick_panel(fMdpCtl);
@@ -996,9 +1131,64 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
 	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
 	IOLockUnlock(fb->fLock);
 	sender->setTimeoutUS(OP2_FB_VSYNC_US);
+	if (op2_fb_mdp_top != NULL &&
+	    (op2_fb_mdp_top[OP2_MDP_INTR_STATUS / 4] & OP2_MDP_IRQ_PP0_RDPTR)) {
+		op2_fb_mdp_top[OP2_MDP_INTR_CLEAR / 4] = OP2_MDP_IRQ_PP0_RDPTR;
+		op2_fb_te_seen++;   /* at most one per tick: ~60/s means TE (or the PP counter) runs at 60 Hz */
+	}
+	fb->retireScanout();
+	if ((count % 600) == 0) {   /* every 10 s */
+		uint64_t cur[6] = { op2_fb_fps_swaps, op2_fb_present_count, op2_fb_kick_count,
+			            op2_fb_ppdone_count, op2_fb_te_seen, op2_fb_fps_completed };
+		uint64_t dt = now - fb->fFpsLastTime;
+		if (fb->fFpsLastTime != 0 && dt != 0) {
+			uint64_t r[6];
+			for (int i = 0; i < 6; i++) {
+				r[i] = ((cur[i] - fb->fFpsLast[i]) * 19200000ULL * 10ULL) / dt;   /* x10 per second */
+			}
+			IOLog("OP2 FB FPS: swaps=%llu.%llu presents=%llu.%llu kicks=%llu.%llu ppdone=%llu.%llu te=%llu.%llu released=%llu.%llu /s; transfer max=%lluus pp_timeouts=%llu fbsync=0x%x te_en=%u\n",
+			    r[0] / 10, r[0] % 10, r[1] / 10, r[1] % 10, r[2] / 10, r[2] % 10,
+			    r[3] / 10, r[3] % 10, r[4] / 10, r[4] % 10, r[5] / 10, r[5] % 10,
+			    op2_fb_ppdone_max_us, op2_fb_ppdone_timeouts, op2_fb_sync,
+			    fb->fMdpPP != NULL ? (fb->fMdpPP[0x00 / 4] & 1u) : 0u);
+			op2_fb_ppdone_max_us = 0;
+		}
+		fb->fFpsLastTime = now;
+		memcpy(fb->fFpsLast, cur, sizeof(cur));
+	}
 	if (flush) {
 		fb->presentPending();   /* safety net; SwapEnd normally presents at once */
 	}
+}
+
+void
+AppleCLCD::completeSwap(uint32_t swapID)
+{
+	IOLockLock(fLock);
+	if ((int32_t)(swapID - fCompletedSwapID) > 0) {
+		fCompletedSwapID = swapID;
+	}
+	op2_fb_fps_completed++;
+	IOLockWakeup(fLock, &fCompletedSwapID, false);
+	IOLockUnlock(fLock);
+}
+
+/* Workloop context. Release a scanned-out client surface once its DSI
+ * transfer is over; until then poll every 500 us. */
+void
+AppleCLCD::retireScanout(void)
+{
+	if (!fScanoutWait) {
+		return;
+	}
+	if (op2_fb_pp_busy()) {
+		if (fPresentNow != NULL) {
+			fPresentNow->setTimeoutUS(500);
+		}
+		return;
+	}
+	fScanoutWait = false;
+	completeSwap(fScanoutSwapID);
 }
 
 /* Minimum spacing between DSI kicks: a command-mode transfer must finish
@@ -1024,11 +1214,20 @@ AppleCLCD::presentPending(void)
 {
 	uint64_t now = mach_absolute_time();
 	bool early = false;
-	if (op2_fb_last_kick != 0 && (now - op2_fb_last_kick) < OP2_FB_MIN_KICK_TICKS) {
-		uint64_t wait_ticks = OP2_FB_MIN_KICK_TICKS - (now - op2_fb_last_kick);
+	retireScanout();
+	bool tooSoon;
+	uint32_t retry_us;
+	if ((op2_fb_sync & 1) && op2_fb_mdp_top != NULL) {
+		tooSoon = op2_fb_pp_busy();          /* the panel is still taking the last frame */
+		retry_us = 500;
+	} else {
+		tooSoon = op2_fb_last_kick != 0 && (now - op2_fb_last_kick) < OP2_FB_MIN_KICK_TICKS;
+		retry_us = tooSoon ? (uint32_t)((OP2_FB_MIN_KICK_TICKS - (now - op2_fb_last_kick)) * 10 / 192) + 50 : 0;
+	}
+	if (tooSoon) {
 		op2_fb_perf_deferred++;
 		if (fPresentNow != NULL) {
-			fPresentNow->setTimeoutUS((uint32_t)(wait_ticks * 10 / 192) + 50);
+			fPresentNow->setTimeoutUS(retry_us);
 		}
 		/* Too soon to kick, but copy the frame now (into the back buffer,
 		 * which the panel is not reading) so the client can reuse its
@@ -1088,12 +1287,17 @@ AppleCLCD::presentPending(void)
 	}
 	IOFreeData(rec, OP2_FB_SWAP_REC_SIZE);
 
-	IOLockLock(fLock);
-	if ((int32_t)(swapID - fCompletedSwapID) > 0) {
-		fCompletedSwapID = swapID;
+	if ((op2_fb_sync & 1) && op2_fb_mdp_top != NULL && (fPresentScansClient || fScanoutWait)) {
+		/* The MDP is reading a client's own surface right now: SwapWait
+		 * must hold until PP_DONE, or CA draws into it mid-transfer.
+		 * Completion is "everything up to id", so a newer early-copied
+		 * frame waits too: releasing it would release the scanned one. */
+		fScanoutSwapID = swapID;
+		fScanoutWait = true;
+		retireScanout();
+	} else {
+		completeSwap(swapID);   /* copied out: the client's buffer is free now */
 	}
-	IOLockWakeup(fLock, &fCompletedSwapID, false);
-	IOLockUnlock(fLock);
 
 	op2_fb_perf_n++;
 	op2_fb_perf_sum_us += us;
@@ -1222,6 +1426,7 @@ AppleCLCD::swap(const uint8_t *rec)
 		setProperty("OP2SwapCount", op2_fb_swap_count, 64);
 	}
 
+	op2_fb_fps_swaps++;
 	IOLockLock(fLock);
 	memcpy(fPending, rec, OP2_FB_SWAP_REC_SIZE);
 	fDirty = true;
@@ -1389,6 +1594,7 @@ void
 AppleCLCD::present(const uint8_t *rec)
 {
 	uint64_t pc = ++op2_fb_present_count;
+	fPresentScansClient = false;
 	memcpy(op2_fb_last_rec, rec, sizeof(op2_fb_last_rec));
 	op2_fb_last_pc = pc;
 	if (!fConsolePaused) {
@@ -1639,6 +1845,7 @@ AppleCLCD::present(const uint8_t *rec)
 		 * Surface is physically contiguous in hardware DMA memory.
 		 * Point MDP5 hardware pipe directly to the surface's physical address.
 		 */
+		fPresentScansClient = true;
 		if (direct_phys != op2_fb_direct_cur) {
 			op2_fb_direct_cur = direct_phys;
 			fActivePipe[0x14 / 4] = (uint32_t)direct_phys;
@@ -1654,6 +1861,7 @@ AppleCLCD::present(const uint8_t *rec)
 			}
 		}
 	} else if (!fEarlyCopy && op2_fb_try_hwscale(this, s, direct_phys, segLen)) {
+		fPresentScansClient = true;   /* VIG0 fetches the client surface itself */
 		/* VIG0 scales the surface straight to the panel: no CPU copy,
 		 * no back-buffer flip. Shared tail below releases, barriers, kicks. */
 	} else {
