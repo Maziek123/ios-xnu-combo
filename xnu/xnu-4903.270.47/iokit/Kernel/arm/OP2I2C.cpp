@@ -26,6 +26,20 @@
 extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern "C" void op2_digitizer_post(uint32_t touchDown, uint32_t x_fp16, uint32_t y_fp16, uint32_t z_raw);
 extern "C" void op2_home_button_post(uint32_t down);
+extern "C" void op2_button_post(uint32_t usage, uint32_t down);        /* OP2Digitizer.cpp, OP2Buttons */
+extern "C" bool op2_spmi_read(uint8_t sid, uint16_t addr, uint8_t *buf, uint32_t len);   /* OP2Battery.cpp */
+
+/* 2026-11-23 keys. PM8994 (SPMI SID 0), from the Android device tree (research/hardware/live.dts):
+ *   Power   = PON KPDPWR: PON_INT_RT_STS 0x0810 bit 0 set while pressed (qpnp-power-on.c)
+ *   Vol up  = PM8994 GPIO 3, Vol down = GPIO 2: STATUS1 (0xC208 / 0xC108) bit 0, active low with pull-up
+ *             (gpio-keys, qpnp-pin.c Q_REG_STATUS1); LK leaves them configured as inputs.
+ * Capacitive Back / Recents: the S3320's RMI4 function 0x1A (0-D buttons), found by a page-table scan.
+ * Boot-arg op2k: 0 off, 1 on (default), 2 = swap the two capacitive keys. Long-holding Power ~11 s still makes
+ * the PMIC reset the phone (pon_1 s1+s2 timers), as on Android. */
+#define OP2_PM8994_SID       0
+#define OP2_PON_RT_STS       0x0810
+#define OP2_PMGPIO3_STATUS1  0xC208
+#define OP2_PMGPIO2_STATUS1  0xC108
 extern "C" bool op2_fb_is_power_off(void);
 extern "C" uint64_t op2_fb_get_last_kick(void);
 
@@ -124,10 +138,132 @@ class OP2I2C : public IOService {
 	void synaProbe(void);
 	bool synaInit(void);
 	void pollLoop(void) __attribute__((noreturn));
+	uint8_t fF1aPage, fF1aData;   /* S3320 0-D buttons: RMI4 page and data register, 0 = not found */
+	void scanF1a(void);
+	void pollKeys(uint32_t polls);
+	void capKey(uint32_t which, bool down);
 	static void pollThread(void *param, wait_result_t res) __attribute__((noreturn));
 };
 
 OSDefineMetaClassAndStructors(OP2I2C, IOService);
+
+/* RMI4 page description table, pages 0..4: entries of 6 bytes from 0xE9 down (query, command, control, data,
+ * irq count | version, function number). Leaves page 0 selected. */
+void
+OP2I2C::scanF1a(void)
+{
+	fF1aPage = fF1aData = 0;
+	for (uint8_t page = 0; page < 5 && fF1aData == 0; page++) {
+		if (synaWrite(0xFF, page) != 0) {
+			break;
+		}
+		for (int a = 0xE9; a >= 0x0F; a -= 6) {
+			uint8_t e[6];
+			if (synaRead((uint8_t)(a - 5), e, sizeof(e)) != 0 || e[5] == 0 || e[5] == 0xFF) {
+				break;
+			}
+			IOLog("OP2I2C: RMI4 page %u fn %02x data %02x ctrl %02x query %02x\n", page, e[5], e[3], e[2], e[0]);
+			if (e[5] == 0x1A) {
+				fF1aPage = page;
+				fF1aData = e[3];
+				break;
+			}
+		}
+	}
+	synaWrite(0xFF, 0);
+	if (fF1aData != 0) {
+		IOLog("OP2I2C: capacitive keys: F1A on page %u, data 0x%02x\n", fF1aPage, fF1aData);
+	} else {
+		IOLog("OP2I2C: capacitive keys: no F1A on the S3320 (keys not reported by the touch controller)\n");
+	}
+}
+
+/* Back = a left-edge swipe (UIKit's interactive pop in navigation stacks); Recents = Home twice (app switcher).
+ * Synthesised here, in the poll thread, so they never interleave with real touches. */
+void
+OP2I2C::capKey(uint32_t which, bool down)
+{
+	if (!down) {
+		return;   /* act on press */
+	}
+	if (which == 0) {
+		IOLog("OP2I2C: Back key -> left-edge swipe\n");
+		const uint32_t y = 0x8000;
+		for (uint32_t i = 0; i <= 8; i++) {
+			op2_digitizer_post(1, 0x0080 + i * 0x1000, y, 0x40);
+			IOSleep(16);
+		}
+		op2_digitizer_post(0, 0x8080, y, 0);
+	} else {
+		IOLog("OP2I2C: Recents key -> Home x2\n");
+		op2_home_button_post(1);
+		IOSleep(50);
+		op2_home_button_post(0);
+		IOSleep(90);
+		op2_home_button_post(1);
+		IOSleep(50);
+		op2_home_button_post(0);
+	}
+}
+
+void
+OP2I2C::pollKeys(uint32_t polls)
+{
+	static uint32_t mode = 0xffffffff;
+	static bool primed = false, pwr, vup, vdn, cap[2];
+	if (mode == 0xffffffff) {
+		mode = 1;
+		PE_parse_boot_argn("op2k", &mode, sizeof(mode));
+		IOLog("OP2I2C: keys %s\n", mode == 0 ? "off" : (mode == 2 ? "on (capacitive swapped)" : "on"));
+	}
+	if (mode == 0 || (polls % 2) != 0) {   /* every 40 ms */
+		return;
+	}
+	uint8_t v = 0;
+	bool ok;
+	bool p = (ok = op2_spmi_read(OP2_PM8994_SID, OP2_PON_RT_STS, &v, 1)) && (v & 1);
+	bool pOk = ok;
+	bool u = (ok = op2_spmi_read(OP2_PM8994_SID, OP2_PMGPIO3_STATUS1, &v, 1)) && !(v & 1);
+	bool uOk = ok;
+	bool d = (ok = op2_spmi_read(OP2_PM8994_SID, OP2_PMGPIO2_STATUS1, &v, 1)) && !(v & 1);
+	bool dOk = ok;
+	bool c[2] = { false, false };
+	if (fF1aData != 0 && (polls % 4) == 0) {   /* every 80 ms: two extra page switches */
+		uint8_t b = 0;
+		if (synaWrite(0xFF, fF1aPage) == 0 && synaRead(fF1aData, &b, 1) == 0) {
+			c[0] = (b & 1) != 0;
+			c[1] = (b & 2) != 0;
+			if (b & ~3u) {
+				static uint32_t sOther;
+				if (sOther++ < 4) {
+					IOLog("OP2I2C: F1A data 0x%02x (more than two buttons?)\n", b);
+				}
+			}
+		}
+		synaWrite(0xFF, 0);
+	} else {
+		c[0] = cap[0];
+		c[1] = cap[1];
+	}
+	if (!primed) {   /* first sample: the state, no events (a key held at boot is not a press) */
+		IOLog("OP2I2C: keys at start: power %d/%s vol+ %d/%s vol- %d/%s\n", p, pOk ? "ok" : "SPMI FAIL",
+		    u, uOk ? "ok" : "SPMI FAIL", d, dOk ? "ok" : "SPMI FAIL");
+		pwr = p; vup = u; vdn = d; cap[0] = c[0]; cap[1] = c[1];
+		primed = true;
+		return;
+	}
+	if (pOk && p != pwr) { op2_button_post(0x30, p); pwr = p; }
+	if (uOk && u != vup) { op2_button_post(0xE9, u); vup = u; }
+	if (dOk && d != vdn) { op2_button_post(0xEA, d); vdn = d; }
+	for (uint32_t k = 0; k < 2; k++) {
+		if (c[k] != cap[k]) {
+			cap[k] = c[k];
+			IOLog("OP2I2C: capacitive key bit %u %s\n", k, c[k] ? "DOWN" : "UP");
+			/* bit 0 = Back, bit 1 = Recents until a log says otherwise; op2k=2 swaps */
+			capKey(mode == 2 ? (k ^ 1) : k, c[k]);
+		}
+	}
+}
 
 uint32_t
 OP2I2C::rd(volatile uint32_t *b, uint32_t off)
@@ -408,6 +544,7 @@ OP2I2C::pollLoop(void)
 				prevFpcDown = fpcDown;
 			}
 		}
+		pollKeys(polls);
 
 		uint8_t w[2];
 		if (synaRead(kSynaF01Data, w, 2) != 0) {
@@ -540,6 +677,7 @@ OP2I2C::synaProbe(void)
 		return;
 	}
 	(void)f01Ctrl; (void)f12Query;
+	scanF1a();
 
 	/* F01 queries: [0]=mfr(0x01 Synaptics), [2..3]=fw, [11..20]=product id */
 	uint8_t q[21];
