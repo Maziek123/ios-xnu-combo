@@ -214,8 +214,6 @@ public:
 OSDefineMetaClassAndStructors(OP2Buttons, IOHIDEventService);
 
 static OP2Buttons *gOP2Buttons = NULL;
-static const uint32_t kOP2ButtonCount = 4;
-static const uint16_t kOP2ButtonUsages[kOP2ButtonCount] = { 0x40, 0x30, 0xE9, 0xEA };
 
 class OP2ButtonsUserClient : public IOUserClient {
 	OSDeclareDefaultStructors(OP2ButtonsUserClient);
@@ -360,7 +358,6 @@ OP2Digitizer::free(void)
 
 extern "C" void op2_digitizer_post(uint32_t touchDown, uint32_t x_fp16, uint32_t y_fp16, uint32_t z_raw);
 extern "C" void op2_home_button_post(uint32_t down);
-extern "C" void op2_button_post(uint32_t usage, uint32_t down);
 
 extern "C" void
 op2_home_button_post(uint32_t down)
@@ -370,16 +367,6 @@ op2_home_button_post(uint32_t down)
 	}
 	if (gOP2Buttons != NULL) {
 		gOP2Buttons->key(0x0040, down);
-	}
-}
-
-/* Consumer-page keys for backboardd: 0x30 Power (lock/wake; hold = power-off slider), 0xE9 Volume Increment,
- * 0xEA Volume Decrement, 0x40 Menu (Home). */
-extern "C" void
-op2_button_post(uint32_t usage, uint32_t down)
-{
-	if (gOP2Buttons != NULL) {
-		gOP2Buttons->key(usage, down);
 	}
 }
 
@@ -1287,34 +1274,16 @@ OP2ButtonsUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
 
 	case 14: /* kIOHIDLibUserClientGetElementCount */
 		if (arguments->scalarOutput && arguments->scalarOutputCount >= 2) {
-			arguments->scalarOutput[0] = kOP2ButtonCount; /* Menu, Power, Volume+, Volume- */
+			arguments->scalarOutput[0] = 1; /* 1 element */
 			arguments->scalarOutput[1] = 1; /* 1 report handler */
 			arguments->scalarOutputCount = 2;
 		}
-		IOLog("OP2 Buttons: %s getElementCount (selector 14) -> elements=%u reports=1\n", name, kOP2ButtonCount);
+		IOLog("OP2 Buttons: %s getElementCount (selector 14) -> elements=1 reports=1\n", name);
 		return kIOReturnSuccess;
 
 	case 15: /* kIOHIDLibUserClientGetElements */
 		if (arguments->structureOutput && arguments->structureOutputSize >= sizeof(struct IOHIDElementStruct)) {
 			struct IOHIDElementStruct *elem = (struct IOHIDElementStruct *)arguments->structureOutput;
-			uint32_t n = (uint32_t)(arguments->structureOutputSize / sizeof(struct IOHIDElementStruct));
-			if (n > kOP2ButtonCount) {
-				n = kOP2ButtonCount;
-			}
-			for (uint32_t k = 1; k < n; k++) {   /* elements 2..n: Power, Volume+, Volume- (same shape as Menu) */
-				struct IOHIDElementStruct *e = elem + k;
-				bzero(e, sizeof(*e));
-				e->cookieMin = e->cookieMax = k + 1;
-				e->type = 2;
-				e->usagePage = 12;
-				e->usageMin = e->usageMax = kOP2ButtonUsages[k];
-				e->max = e->scaledMax = 1;
-				e->size = e->reportSize = 8;
-				e->reportCount = 1;
-			}
-			if (n > 1) {
-				arguments->structureOutputSize = n * sizeof(struct IOHIDElementStruct);
-			}
 			bzero(elem, sizeof(struct IOHIDElementStruct));
 			elem->cookieMin = 1;
 			elem->cookieMax = 1;
@@ -1333,9 +1302,7 @@ OP2ButtonsUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
 			elem->reportSize = 8;
 			elem->reportCount = 1;
 			elem->reportID = 0;
-			if (n <= 1) {
-				arguments->structureOutputSize = sizeof(struct IOHIDElementStruct);
-			}
+			arguments->structureOutputSize = sizeof(struct IOHIDElementStruct);
 			IOLog("OP2 Buttons: %s getElements (selector 15) -> consumer/menu button element (%lu bytes)\n",
 			    name, (unsigned long)sizeof(struct IOHIDElementStruct));
 		}
