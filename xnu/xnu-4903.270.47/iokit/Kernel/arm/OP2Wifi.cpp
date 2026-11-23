@@ -8,7 +8,9 @@
  * Boot-arg wifi:
  *   0  (default) nothing runs
  *   1  read-only probe: log GPIO / PMIC / clock / power-domain states; writes nothing
- *   2  bring-up: power + clocks + PHY + link training + config read
+ *   2  bring-up: power + clocks + PHY + link training + config read (step 1), then step 2a: give BAR0 an
+ *      address, enable memory decoding (no bus mastering: the chip cannot DMA yet), wake the chip's SoC
+ *      and read its chip ID and firmware indicator (ath10k pci.c / hw.c qca6174_regs)
  *
  * Runs in its own kernel thread 120 s after the framebuffer starts (RPM is up by then, the UI is running),
  * and repeats a one-line summary every 60 s so it survives in the ramoops ring.
@@ -44,6 +46,17 @@ extern "C" void op2_wifi_start(void);   /* called from op2_threaddump_start (osf
 #define W_PHY_PHYS        0xfc52e000ULL   /* 0x1000 */
 #define W_DBI_PHYS        0xf8800000ULL   /* dm_core 0xf1d, ELBI at +0xf20 */
 #define W_CONF_PHYS       0xf8801000ULL   /* config window, 4 KB used */
+#define W_BARS_PHYS       0xf8900000ULL   /* "bars": 7 MB memory window, passed to PCIe untranslated */
+#define W_BARS_SIZE       0x700000ULL
+
+/* ---- QCA6174 BAR0 (ath10k hw.c qca6174_regs, hw.h) ---- */
+#define Q_RTC_SOC_BASE      0x00000800
+#define Q_SOC_CHIP_ID       (Q_RTC_SOC_BASE + 0xf0)
+#define Q_PCIE_LOCAL_BASE   0x00080000
+#define Q_RTC_STATE         (Q_PCIE_LOCAL_BASE + 0x0000)   /* bits 2:0 == 3: SoC awake */
+#define Q_SOC_WAKE          (Q_PCIE_LOCAL_BASE + 0x0004)   /* 1 = request wake, 0 = release */
+#define Q_FW_INDICATOR      0x0003a028                     /* 0 until firmware runs */
+#define Q_HW32_CHIP_REV     10                             /* QCA6174_HW_3_2_CHIP_ID_REV */
 
 /* ---- GCC (clock-gcc-8994.c) ---- */
 #define GCC_PCIE_1_GDSCR          0x1B44   /* msm-gdsc.dtsi gdsc_pcie_1 */
@@ -107,7 +120,7 @@ extern "C" void op2_wifi_start(void);   /* called from op2_threaddump_start (osf
 #define PHY_START            0x608
 #define PHY_PCS_STATUS       0x728    /* bit 6 set = PHY not ready */
 
-static volatile uint32_t *gGcc, *gTlmm, *gParf, *gPhy, *gDbi, *gConf;
+static volatile uint32_t *gGcc, *gTlmm, *gParf, *gPhy, *gDbi, *gConf, *gBar0;
 static uint32_t gMode;
 static char gSummary[200] = "not run";
 
@@ -326,6 +339,73 @@ static const uint32_t kPhyInit[][2] = {
 };
 
 /* ---------------------------------------------------------------------------------------------------- */
+/* step 2a: BAR0 + chip registers (link already up, iATU region 0 = config window of 01:00.0)           */
+
+static void
+step2a(void)
+{
+	char line[200];
+
+	/* Root port (DBI = its own config space): bus 0 -> secondary 1, subordinate 1; memory window = the
+	 * 7 MB "bars" range; memory decoding on. Bus mastering stays off on both sides. */
+	wr(gDbi, 0x18, 0x00010100u);
+	wr(gDbi, 0x20, (uint32_t)((W_BARS_PHYS + W_BARS_SIZE - 1) & 0xFFF00000u) | (uint32_t)((W_BARS_PHYS >> 16) & 0xFFF0u));
+	wr(gDbi, 0x04, (rd(gDbi, 0x04) & ~0x4u) | 0x2u);
+
+	/* Size BAR0 (64-bit memory BAR: BAR0 low, BAR1 high), then place it at the start of the window. */
+	uint32_t orig = rd(gConf, 0x10);
+	wr(gConf, 0x10, 0xFFFFFFFFu);
+	uint32_t mask = rd(gConf, 0x10);
+	wr(gConf, 0x10, orig);
+	uint64_t size = (uint64_t)(~(mask & ~0xFu)) + 1u;
+	size &= 0xFFFFFFFFu;
+	W_LOG("BAR0: was %08x, sizing mask %08x -> %llu KB (%s)", orig, mask, size / 1024,
+	    (mask & 0x6u) == 0x4u ? "64-bit memory" : "32-bit memory");
+	if ((mask & 1u) || size == 0 || size > W_BARS_SIZE) {
+		snprintf(line, sizeof(line), "STEP 2a FAIL: BAR0 unusable (mask %08x, size %llu)", mask, size);
+		summary(line);
+		return;
+	}
+	wr(gConf, 0x10, (uint32_t)W_BARS_PHYS | (mask & 0xFu));
+	if ((mask & 0x6u) == 0x4u) {
+		wr(gConf, 0x14, 0u);
+	}
+	wr(gConf, 0x04, (rd(gConf, 0x04) & ~0x7u) | 0x2u);   /* memory space only */
+	W_LOG("BAR0 at 0x%08x, ep command %08x, rp command %08x, rp window %08x", rd(gConf, 0x10), rd(gConf, 0x04),
+	    rd(gDbi, 0x04), rd(gDbi, 0x20));
+
+	gBar0 = (volatile uint32_t *)ml_io_map(W_BARS_PHYS, (vm_size_t)size);
+	if (gBar0 == NULL) {
+		summary("STEP 2a FAIL: cannot map BAR0");
+		return;
+	}
+
+	/* Wake the chip's SoC (ath10k_pci_wake: 30 ms limit), read, release. */
+	wr(gBar0, Q_SOC_WAKE, 1u);
+	uint32_t st = 0;
+	int us = 0;
+	for (; us < 30000; us += 50) {
+		st = rd(gBar0, Q_RTC_STATE);
+		if ((st & 7u) == 3u) {
+			break;
+		}
+		IODelay(50);
+	}
+	if ((st & 7u) != 3u) {
+		wr(gBar0, Q_SOC_WAKE, 0u);
+		snprintf(line, sizeof(line), "STEP 2a FAIL: chip SoC did not wake in 30 ms (rtc_state %08x)", st);
+		summary(line);
+		return;
+	}
+	uint32_t chip = rd(gBar0, Q_SOC_CHIP_ID), fwi = rd(gBar0, Q_FW_INDICATOR);
+	wr(gBar0, Q_SOC_WAKE, 0u);
+	uint32_t rev = (chip >> 8) & 0xFu;
+	snprintf(line, sizeof(line), "%s: chip id %08x (rev %u, hw3.2 = %u), fw indicator %08x, awake after %d us",
+	    rev == Q_HW32_CHIP_REV ? "STEP 2a PASS" : "STEP 2a: unexpected chip rev", chip, rev, Q_HW32_CHIP_REV, fwi, us);
+	summary(line);
+}
+
+/* ---------------------------------------------------------------------------------------------------- */
 
 static void
 bringup(void)
@@ -489,6 +569,9 @@ bringup(void)
 	snprintf(line, sizeof(line), "%s: endpoint id %04x:%04x class/rev %08x bar0 %08x (QCA6174 is 168c:003e)",
 	    (id & 0xFFFF) == 0x168C ? "PASS" : "LINK UP, unexpected id", id & 0xFFFF, id >> 16, cls, bar0);
 	summary(line);
+	if (id == 0x003E168Cu) {
+		step2a();
+	}
 }
 
 static void __attribute__((noreturn))
