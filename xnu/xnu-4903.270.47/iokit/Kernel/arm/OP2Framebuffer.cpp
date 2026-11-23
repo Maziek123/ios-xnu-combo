@@ -131,7 +131,21 @@ static uint32_t op2_fb_sync = 1;
 static uint32_t op2_fb_flush_mask = 0x00020041;  /* CTL | LM0 | VIG0; start() adds the real pipe bit */
 static bool     op2_fb_pp_outstanding = false;
 static uint64_t op2_fb_ppdone_count, op2_fb_ppdone_timeouts, op2_fb_ppdone_max_us, op2_fb_te_seen;
-static uint32_t op2_fb_pp_misses;   /* consecutive PP_DONE timeouts; 8 in a row = the status bit is not ours */
+static uint32_t op2_fb_pp_misses;
+static volatile uint32_t *op2_fb_te_pp = NULL;   /* set when WE turned tear check on (not LK): we may turn it off */
+
+static void
+op2_fb_tearcheck_off(const char *why)
+{
+	if (op2_fb_te_pp == NULL) {
+		return;
+	}
+	op2_fb_te_pp[0x00 / 4] = 0;   /* TEAR_CHECK_EN */
+	__asm__ volatile("dsb sy" ::: "memory");
+	op2_fb_te_pp = NULL;
+	op2_fb_sync &= ~2u;
+	IOLog("OP2 FB: tear check OFF: %s\n", why);
+}   /* consecutive PP_DONE timeouts; 8 in a row = the status bit is not ours */
 static uint64_t op2_fb_fps_swaps, op2_fb_fps_completed;
 
 /* Non-blocking: true while the last START's DSI transfer is still running. */
@@ -161,6 +175,7 @@ op2_fb_pp_busy(void)
 		if (++op2_fb_pp_misses >= 8) {
 			/* Never seen a DONE: wrong register or bit on this MDP. Back to the timed spacing for good
 			 * (bit 2, GPU scale-out, depends on bit 0 and goes with it). */
+			op2_fb_tearcheck_off("PP0_DONE timeouts");
 			op2_fb_sync &= ~5u;
 			IOLog("OP2 FB: fbsync: PP0_DONE never arrived (8 timeouts in a row), back to timed kicks\n");
 		}
@@ -193,6 +208,7 @@ op2_fb_setup_tearcheck(volatile uint32_t *pp, uint32_t vdisp)
 	__asm__ volatile("dsb sy" ::: "memory");
 	pp[0x00 / 4] = 1;                                    /* TEAR_CHECK_EN */
 	__asm__ volatile("dsb sy" ::: "memory");
+	op2_fb_te_pp = pp;
 	IOLog("OP2 FB: tear check on: vclks_line=%u vdisp=%u SYNC_CFG=0x%08x\n",
 	    vclks_line, vdisp, pp[0x04 / 4]);
 }
@@ -965,7 +981,30 @@ AppleCLCD::start(IOService *provider)
 	fFpsLastTime = 0;
 
 	/* Kick command-mode panel to replace the LK splash logo with iOS boot screen */
-	op2_fb_kick_panel(fMdpCtl);
+	if (op2_fb_te_pp != NULL && op2_fb_mdp_top != NULL) {
+		/* Tear-check self-test: with TE gating, a kicked transfer must finish within two panel frames.
+		 * If it does not, the TE path is not working on this phone: turn it off and kick again. */
+		op2_fb_mdp_top[OP2_MDP_INTR_CLEAR / 4] = OP2_MDP_IRQ_PP0_DONE;
+		__asm__ volatile("dsb sy" ::: "memory");
+		op2_fb_kick_panel(fMdpCtl);
+		bool done = false;
+		for (int i = 0; i < 60 && !done; i++) {
+			done = (op2_fb_mdp_top[OP2_MDP_INTR_STATUS / 4] & OP2_MDP_IRQ_PP0_DONE) != 0;
+			if (!done) {
+				IODelay(1000);
+			}
+		}
+		if (done) {
+			IOLog("OP2 FB: tear check self-test passed (transfer finished)\n");
+		} else {
+			op2_fb_tearcheck_off("self-test: no PP0_DONE within 60 ms of a kick");
+			op2_fb_pp_outstanding = false;
+			op2_fb_last_kick = 0;
+			op2_fb_kick_panel(fMdpCtl);
+		}
+	} else {
+		op2_fb_kick_panel(fMdpCtl);
+	}
 	delay(20000); /* 20 ms to allow initial frame transfer to finish cleanly */
 	IOLog("OP2 FB: initial panel kickoff complete (kicks=%llu)\n", op2_fb_kick_count);
 
