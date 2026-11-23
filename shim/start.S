@@ -27,7 +27,7 @@ _head:
 	.long	0			/* 0x28: res3 */
 	.long	0x1000			/* 0x2C: DTB offset for Little Kernel (4096 bytes) */
 	.quad	0			/* 0x30: res4 */
-	.ascii	"ARM\x64"		/* 0x38: magic (0x644d5241) */
+	.byte 0x41, 0x52, 0x4d, 0x64
 	.long	0			/* 0x3C: res5 */
 
 /*

@@ -10,7 +10,7 @@ op2_require_xcode || exit 1
 TOOLCHAIN="${XCODE_ROOT}/Toolchains/XcodeDefault.xctoolchain/usr/bin"
 SDK="${XCODE_ROOT}/Platforms/MacOSX.platform/Developer/SDKs/MacOSX10.14.sdk"
 
-export PATH="${REPO_ROOT}/tools:${TOOLCHAIN}:/usr/bin:/bin:/usr/sbin:/sbin"
+export PATH=/opt/local/bin:/usr/local/bin:"${REPO_ROOT}/tools:${TOOLCHAIN}:/usr/bin:/bin:/usr/sbin:/sbin"
 unset DEVELOPER_DIR
 export XCRUN="${REPO_ROOT}/tools/xcrun"
 
