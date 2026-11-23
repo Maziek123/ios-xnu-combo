@@ -129,6 +129,8 @@ OP2Battery::sharedRead(uint8_t sid, uint16_t addr, uint8_t *buf, uint32_t len)
 	return b != NULL && b->spmiRead(sid, addr, buf, len);
 }
 
+extern "C" bool op2_spmi_read(uint8_t sid, uint16_t addr, uint8_t *buf, uint32_t len);   /* -Wmissing-prototypes */
+
 extern "C" bool
 op2_spmi_read(uint8_t sid, uint16_t addr, uint8_t *buf, uint32_t len)
 {
