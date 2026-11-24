@@ -119,6 +119,7 @@ static const char *gStep = "2b";   /* "2b", "2c" or "3": the step the log lines 
 #define HI_BASE                 0x00400800u   /* QCA988X_HOST_INTEREST_ADDRESS: used for every PCI chip */
 #define HI_APP_HOST_INTEREST    (HI_BASE + 0x00u)
 #define HI_FAILURE_STATE        (HI_BASE + 0x04u)
+#define HI_DBGLOG_HDR           (HI_BASE + 0x08u)   /* struct dbglog_hdr_s *: the firmware's debug log */
 #define HI_OPTION_FLAG          (HI_BASE + 0x10u)
 #define HI_SERIAL_ENABLE        (HI_BASE + 0x14u)
 #define HI_BE                   (HI_BASE + 0x44u)
@@ -131,6 +132,7 @@ static const char *gStep = "2b";   /* "2b", "2c" or "3": the step the log lines 
 #define HI_INTERCONNECT_STATE   (HI_BASE + 0xf8u)
 #define HI_EARLY_ALLOC          (HI_BASE + 0x100u)
 #define HI_OPTION_EARLY_CFG_DONE 0x10u
+#define HI_OPTION_DISABLE_DBGLOG 0x40u        /* in hi_option_flag */
 #define HI_EARLY_ALLOC_MAGIC    0x6d8au       /* bits 31:16 */
 #define HW3_IRAM_BANKS          9u            /* ath10k_pci_get_num_banks(): QCA6174 hw3.0 / 3.1 / 3.2 */
 #define PCIE_STATE_PIPE_CFG     0x00u         /* struct pcie_state */
@@ -144,11 +146,14 @@ static const char *gStep = "2b";   /* "2b", "2c" or "3": the step the log lines 
 #define BMI_WRITE_MEMORY        3u
 #define BMI_EXECUTE             4u
 #define BMI_SET_APP_START       5u
+#define BMI_READ_SOC_REGISTER   6u
+#define BMI_WRITE_SOC_REGISTER  7u
 #define BMI_GET_TARGET_INFO     8u
 #define BMI_LZ_STREAM_START     13u
 #define BMI_LZ_DATA             14u
 #define BMI_MAX_DATA_SIZE       256u
 #define BMI_PATCH_LOAD_ADDR     0x1234u       /* QCA6174_HW_3_0_PATCH_LOAD_ADDR: the segmented-image sink */
+#define BMI_PARAM_GET_EEPROM_BOARD_ID 0x10u   /* OTP run that only reports the board ID */
 #define QCA6174_BOARD_DATA_SZ   8192u
 #define QCA6174_DEVICE_ID       0x003eu       /* hi_hci_uart_pwr_mgmt_params_ext wants the PCI device ID */
 #define HTC_PROTOCOL_VERSION    0x0002u
@@ -163,6 +168,21 @@ static const char *gStep = "2b";   /* "2b", "2c" or "3": the step the log lines 
 #define SGMT_EXEC               0xfffffffcu
 #define QCA6174_HW_3_2_VERSION  0x05030000u
 #define BMI_SEND_FLAGS          0xFFFCu       /* ath10k_ce_send(..., transfer_id -1): META_DATA bits 15:2 set */
+
+/* ---- PLL switch (hw.h; qcacld ol_fw.c ol_patch_pll_switch): SoC registers as the target CPU addresses them ---- */
+#define RTC_SOC_BASE            0x00000800u
+#define RTC_WMAC_BASE           0x00001000u
+#define EFUSE_OFFSET            0x032cu       /* XTAL_SEL bits 10:8: which crystal the board has */
+#define BB_PLL_CONFIG_OFFSET    0x02f4u       /* FRAC 17:0, OUTDIV 20:18 */
+#define WLAN_PLL_SETTLE_OFFSET  0x0018u       /* TIME 10:0 */
+#define SOC_CORE_CLK_CTRL_OFFSET 0x0114u      /* DIV 2:0 */
+#define WLAN_PLL_CONTROL_OFFSET 0x0014u       /* DIV 9:0, REFDIV 13:10, BYPASS 16, NOPWD 18 */
+#define RTC_SYNC_STATUS_OFFSET  0x0244u       /* PLL_CHANGING 5 */
+#define SOC_CPU_CLOCK_OFFSET    0x0020u       /* STANDARD 1:0 */
+#define CPU_PLL_INIT_DONE_ADDR  0x00404020u   /* firmware variables (AR6320V3_* in qcacld, qca6174_regs in ath10k) */
+#define CPU_SPEED_ADDR          0x00404024u
+#define CORE_CLK_DIV_ADDR       0x00404028u
+#define TARGET_CPU_FREQ         176000000u
 
 /* ---- the DMA block; every area on its own 64-byte cache lines ---- */
 #define DMA_SIZE        0x10000u
@@ -928,6 +948,118 @@ bmi_simple(uint32_t id, uint32_t arg)   /* BMI_LZ_STREAM_START, BMI_SET_APP_STAR
 	return bmi_cmd(cmd, sizeof(cmd), NULL, NULL);
 }
 
+/* ath10k_bmi_read_soc_reg / _write_soc_reg */
+static bool
+bmi_read_soc(uint32_t addr, uint32_t *v)
+{
+	uint32_t cmd[2] = { BMI_READ_SOC_REGISTER, addr }, len = 4u;
+	*v = 0;
+	return bmi_cmd(cmd, sizeof(cmd), v, &len) && len == 4u;
+}
+
+static bool
+bmi_write_soc(uint32_t addr, uint32_t v)
+{
+	uint32_t cmd[3] = { BMI_WRITE_SOC_REGISTER, addr, v };
+	return bmi_cmd(cmd, sizeof(cmd), NULL, NULL);
+}
+
+/* Read-modify-write of one SoC register over BMI, read back afterwards (qcacld's "a"/"b" steps). */
+static bool
+bmi_rmw_soc(uint32_t addr, uint32_t clear, uint32_t set, uint32_t *before, uint32_t *after)
+{
+	return bmi_read_soc(addr, before) && bmi_write_soc(addr, (*before & ~clear) | set) && bmi_read_soc(addr, after);
+}
+
+/* RTC_SYNC_STATUS until PLL_CHANGING clears: the number of polls, or -1 (BMI failed, or 10000 polls) */
+static int
+pll_wait(void)
+{
+	for (int i = 0; i < 10000; i++) {
+		uint32_t v = 0;
+		if (!bmi_read_soc(RTC_WMAC_BASE | RTC_SYNC_STATUS_OFFSET, &v)) {
+			return -1;
+		}
+		if ((v & 0x20u) == 0) {
+			return i;
+		}
+		IODelay(10);
+	}
+	return -1;
+}
+
+/* WLAN PLL settings per crystal (qcacld ol_fw_populate_clk_settings; ath10k's qca6174_clk is the same except for
+ * 40 MHz, where 0x11 is the one that gives the same 704 MHz as every other row) */
+static const struct {
+	uint32_t hz, div, rnfrac, settle;
+} kRefClk[8] = {
+	{ 48000000u, 0x0Eu, 0x2AAA8u, 2400u }, { 19200000u, 0x24u, 0x2AAA8u, 960u }, { 24000000u, 0x1Du, 0x15551u, 1200u },
+	{ 26000000u, 0x1Bu, 0x04EC4u, 1300u }, { 37400000u, 0x12u, 0x34B49u, 1870u }, { 38400000u, 0x12u, 0x15551u, 1920u },
+	{ 40000000u, 0x11u, 0x26665u, 2000u }, { 52000000u, 0x1Bu, 0x04EC4u, 2600u },
+};
+
+/*
+ * qcacld ol_patch_pll_switch (= ath10k_hw_qca6174_enable_pll_clock): the baseband and WLAN PLLs set up for the
+ * board's crystal (from the efuse), the CPU moved onto the PLL, and the firmware told (cpu_pll_init_done, its
+ * CPU speed). Both host drivers do this before every firmware download; qcacld, the phone's own driver, does
+ * not download at all if it fails. Returns NULL when done, else the step that failed.
+ */
+static const char *
+pll_switch(void)
+{
+	uint32_t efuse = 0, bb0 = 0, bb1 = 0, st0 = 0, st1 = 0, cc0 = 0, cc1 = 0, pc0 = 0, pc1 = 0, by1 = 0, cpu0 = 0, cpu1 = 0;
+	uint32_t nopwd = 0, tmp = 0;
+	if (!bmi_read_soc(RTC_SOC_BASE | EFUSE_OFFSET, &efuse)) {
+		return "efuse read";
+	}
+	uint32_t sel = (efuse >> 8) & 7u;
+	A_LOG("PLL: efuse %08x: crystal %u Hz (xtal_sel %u)", efuse, kRefClk[sel].hz, sel);
+	if (!bmi_rmw_soc(RTC_SOC_BASE | BB_PLL_CONFIG_OFFSET, 0x001FFFFFu, (kRefClk[sel].rnfrac & 0x3FFFFu) | (1u << 18),
+	    &bb0, &bb1)) {
+		return "bb_pll_config";
+	}
+	if (!bmi_rmw_soc(RTC_WMAC_BASE | WLAN_PLL_SETTLE_OFFSET, 0x7FFu, kRefClk[sel].settle & 0x7FFu, &st0, &st1)) {
+		return "wlan_pll_settle";
+	}
+	if (!bmi_rmw_soc(RTC_SOC_BASE | SOC_CORE_CLK_CTRL_OFFSET, 0x7u, 1u, &cc0, &cc1)) {
+		return "core_clk_ctrl";
+	}
+	if (!bmi_write32(CORE_CLK_DIV_ADDR, 1u)) {
+		return "core_clk_div";
+	}
+	/* refdiv 0, div, NOPWD set: the PLL powers up but stays bypassed */
+	if (!bmi_rmw_soc(RTC_WMAC_BASE | WLAN_PLL_CONTROL_OFFSET, 0x3FFu | 0x3C00u | (1u << 18),
+	    (kRefClk[sel].div & 0x3FFu) | (1u << 18), &pc0, &pc1)) {
+		return "wlan_pll_control";
+	}
+	IODelay(100);
+	int lock1 = pll_wait();
+	if (lock1 < 0) {
+		return "pll lock (power up)";
+	}
+	if (!bmi_rmw_soc(RTC_WMAC_BASE | WLAN_PLL_CONTROL_OFFSET, 1u << 16, 0u, &tmp, &by1)) {
+		return "pll bypass off";
+	}
+	int lock2 = pll_wait();
+	if (lock2 < 0) {
+		return "pll lock (bypass off)";
+	}
+	if (!bmi_rmw_soc(RTC_SOC_BASE | SOC_CPU_CLOCK_OFFSET, 0x3u, 1u, &cpu0, &cpu1)) {
+		return "cpu_clock";
+	}
+	if (!bmi_rmw_soc(RTC_WMAC_BASE | WLAN_PLL_CONTROL_OFFSET, 1u << 18, 0u, &tmp, &nopwd)) {
+		return "pll nopwd off";
+	}
+	if (!bmi_write32(CPU_PLL_INIT_DONE_ADDR, 1u) || !bmi_write32(CPU_SPEED_ADDR, TARGET_CPU_FREQ)) {
+		return "pll_init_done / cpu speed";
+	}
+	A_LOG("PLL: bb_pll_config %08x->%08x, settle %08x->%08x, core_clk_ctrl %08x->%08x, wlan_pll_control %08x->%08x",
+	    bb0, bb1, st0, st1, cc0, cc1, pc0, pc1);
+	A_LOG("PLL: locked after %d + %d polls, control %08x then %08x, cpu_clock %08x->%08x; firmware told %u Hz", lock1, lock2,
+	    by1, nopwd, cpu0, cpu1, TARGET_CPU_FREQ);
+	return NULL;
+}
+
 /* ath10k_bmi_lz_data: len is a multiple of 4; chunks of BMI_MAX_DATA_SIZE minus the 8-byte header */
 static bool
 bmi_lz_data(const uint8_t *data, uint32_t len)
@@ -1203,12 +1335,33 @@ run2c(char *res, size_t len)
 	/* ath10k_init_configure_target */
 	uint32_t opt = 0;
 	bool ok = bmi_write32(HI_APP_HOST_INTEREST, HTC_PROTOCOL_VERSION) && bmi_read32(HI_OPTION_FLAG, &opt) &&
-	    bmi_write32(HI_OPTION_FLAG, opt | (1u << 9) | (2u << 12) | (1u << 3)) &&   /* 1 device, AP mode, MAC method 1 */
+	    /* 1 device, AP mode, MAC method 1; and the firmware's debug log on (qcacld with gEnablefwlog) */
+	    bmi_write32(HI_OPTION_FLAG, (opt | (1u << 9) | (2u << 12) | (1u << 3)) & ~HI_OPTION_DISABLE_DBGLOG) &&
 	    bmi_write32(HI_BE, 0u) && bmi_write32(HI_FW_SWAP, 0u) &&
 	    bmi_write32(HI_HCI_UART_PWR_MGMT_EXT, QCA6174_DEVICE_ID);
 	if (!ok) {
 		snprintf(res, len, "%s", "STEP 2c FAIL: configuring the target over BMI failed");
 		return false;
+	}
+
+	/* the PLL switch both host drivers make before downloading anything; a failure is logged, not fatal (ath10k) */
+	const char *pll = pll_switch();
+	if (pll != NULL) {
+		A_LOG("PLL: FAILED at %s; going on with the reference clock", pll);
+	}
+
+	/* qcacld ol_download_firmware, and ath10k on its first boot (ath10k_core_get_board_id_from_otp): the OTP image
+	 * run once with BMI_PARAM_GET_EEPROM_BOARD_ID before the board data goes in */
+	if (f.otp_len > 0) {
+		uint32_t r = 0;
+		ok = bmi_fast_download(BMI_PATCH_LOAD_ADDR, f.otp, f.otp_len) &&
+		    bmi_execute(BMI_PATCH_LOAD_ADDR, BMI_PARAM_GET_EEPROM_BOARD_ID, &r);
+		A_LOG("otp board id: %s, result %08x (status %u, board id %u, chip id %u, extended board id %s)",
+		    ok ? "ran" : "FAILED", r, r & 0xFFu, (r & 0x7C00u) >> 10, (r & 0x18000u) >> 15, (r & 0x40000u) ? "yes" : "no");
+		if (!ok) {
+			snprintf(res, len, "%s", "STEP 2c FAIL: OTP board ID run over BMI");
+			return false;
+		}
 	}
 
 	/* ath10k_download_board_data (QCA6174 has no extended board data) */
@@ -1271,7 +1424,8 @@ static const struct rx_pipe gRxPipes[3] = {
 };
 
 static uint8_t gEpWmi = 0xFFu, gEpHtt = 0xFFu;
-static uint32_t gWmiCredits, gCreditReports, gOtherMsgs;
+static uint32_t gWmiCredits, gCreditReports, gOtherMsgs, gDebugMsgs;
+static bool gFwDown;                /* fw_down() saw a crash or a dead link */
 static uint8_t gHtcSeq[HTC_EP_COUNT];
 static uint8_t gRx[HTC_RX_SIZE];   /* the message htc_rx_one delivered: payload without header and trailer */
 static uint32_t gRxLen;
@@ -1346,6 +1500,7 @@ htc_rx_one(void)
 		if (!ce_recv_done(p->ce, &n, &at)) {
 			continue;
 		}
+		bwr(p->ce->base + CE_HOST_IS, 0x1Fu);   /* ath10k_ce_per_engine_service: clear before handling */
 		uint32_t lo = gDmaPhys + p->first;
 		if (at < lo || at >= lo + p->count * p->size || (at - lo) % p->size != 0) {
 			A_LOG("%s: completion of a buffer that was never posted (%08x, %u bytes); dropped", p->name, at, n);
@@ -1393,9 +1548,31 @@ msg_id(void)
 	return 0xFFFFFFFFu;
 }
 
+/* Words for the log, 8 per line */
+static void
+log_words(const char *tag, uint32_t base, const uint8_t *p, uint32_t bytes)
+{
+	uint32_t w[8];
+	for (uint32_t o = 0; o + 4u <= bytes; o += 32u) {
+		uint32_t n = (bytes - o) / 4u < 8u ? (bytes - o) / 4u : 8u;
+		bzero(w, sizeof(w));
+		memcpy(w, p + o, n * 4u);
+		A_LOG("%s +%04x: %08x %08x %08x %08x %08x %08x %08x %08x", tag, base + o, w[0], w[1], w[2], w[3], w[4], w[5], w[6],
+		    w[7]);
+	}
+}
+
+#define WMI_TLV_DEBUG_MESG_EVENTID 0x1d003u
+
 static void
 other_msg(void)
 {
+	if (gRxEid == gEpWmi && msg_id() == WMI_TLV_DEBUG_MESG_EVENTID && gDebugMsgs < 2u) {
+		gDebugMsgs++;
+		A_LOG("firmware debug log event, %u bytes", gRxLen);
+		log_words("debug log event", 0u, gRx, gRxLen < 1024u ? gRxLen : 1024u);
+		return;
+	}
 	if (gOtherMsgs++ < 16u) {
 		A_LOG("unrequested message: endpoint %u id %x, %u bytes: %02x %02x %02x %02x %02x %02x %02x %02x", gRxEid, msg_id(),
 		    gRxLen, gRx[0], gRx[1], gRx[2], gRx[3], gRx[4], gRx[5], gRx[6], gRx[7]);
@@ -1419,10 +1596,12 @@ fw_down(const char *what, char *res, size_t len)
 {
 	uint32_t fwi = brd(Q_FW_INDICATOR);
 	if (fwi == 0xFFFFFFFFu) {
+		gFwDown = true;
 		snprintf(res, len, "STEP 3 FAIL: BAR0 reads all ones while waiting for %s", what);
 		return true;
 	}
 	if (fwi & Q_FW_IND_EVENT_PENDING) {
+		gFwDown = true;
 		A_LOG("firmware crashed while we waited for %s (fw indicator %08x)", what, fwi);
 		dump_fw_crash();
 		snprintf(res, len, "STEP 3 FAIL: firmware crashed while we waited for %s (fw indicator %08x)", what, fwi);
@@ -1432,8 +1611,17 @@ fw_down(const char *what, char *res, size_t len)
 }
 
 /* Wait for one message (endpoint eid, msg_id() == id); others are logged (the first 16) and dropped. */
+static void
+dump_ces(void)
+{
+	ce_dump("CE1", &gCe1);
+	ce_dump("CE2", &gCe2);
+	ce_dump("CE3", &gCe3);
+	ce_dump("CE5", &gCe5);
+}
+
 static bool
-htc_wait(uint32_t eid, uint32_t id, uint32_t timeout_ms, const char *what, char *res, size_t len)
+htc_wait(uint32_t eid, uint32_t id, uint32_t timeout_ms, const char *what, char *res, size_t len, bool dump)
 {
 	for (uint32_t t = 0;; t++) {
 		int r;
@@ -1453,9 +1641,9 @@ htc_wait(uint32_t eid, uint32_t id, uint32_t timeout_ms, const char *what, char 
 		}
 		IOSleep(1);
 	}
-	ce_dump("CE1", &gCe1);
-	ce_dump("CE2", &gCe2);
-	ce_dump("CE5", &gCe5);
+	if (dump) {
+		dump_ces();
+	}
 	snprintf(res, len, "STEP 3 FAIL: %s did not come within %u ms (fw indicator %08x)", what, timeout_ms,
 	    brd(Q_FW_INDICATOR));
 	return false;
@@ -1495,7 +1683,9 @@ htc_send(uint32_t eid, struct ce_pipe *ce, uint32_t off, uint32_t max, const voi
 		return false;
 	}
 	uint32_t unused = 0;
-	return ce_wait(ce, NULL, &unused, 1000000u, "HTC send");
+	bool sent = ce_wait(ce, NULL, &unused, 1000000u, "HTC send");
+	bwr(ce->base + CE_HOST_IS, 0x1Fu);
+	return sent;
 }
 
 /* ath10k_htc_connect_service: only WMI control gets credits (all of them) and credit flow control */
@@ -1510,7 +1700,7 @@ htc_connect(uint32_t svc, const char *name, uint8_t *eid_out, char *res, size_t 
 		snprintf(res, len, "STEP 3 FAIL: HTC connect request for %s could not be sent", name);
 		return false;
 	}
-	if (!htc_wait(0u, HTC_MSG_CONNECT_SERVICE_RESP, 1000u, "an HTC connect response", res, len)) {
+	if (!htc_wait(0u, HTC_MSG_CONNECT_SERVICE_RESP, 1000u, "an HTC connect response", res, len, true)) {
 		return false;
 	}
 	/* { message_id, service_id le16, status, eid, max_msg_size le16 } */
@@ -1740,6 +1930,110 @@ build_init(bool full_reorder)
 	return n * 4u;
 }
 
+
+/* One WMI echo and its answer (ath10k_wmi_barrier's round trip): "OK", "wrong value", "no answer", "not sent" */
+static const char *
+wmi_echo(uint32_t timeout_ms)
+{
+	char why[160];
+	uint32_t ev[2] = { tlv_hdr(WMI_TLV_TAG_ECHO_CMD, 4u), OP2_ECHO_VALUE };
+	if (!wmi_cmd(WMI_TLV_ECHO_CMDID, ev, sizeof(ev))) {
+		return "not sent";
+	}
+	if (!htc_wait(gEpWmi, WMI_TLV_ECHO_EVENTID, timeout_ms, "the WMI echo", why, sizeof(why), false)) {
+		A_LOG("%s", why);
+		return "no answer";
+	}
+	const uint8_t *v = wmi_find(WMI_TLV_TAG_ECHO_EVENT, 4u);
+	return v != NULL && le32(v) == OP2_ECHO_VALUE ? "OK" : "wrong value";
+}
+
+/* Target memory the diagnostic window reaches with the window register at its default: below 1 MB, and DRAM */
+static bool
+in_target_mem(uint32_t a, uint32_t n)
+{
+	return a != 0 && ((a + n <= 0x100000u && a + n >= a) ||
+	    (a >= DRAM_BASE_ADDRESS && a + n <= DRAM_BASE_ADDRESS + REGION_ACCESS_SIZE));
+}
+
+/* The firmware's debug log (qcacld dbglog.h): hi_dbglog_hdr -> { dbuf, dropped }, a ring of
+ * { next, buffer, bufsize, length, count, free }; entries are { timestamp, dbgid 9:0 | module 17:10 | vdev 25:18 |
+ * nargs 31:26 } and their arguments. Raw words for the log, up to 2 buffers. */
+static void
+dump_dbglog(void)
+{
+	static uint8_t buf[1536];
+	uint32_t hdr = 0, h[2] = { 0, 0 };
+	if (!diag_read32(HI_DBGLOG_HDR, &hdr) || !in_target_mem(hdr, 8u) || !diag_read(hdr, h, sizeof(h))) {
+		A_LOG("firmware debug log: no header (hi_dbglog_hdr %08x)", hdr);
+		return;
+	}
+	A_LOG("firmware debug log: header at %08x: first buffer %08x, %u entries dropped", hdr, h[0], h[1]);
+	uint32_t at = h[0], shown = 0;
+	for (uint32_t n = 0; n < 6u && shown < 2u && in_target_mem(at, 24u); n++) {
+		uint32_t b[6];
+		if (!diag_read(at, b, sizeof(b))) {
+			return;
+		}
+		A_LOG("firmware debug log buffer %u at %08x: data %08x, size %u, length %u, count %u, free %u, next %08x", n, at,
+		    b[1], b[2], b[3], b[4], b[5], b[0]);
+		uint32_t bytes = (b[3] < b[2] ? b[3] : b[2]) & ~3u;
+		if (bytes > sizeof(buf)) {
+			bytes = sizeof(buf);
+		}
+		if (bytes > 0 && b[2] <= 0x4000u && in_target_mem(b[1], bytes) && diag_read(b[1], buf, bytes)) {
+			char tag[24];
+			snprintf(tag, sizeof(tag), "debug log %u", n);
+			log_words(tag, 0u, buf, bytes);
+			shown++;
+		}
+		at = b[0];
+		if (at == h[0]) {
+			break;
+		}
+	}
+}
+
+static void
+ready_progress(uint32_t ms)
+{
+	A_LOG("waiting for WMI ready, %u ms: fw indicator %08x; CE2 target sent %u (done %u); CE3 our sends %u (done %u), "
+	    "target buffers %u (used %u); LF timer %08x", ms, brd(Q_FW_INDICATOR), brd(gCe2.base + CE_SR_WR_INDEX),
+	    brd(gCe2.base + CE_CURRENT_SRRI), brd(gCe3.base + CE_SR_WR_INDEX), brd(gCe3.base + CE_CURRENT_SRRI),
+	    brd(gCe3.base + CE_DST_WR_INDEX), brd(gCe3.base + CE_CURRENT_DRRI), brd(0x84cu));
+}
+
+/*
+ * ath10k_wmi_wait_for_unified_ready gives the firmware 5 s. Here: 10 s with a progress line every 2 s; then the
+ * chip's own interrupt enable switched on, as ath10k_pci_irq_enable leaves it while the firmware runs (the PCI
+ * interrupt-disable bit still keeps anything from reaching the phone), and 6 s more. *phase2: the ready event came
+ * only after that.
+ */
+static bool
+wait_wmi_ready(char *res, size_t len, uint32_t *took_ms, bool *phase2)
+{
+	uint32_t t0 = ms_since_power_on();
+	*phase2 = false;
+	for (uint32_t slice = 0; slice < 8u; slice++) {
+		if (slice == 5u) {
+			bwr(Q_PCIE_INTR_CLR, Q_INTR_FW_AND_CE);
+			bwr(Q_PCIE_INTR_ENABLE, Q_INTR_FW_AND_CE);
+			A_LOG("no WMI ready after 10 s: chip interrupt enable now %08x (cause %08x), INTx stays disabled (chip command "
+			    "%08x); 6 s more", brd(Q_PCIE_INTR_ENABLE), brd(Q_PCIE_INTR_CAUSE), rd32(gConf, 0x04));
+			*phase2 = true;
+		}
+		if (htc_wait(gEpWmi, WMI_TLV_READY_EVENTID, 2000u, "the WMI ready event", res, len, false)) {
+			*took_ms = ms_since_power_on() - t0;
+			return true;
+		}
+		if (gFwDown) {
+			return false;
+		}
+		ready_progress(ms_since_power_on() - t0);
+	}
+	return false;
+}
+
 /* ath10k_core_start from ath10k_htt_connect to ath10k_htt_setup's version check, plus a WMI echo */
 static bool
 run3(char *res, size_t len)
@@ -1791,7 +2085,7 @@ run3(char *res, size_t len)
 	    gHtcCreditSize);
 
 	/* ath10k_wmi_wait_for_service_ready (5 s) */
-	if (!htc_wait(gEpWmi, WMI_TLV_SERVICE_READY_EVENTID, 5000u, "the WMI service ready event", res, len)) {
+	if (!htc_wait(gEpWmi, WMI_TLV_SERVICE_READY_EVENTID, 5000u, "the WMI service ready event", res, len, true)) {
 		return false;
 	}
 	struct svc_ready *s = &gSvc;
@@ -1835,9 +2129,23 @@ run3(char *res, size_t len)
 		snprintf(res, len, "%s", "STEP 3 FAIL: WMI init could not be sent");
 		return false;
 	}
-	if (!htc_wait(gEpWmi, WMI_TLV_READY_EVENTID, 5000u, "the WMI ready event", res, len)) {
+	uint32_t took = 0;
+	bool phase2 = false;
+	if (!wait_wmi_ready(res, len, &took, &phase2)) {
+		if (gFwDown) {
+			dump_dbglog();
+			return false;
+		}
+		dump_ces();
+		const char *echo = wmi_echo(2000u);
+		A_LOG("after no WMI ready: WMI echo %s; credits %u, %u credit reports, %u unrequested messages", echo, gWmiCredits,
+		    gCreditReports, gOtherMsgs);
+		dump_dbglog();
+		snprintf(res, len, "STEP 3 FAIL: no WMI ready within 16 s (the last 6 s with the chip interrupt on); WMI echo %s; "
+		    "fw indicator %08x", echo, brd(Q_FW_INDICATOR));
 		return false;
 	}
+	A_LOG("WMI ready came %u ms after init%s", took, phase2 ? ", only after the chip interrupt enable went on" : "");
 	const uint8_t *rdy = wmi_find(WMI_TLV_TAG_READY_EVENT, 36u);   /* abi (24 B), mac_addr (8 B), status */
 	if (rdy == NULL) {
 		snprintf(res, len, "STEP 3 FAIL: WMI ready event without its ready TLV (%u bytes)", gRxLen);
@@ -1855,7 +2163,7 @@ run3(char *res, size_t len)
 		snprintf(res, len, "%s", "STEP 3 FAIL: HTT version request could not be sent");
 		return false;
 	}
-	if (!htc_wait(gEpHtt, HTT_T2H_MSG_TYPE_VERSION_CONF, 3000u, "the HTT version", res, len)) {
+	if (!htc_wait(gEpHtt, HTT_T2H_MSG_TYPE_VERSION_CONF, 3000u, "the HTT version", res, len, true)) {
 		return false;
 	}
 	uint32_t htt_minor = gRxLen >= 3u ? gRx[1] : 0u, htt_major = gRxLen >= 3u ? gRx[2] : 0u;
@@ -1866,17 +2174,7 @@ run3(char *res, size_t len)
 	}
 
 	/* a WMI round trip after init; the step does not depend on it */
-	char why[120];
-	const char *echo = "no answer";
-	uint32_t ev[2] = { tlv_hdr(WMI_TLV_TAG_ECHO_CMD, 4u), OP2_ECHO_VALUE };
-	if (!wmi_cmd(WMI_TLV_ECHO_CMDID, ev, sizeof(ev))) {
-		echo = "not sent";
-	} else if (htc_wait(gEpWmi, WMI_TLV_ECHO_EVENTID, 1000u, "the WMI echo", why, sizeof(why))) {
-		const uint8_t *v = wmi_find(WMI_TLV_TAG_ECHO_EVENT, 4u);
-		echo = v != NULL && le32(v) == OP2_ECHO_VALUE ? "OK" : "wrong value";
-	} else {
-		A_LOG("%s", why);
-	}
+	const char *echo = wmi_echo(1000u);
 	drain();
 	A_LOG("WMI echo %s; WMI credits %u, %u credit reports, %u unrequested messages", echo, gWmiCredits, gCreditReports,
 	    gOtherMsgs);
@@ -1996,6 +2294,10 @@ op2_ath10k_step2b(const struct op2_ath10k_bus *bus, char *result, size_t len)
 		ok = run3(result, len);
 	}
 	/* The chip cannot DMA any more; the block stays allocated for good. */
+	if (!gChipGone) {
+		bwr(Q_PCIE_INTR_ENABLE, 0u);   /* ath10k_pci_irq_disable: step 3 may have switched it on */
+		bwr(Q_PCIE_INTR_CLR, Q_INTR_FW_AND_CE);
+	}
 	wr32(gDbi, 0x04, rd32(gDbi, 0x04) & 0xFFFBu);
 	if (gChipGone) {
 		A_LOG("done: root port bus mastering off (rp command %08x); chip left alone", rd32(gDbi, 0x04));
