@@ -23,8 +23,8 @@
  *   firmware-6.bin from linux-firmware, embedded at build time from the gitignored firmware/qca6174/ by
  *   tools/gen-wifi-fw.py; without it 2c reports that no firmware is built in.
  * Step 3 (wifi=5), after a 2c pass, starts the firmware the way ath10k_core_start goes on (still polled):
- *   host side of CE2 (WMI events), CE3 (WMI commands), CE4 (HTT commands), CE5 (HTT messages) and receive
- *   buffers on CE1/CE2/CE5; HTC connect of the HTT data and WMI control services, HTC setup complete; the WMI
+ *   host side of CE2 (WMI events), CE3 (WMI commands), CE4 (HTT commands) and receive buffers on CE1/CE2 (CE5
+ *   is the firmware's own on QCA6174; HTT messages come on CE1); HTC connect of the HTT data and WMI control services, HTC setup complete; the WMI
  *   service-ready event (TLV ABI checked, host memory the firmware asks for allocated); WMI init with
  *   ath10k's TLV resource config; the WMI ready event, which carries the chip's MAC address; the HTT version;
  *   a WMI echo. HTC credit reports in message trailers give the WMI endpoint its credits back.
@@ -193,7 +193,6 @@ static const char *gStep = "2b";   /* "2b", "2c" or "3": the step the log lines 
 #define OFF_CE2_DST     0x0300u   /* step 3: 16 x 8 B each */
 #define OFF_CE3_SRC     0x0400u
 #define OFF_CE4_SRC     0x0500u
-#define OFF_CE5_DST     0x0600u
 #define OFF_BMI_REQ     0x1000u   /* 256 B */
 #define OFF_BMI_RESP    0x1800u   /* 2 KB */
 #define OFF_DIAG        0x2000u   /* 2 KB = DIAG_TRANSFER_LIMIT */
@@ -202,13 +201,10 @@ static const char *gStep = "2b";   /* "2b", "2c" or "3": the step the log lines 
 #define OFF_WMI_TX      0x3000u   /* 2 KB: WMI commands (CE3) */
 #define OFF_HTC_RX      0x4000u   /* 8 x 2 KB receive buffers for CE1 once the firmware runs */
 #define OFF_WMI_RX      0x8000u   /* 8 x 2 KB for CE2 */
-#define OFF_HTT_RX      0xC000u   /* 8 x 512 B for CE5 */
 #define HTC_RX_COUNT    8u
 #define HTC_RX_SIZE     2048u
 #define WMI_RX_COUNT    8u
 #define WMI_RX_SIZE     2048u
-#define HTT_RX_COUNT    8u
-#define HTT_RX_SIZE     512u      /* pci_target_ce_config_wlan CE5 nbytes_max */
 #define HTC_TX_MAX      256u      /* CE0 src_sz_max */
 #define HTT_TX_MAX      256u      /* CE4 src_sz_max */
 #define WMI_TX_MAX      2048u     /* CE3 src_sz_max */
@@ -295,14 +291,17 @@ enum : uint32_t {
 };
 
 /* pci_target_ce_config_wlan[0..6] (NUM_TARGET_CE_CONFIG_WLAN = 7 on QCA6174), struct ce_pipe_config:
- * pipenum, pipedir (1 target->host, 2 host->target, 3 both), nentries, nbytes_max, flags, reserved */
+ * pipenum, pipedir (1 target->host, 2 host->target, 3 both), nentries, nbytes_max, flags, reserved.
+ * With ath10k_pci_override_ce_config applied, as ath10k does for QCA6174 and QCA9377: CE5 "is currently used for
+ * other feature" by the firmware (host->target, 2048 bytes, no host ring), and HTT messages come on pipe 1. Without
+ * the override the firmware crashed handling WMI init, its registers pointing at this table's entry 5. */
 static const uint32_t kTargetCeConfig[7][6] = {
 	{ 0, 2, 32, 256, 0, 0 },     /* HTC control and raw streams */
 	{ 1, 1, 32, 2048, 0, 0 },    /* HTT + HTC control */
 	{ 2, 1, 64, 2048, 0, 0 },    /* WMI events */
 	{ 3, 2, 32, 2048, 0, 0 },    /* WMI commands */
 	{ 4, 2, 256, 256, 0, 0 },    /* HTT tx */
-	{ 5, 1, 32, 512, 0, 0 },     /* HTT rx (HIF->HTT) */
+	{ 5, 2, 32, 2048, 0, 0 },    /* the firmware's own use (ath10k_pci_override_ce_config) */
 	{ 6, 3, 32, 4096, 0, 0 },    /* target autonomous hif_memcpy */
 };
 
@@ -315,7 +314,7 @@ static const uint32_t kServiceMap[17][3] = {
 	{ 0x0100, 2, 3 }, { 0x0100, 1, 2 },   /* WMI_CONTROL */
 	{ 0x0001, 2, 0 }, { 0x0001, 1, 1 },   /* RSVD_CTRL */
 	{ 0xFE00, 2, 0 }, { 0xFE00, 1, 1 },   /* TEST_RAW_STREAMS */
-	{ 0x0300, 2, 4 }, { 0x0300, 1, 5 },   /* HTT_DATA_MSG */
+	{ 0x0300, 2, 4 }, { 0x0300, 1, 1 },   /* HTT_DATA_MSG; target->host on pipe 1 (override; the table has 5) */
 	{ 0, 0, 0 },
 };
 
@@ -1409,18 +1408,17 @@ run2c(char *res, size_t len)
 /* ---------------------------------------------------------------------------------------------------- */
 /* step 3: HTC services, WMI init and ready, HTT version (htc.c, wmi.c, wmi-tlv.c, htt.c, htt_tx.c)     */
 
-/* Receive pipes once the firmware runs. The service map written in 2b sends HTC control on pipe 1, WMI events
- * on pipe 2 and HTT messages on pipe 5. */
+/* Receive pipes once the firmware runs. The service map written in 2b sends HTC control and HTT messages on
+ * pipe 1 and WMI events on pipe 2; CE5 belongs to the firmware (ath10k_pci_override_ce_config). */
 struct rx_pipe {
 	struct ce_pipe *ce;
 	uint32_t first, count, size;
 	const char *name;
 };
 
-static const struct rx_pipe gRxPipes[3] = {
+static const struct rx_pipe gRxPipes[2] = {
 	{ &gCe1, OFF_HTC_RX, HTC_RX_COUNT, HTC_RX_SIZE, "CE1" },
 	{ &gCe2, OFF_WMI_RX, WMI_RX_COUNT, WMI_RX_SIZE, "CE2" },
-	{ &gCe5, OFF_HTT_RX, HTT_RX_COUNT, HTT_RX_SIZE, "CE5" },
 };
 
 static uint8_t gEpWmi = 0xFFu, gEpHtt = 0xFFu;
@@ -1489,12 +1487,12 @@ htc_trailer(const uint8_t *t, uint32_t len)
 	}
 }
 
-/* One completed receive on CE1, CE2 or CE5 (ath10k_htc_rx_completion_handler): header checked, trailer applied,
+/* One completed receive on CE1 or CE2 (ath10k_htc_rx_completion_handler): header checked, trailer applied,
  * the buffer posted again. 0: nothing completed; 1: completed, nothing to deliver; 2: a message is in gRx. */
 static int
 htc_rx_one(void)
 {
-	for (uint32_t i = 0; i < 3u; i++) {
+	for (uint32_t i = 0; i < sizeof(gRxPipes) / sizeof(gRxPipes[0]); i++) {
 		const struct rx_pipe *p = &gRxPipes[i];
 		uint32_t n = 0, at = 0;
 		if (!ce_recv_done(p->ce, &n, &at)) {
@@ -2045,28 +2043,23 @@ run3(char *res, size_t len)
 	gCe2.base = Q_CE(2);
 	gCe3.base = Q_CE(3);
 	gCe4.base = Q_CE(4);
-	gCe5.base = Q_CE(5);
+	gCe5.base = Q_CE(5);   /* only read, for the dumps: the firmware's own */
 	ce_quiet(&gCe2);
 	ce_quiet(&gCe3);
 	ce_quiet(&gCe4);
-	ce_quiet(&gCe5);
 	ce_init_dst(&gCe2, OFF_CE2_DST, 16u, true);
 	ce_init_src(&gCe3, OFF_CE3_SRC, 16u, WMI_TX_MAX, true);
 	ce_init_src(&gCe4, OFF_CE4_SRC, 16u, HTT_TX_MAX, true);
-	ce_init_dst(&gCe5, OFF_CE5_DST, 16u, true);
 	bool ok = true;
 	for (uint32_t i = 0; i < WMI_RX_COUNT; i++) {
 		ok = ok && ce_post_rx(&gCe2, gDmaPhys + OFF_WMI_RX + i * WMI_RX_SIZE);
-	}
-	for (uint32_t i = 0; i < HTT_RX_COUNT; i++) {
-		ok = ok && ce_post_rx(&gCe5, gDmaPhys + OFF_HTT_RX + i * HTT_RX_SIZE);
 	}
 	ce_dump("CE2", &gCe2);
 	ce_dump("CE3", &gCe3);
 	ce_dump("CE4", &gCe4);
 	ce_dump("CE5", &gCe5);
 	if (!ok) {
-		snprintf(res, len, "%s", "STEP 3 FAIL: could not post the receive buffers on CE2 / CE5");
+		snprintf(res, len, "%s", "STEP 3 FAIL: could not post the receive buffers on CE2");
 		return false;
 	}
 
@@ -2137,12 +2130,19 @@ run3(char *res, size_t len)
 			return false;
 		}
 		dump_ces();
+		uint32_t rec = 0, word0 = 0;   /* the firmware can stop without raising FW_IND_EVENT_PENDING */
+		bool crashed = diag_read32(HI_FAILURE_STATE, &rec) && rec != 0 && diag_read32(rec, &word0) &&
+		    word0 == 0x05030000u;
+		if (crashed) {
+			A_LOG("firmware crash record at %08x holds a register dump (first word %08x): the firmware stopped", rec, word0);
+			dump_fw_crash();
+		}
 		const char *echo = wmi_echo(2000u);
 		A_LOG("after no WMI ready: WMI echo %s; credits %u, %u credit reports, %u unrequested messages", echo, gWmiCredits,
 		    gCreditReports, gOtherMsgs);
 		dump_dbglog();
-		snprintf(res, len, "STEP 3 FAIL: no WMI ready within 16 s (the last 6 s with the chip interrupt on); WMI echo %s; "
-		    "fw indicator %08x", echo, brd(Q_FW_INDICATOR));
+		snprintf(res, len, "STEP 3 FAIL: no WMI ready within 16 s (the last 6 s with the chip interrupt on); %sWMI echo %s; "
+		    "fw indicator %08x", crashed ? "firmware crash record written; " : "", echo, brd(Q_FW_INDICATOR));
 		return false;
 	}
 	A_LOG("WMI ready came %u ms after init%s", took, phase2 ? ", only after the chip interrupt enable went on" : "");
@@ -2157,7 +2157,7 @@ run3(char *res, size_t len)
 	A_LOG("WMI ready: sw version %08x, abi %u, status %u, MAC %02x:%02x:%02x:%02x:%02x:%02x", le32(rdy), le32(rdy + 4),
 	    status, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
-	/* ath10k_htt_setup: version request on the HTT endpoint (CE4), the answer on pipe 5 (3 s) */
+	/* ath10k_htt_setup: version request on the HTT endpoint (CE4), the answer on pipe 1 (3 s) */
 	uint8_t vreq[4] = { HTT_H2T_MSG_TYPE_VERSION_REQ, 0, 0, 0 };
 	if (!htc_send(gEpHtt, &gCe4, OFF_HTT_TX, HTT_TX_MAX, vreq, sizeof(vreq), false)) {
 		snprintf(res, len, "%s", "STEP 3 FAIL: HTT version request could not be sent");
