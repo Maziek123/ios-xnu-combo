@@ -25,7 +25,7 @@ clone it to `xnu/xnu-4903.270.47` inside this checkout.
 | Battery | `OP2Battery` (PMI8994 fuel gauge → `IOPMPowerSource`) is in the kernel; not yet checked against a meter | kernel source |
 | **Internet over USB** | Through the Mac's NAT: configd makes `ue0` primary, DNS + HTTP verified from the phone ([setup](docs/SETUP.md)) | `op2net example.com` → `200 OK` |
 | Safari | Loads sites over HTTPS with JavaScript (JIT on): Google, Wikipedia, YouTube, apple.com (heavy sites still rough) | photos on the phone |
-| **Wi-Fi (QCA6174 on PCIe)** | Early bring-up, no networking yet: the chip is powered, the PCIe link is up, DMA works and the chip's boot loader answers (hw3.2); loading the firmware is next ([below](#wi-fi-bring-up-step-by-step)) | `OP2 WIFI: RESULT:` lines (boot-arg `wifi=2`) |
+| **Wi-Fi (QCA6174 on PCIe)** | Bring-up, no networking yet: the chip is powered, the PCIe link is up and **the chip boots its own firmware** (`WLAN.RM.4.4.1`, HTC ready); talking to the firmware (WMI) is next ([below](#wi-fi-bring-up-step-by-step)) | `OP2 WIFI: RESULT:` lines (boot-arg `wifi=4`) |
 | Not working yet | Wi-Fi networking and Bluetooth, RTC (clock does not keep time) | [docs/NEXT-PLAN.md](docs/NEXT-PLAN.md) |
 | Known issues | brief pale/partial frames while scrolling; logd SIGBUS/SIGSEGV loop, Spotlight extensions SIGABRT loop, occasional SpringBoard SIGSEGV | [CLAUDE.md](CLAUDE.md) |
 
@@ -54,7 +54,7 @@ Everything here was measured on the phone; the details and logs are in [docs/GPU
 
 The Wi-Fi/Bluetooth chip is a Qualcomm Atheros **QCA6174** (hw3.2) on PCIe root complex 1, not the SoC's WCNSS.
 The kernel code is `iokit/Kernel/arm/OP2Wifi.cpp` (power, PCIe, chip registers) and `OP2Ath10k.cpp` (copy
-engines and boot loader, ported from Linux's ath10k). It is off by default; the boot-arg `wifi` in the `CMDLINE=`
+engines, boot loader and firmware download, ported from Linux's ath10k). It is off by default; the boot-arg `wifi` in the `CMDLINE=`
 line of `tools/build-daily.sh` sets how far it goes. It runs in its own kernel thread 120 s after boot and repeats
 its result every 60 s so the line survives in ramoops: `grep -a 'OP2 WIFI' op2-last-boot.log`.
 
@@ -64,9 +64,11 @@ its result every 60 s so the line survives in ramoops: `grep -a 'OP2 WIFI' op2-l
 | **1** power + PCIe link | 2 | **Passes on the phone.** Chip power (bt_vreg, L30, bootstrap, WLAN_EN), the controller's supplies, clocks and TrustZone secure config, the 20 nm PHY and link training: the chip answers as `168c:003e`, class/rev `02800032`, link x1 Gen1. |
 | **2a** chip registers | 2 | **Passes on the phone.** BAR0 (2 MB, on a 2 MB boundary at `0xf8a00000`), SoC wake, chip ID `00342aff` (rev 10 = hw3.2), readable about 80 ms after WLAN_EN; no reset needed. |
 | **2b** DMA + boot loader | 3 | **Passes on the phone.** The copy engines (CE0/CE1 for boot-loader messages, CE7 as a window into the chip's memory), the target-side configuration and the first boot-loader (BMI) command, `GET_TARGET_INFO`: the chip answers version `05030000` (hw3.2) with no reset. |
-| **2c** firmware boot | 4 | Written, not yet run on the phone: board data, the OTP image and the firmware over BMI and the diagnostic window, `BMI_DONE`, then the firmware's HTC "ready" message. Uses ath10k's `firmware-6.bin` and the phone's own `bdwlan30.bin`, which stay out of this repository ([below](#wi-fi-firmware-files)). |
+| **2c** firmware boot | 4 | **Passes on the phone.** Board data (the phone's own `bdwlan30.bin`), the OTP calibration program and the firmware (`WLAN.RM.4.4.1-00309`, 681 KB in six segments through the diagnostic window), then `BMI_DONE`: 11 ms later the firmware sends its HTC ready message (2 send credits of 1792 bytes, 4 endpoints, HTC 2.1). Uses ath10k's `firmware-6.bin`, which stays out of this repository with the board data ([below](#wi-fi-firmware-files)). |
+| **3** firmware services | 5 | Next: connect the firmware's control (WMI) and data (HTT) services and start it with WMI init; its ready event carries the chip's Wi-Fi MAC address. |
 
-Scanning, connecting, a network interface and Bluetooth come after the firmware boots.
+After that: a first scan that only listens (step 4, the log lists nearby networks), then connecting, a network
+interface and Bluetooth.
 
 #### Progress so far (2026-11-23 to 11-24)
 
@@ -80,7 +82,7 @@ Scanning, connecting, a network interface and Bluetooth come after the firmware 
 | 6 | Step 2b, `wifi=3` (`20094ef`) | **First DMA works**: the chip read its own memory through copy engine 7 into phone RAM (`pcie_state at 00401ee0`), no crash. PARTIAL: the boot ROM never reported "initialized" in 10 s, so BMI wasn't tried | After a plain power-on the ROM doesn't raise that flag. The chip's copy engines see their own memory at `0xf8a00000`, the BAR0 address; our DMA block (`39e8d000`) is well clear of it. |
 | 7 | Try BMI without waiting; if it stays silent, reset only the chip's CPU and try again (`123f043`) | The chip's memory reads and writes all work, and the configuration read back correctly. But BMI got no answer, before or after the CPU reset: the chip never set up its side of the boot-loader channels (copy engine 0 has no receive ring, copy engine 1 no send ring) and never reported "initialized" | The boot ROM starts (it changes its reset-control register and has its tables in memory) but stops before announcing itself. Both reference drivers keep writing the chip's interrupt-enable register while they wait; we never did. |
 | 8 | Wait the way ath10k does (interrupt enable rewritten every 10 ms, with the chip's interrupt-disable bit set so nothing reaches the phone); register dumps; cold reset only if BMI stays silent (`c13dd84`) | **PASS** (no reset): the ROM reported "initialized" 440 ms into the wait (1.1 s after WLAN_EN), and BMI answered version `05030000` (hw3.2), type 8 | Most likely the ROM waits for the host to enable its interrupt: without those writes it stayed silent for 10 s. No reset of any kind is needed. |
-| 9 | Step 2c, `wifi=4`: firmware download and boot; all DMA memory now non-cacheable, so several receive buffers can be outstanding | Not run yet | Checked against a simulated chip with the real `firmware-6.bin`: board data, OTP stream and all six firmware segments arrive byte for byte; firmware crash and silence are reported. |
+| 9 | Step 2c, `wifi=4`: firmware download and boot; all DMA memory now non-cacheable, so several receive buffers can be outstanding (`f05fb2a`) | **PASS** on the first run: board data to `00401fc0`, OTP executed (result 2), six firmware segments through the diagnostic window; the firmware's HTC ready came 11 ms after `BMI_DONE`: 2 credits of 1792 bytes, 4 endpoints, HTC 2.1 | The chip runs its real firmware. OTP result 2 is not an error: this firmware's feature flags tell ath10k to ignore the OTP result, and we do the same. 2 credits of 1792 bytes is also what ath10k logs for its other PCIe chips. |
 
 #### Testing a step
 
@@ -97,7 +99,7 @@ The `RESULT:` line is the verdict; the lines before it show where a failing step
 
 #### Wi-Fi firmware files
 
-Step 2c (`wifi=4`) needs two files in `firmware/qca6174/` of the checkout you build from. That folder is in
+Step 2c and later (`wifi=4` and up) need two files in `firmware/qca6174/` of the checkout you build from. That folder is in
 `.gitignore`: the firmware is Qualcomm's and is not redistributed here.
 
 * `firmware-6.bin`: ath10k's firmware for this chip, from linux-firmware (`ath10k/QCA6174/hw3.0/firmware-6.bin`,
