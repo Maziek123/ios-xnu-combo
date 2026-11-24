@@ -10,7 +10,7 @@ clone it to `xnu/xnu-4903.270.47` inside this checkout.
 
 ---
 
-## Status (2026-11-17)
+## Status (2026-11-24)
 
 | Area | State | Evidence |
 |---|---|---|
@@ -25,7 +25,8 @@ clone it to `xnu/xnu-4903.270.47` inside this checkout.
 | Battery | `OP2Battery` (PMI8994 fuel gauge → `IOPMPowerSource`) is in the kernel; not yet checked against a meter | kernel source |
 | **Internet over USB** | Through the Mac's NAT: configd makes `ue0` primary, DNS + HTTP verified from the phone ([setup](docs/SETUP.md)) | `op2net example.com` → `200 OK` |
 | Safari | Loads sites over HTTPS with JavaScript (JIT on): Google, Wikipedia, YouTube, apple.com (heavy sites still rough) | photos on the phone |
-| Not working yet | Wi-Fi (QCA6174 on PCIe has no driver), RTC (clock does not keep time) | [docs/NEXT-PLAN.md](docs/NEXT-PLAN.md) |
+| **Wi-Fi (QCA6174 on PCIe)** | Early bring-up, no networking yet: the chip is powered, the PCIe link is up and the chip ID reads `00342aff` (hw3.2); DMA and the chip's boot loader are next ([below](#wi-fi-bring-up-step-by-step)) | `OP2 WIFI: RESULT:` lines (boot-arg `wifi=2`) |
+| Not working yet | Wi-Fi networking and Bluetooth, RTC (clock does not keep time) | [docs/NEXT-PLAN.md](docs/NEXT-PLAN.md) |
 | Known issues | brief pale/partial frames while scrolling; logd SIGBUS/SIGSEGV loop, Spotlight extensions SIGABRT loop, occasional SpringBoard SIGSEGV | [CLAUDE.md](CLAUDE.md) |
 
 Between 2026-11-14 and 11-16 another AI agent worked on this tree. Its SpringBoard injection (a 2048 game inside
@@ -48,6 +49,24 @@ Everything here was measured on the phone; the details and logs are in [docs/GPU
 | **G4c** stray writes (fixed) | The uber shader at full panel size wrote outside its buffers. Root cause was dead private-memory stores past fd4's fixed 8 KB buffer; `tools/mesa-op2/ir3-fd4-pvtmem.patch` drops them. |
 | **G4d/G4e** SMMU translation | Real SMMU translation for the A430 (boot-arg `gpu_xl`, off by default, 4 KB identity pages): stray GPU writes fault and are dropped instead of corrupting kernel memory. Full-size draws pixel-correct with zero faults. |
 | **G5** Metal on the Adreno | `op2mtl` (Mesa fd4 behind a C API) plus the `OP2Metal` shim: with `metal=3` CoreAnimation composites the home screen, lock screen and dock blur on the GPU. Open: the OrangeTree game shows blank (SpriteKit pipelines return NULL). |
+
+### Wi-Fi bring-up, step by step
+
+The Wi-Fi/Bluetooth chip is a Qualcomm Atheros **QCA6174** (hw3.2) on PCIe root complex 1, not the SoC's WCNSS.
+The kernel code is `iokit/Kernel/arm/OP2Wifi.cpp` (power, PCIe, chip registers) and `OP2Ath10k.cpp` (copy
+engines and boot loader, ported from Linux's ath10k). It is off by default; the boot-arg `wifi` in the `CMDLINE=`
+line of `tools/build-daily.sh` sets how far it goes. It runs in its own kernel thread 120 s after boot and repeats
+its result every 60 s so the line survives in ramoops: `grep -a 'OP2 WIFI' op2-last-boot.log`.
+
+| Step | `wifi=` | Result |
+|---|---|---|
+| probe | 1 | Read-only: logs the chip's pins, PMIC supplies, PCIe clocks and power domain. |
+| **1** power + PCIe link | 2 | **Passes on the phone.** Chip power (bt_vreg, L30, bootstrap, WLAN_EN), the controller's supplies, clocks and TrustZone secure config, the 20 nm PHY and link training: the chip answers as `168c:003e`, class/rev `02800032`, link x1 Gen1. |
+| **2a** chip registers | 2 | **Passes on the phone.** BAR0 (2 MB, on a 2 MB boundary at `0xf8a00000`), SoC wake, chip ID `00342aff` (rev 10 = hw3.2), readable about 80 ms after WLAN_EN; no reset needed. |
+| **2b** DMA + boot loader | 3 | Written, not yet run on the phone: the copy engines (CE0/CE1 for boot-loader messages, CE7 as a window into the chip's memory), the target-side configuration, and the first boot-loader (BMI) command, `GET_TARGET_INFO`. Passes when the chip answers version `05030000`. |
+| **2c** firmware | — | Next: board data and firmware over BMI, then the firmware's ready message. Needs the firmware files, which are kept out of this public repository. |
+
+Scanning, connecting, a network interface and Bluetooth come after the firmware boots.
 
 ---
 
@@ -142,4 +161,8 @@ See [docs/SETUP.md](docs/SETUP.md) for the full replication guide (file placemen
   adapted from. Their licence is kept as `userland/op2gpu/LICENSE-hakios`.
 * **[Mesa](https://mesa3d.org)** (MIT) — freedreno, ir3, NIR. Fetched and patched at build time, not vendored.
 * **Qualcomm's KGSL** (GPL, in the OnePlus kernel source) — read as the reference for the A430 bring-up sequence.
+* **Linux ath10k** (ISC) — the copy-engine, diagnostic-window and BMI code in `OP2Ath10k.cpp` is ported from
+  `drivers/net/wireless/ath/ath10k`; the Atheros/Qualcomm copyright lines and the ISC permission notice are kept in
+  that file. The PCIe and Wi-Fi power sequences were read from Qualcomm's `pci-msm.c` and `cnss.c` (GPL, OnePlus
+  kernel source).
 * **[dipa-studio/ios-sweet](https://github.com/dipa-studio/ios-sweet)** — the method this port started from.

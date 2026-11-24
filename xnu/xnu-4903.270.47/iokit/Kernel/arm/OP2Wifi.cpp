@@ -13,6 +13,8 @@
  *      wait up to 5 s for it to initialise (the chip ID reads 0 until then), and read its chip ID and
  *      firmware indicator (ath10k pci.c / hw.c qca6174_regs). Only if the ID is still 0: the ath10k cold
  *      reset (SOC_GLOBAL_RESET) and a 3 s wait for the boot ROM's "initialized"
+ *   3  as 2, then step 2b (OP2Ath10k.cpp): DMA through the copy engines, the diagnostic window into the
+ *      chip's memory, the target-side config, and the first boot-loader (BMI) command; no firmware yet
  *
  * Runs in its own kernel thread 120 s after the framebuffer starts (RPM is up by then, the UI is running),
  * and repeats a one-line summary every 60 s so it survives in the ramoops ring.
@@ -35,6 +37,7 @@
 #include <pexpert/pexpert.h>
 #include <libkern/libkern.h>
 #include "op2_rpm.h"
+#include "op2_ath10k.h"
 
 extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern "C" bool op2_spmi_read(uint8_t sid, uint16_t addr, uint8_t *buf, uint32_t len);   /* OP2Battery.cpp */
@@ -501,7 +504,7 @@ q_cold_reset(uint32_t bar_lo, bool bar64, char *why, size_t n)
 	return true;
 }
 
-static void
+static bool
 step2a(void)
 {
 	char line[200];
@@ -524,7 +527,7 @@ step2a(void)
 	if ((mask & 1u) || size == 0 || size > W_BARS_SIZE) {
 		snprintf(line, sizeof(line), "STEP 2a FAIL: BAR0 unusable (mask %08x, size %llu)", mask, size);
 		summary(line);
-		return;
+		return false;
 	}
 	/* A BAR is aligned to its own size: 2 MB here, so the first usable address in the window is 0xf8a00000
 	 * (0xf8900000 is not 2 MB-aligned; the chip dropped bit 20 and put BAR0 at 0xf8800000). PCI bus address =
@@ -533,7 +536,7 @@ step2a(void)
 	if (addr + size > W_BARS_PHYS + W_BARS_SIZE) {
 		snprintf(line, sizeof(line), "STEP 2a FAIL: no %llu KB-aligned slot for BAR0 in the window", size / 1024);
 		summary(line);
-		return;
+		return false;
 	}
 	wr(gConf, 0x10, (uint32_t)addr | (mask & 0xFu));
 	if ((mask & 0x6u) == 0x4u) {
@@ -546,13 +549,13 @@ step2a(void)
 	if ((got & ~0xFu) != (uint32_t)addr) {
 		snprintf(line, sizeof(line), "STEP 2a FAIL: BAR0 reads back %08x, wrote %08llx", got, addr);
 		summary(line);
-		return;
+		return false;
 	}
 
 	gBar0 = (volatile uint32_t *)ml_io_map((vm_offset_t)addr, (vm_size_t)size);
 	if (gBar0 == NULL) {
 		summary("STEP 2a FAIL: cannot map BAR0");
-		return;
+		return false;
 	}
 
 	/* Wake the chip's SoC, then wait (no reset) until it has initialised itself. */
@@ -561,7 +564,7 @@ step2a(void)
 		wr(gBar0, Q_SOC_WAKE, 0u);
 		snprintf(line, sizeof(line), "STEP 2a FAIL: chip SoC did not wake in 30 ms (rtc_state %08x)", rtc);
 		summary(line);
-		return;
+		return false;
 	}
 	W_LOG("SoC awake %u ms after WLAN_EN", ms_since_power_on());
 	q_snapshot("BAR0 regs");
@@ -572,7 +575,7 @@ step2a(void)
 		snprintf(line, sizeof(line), "STEP 2a FAIL: BAR0 reads all ones after the wait (link %s): no reset tried",
 		    rc_link_up() ? "up" : "down");
 		summary(line);
-		return;
+		return false;
 	}
 	if (!chip_id_valid(chip)) {
 		/* Fallback, the ath10k path: cold reset, then wait for the boot ROM's "initialized" (3 s). */
@@ -582,7 +585,7 @@ step2a(void)
 			snprintf(line, sizeof(line), "STEP 2a FAIL: chip id %08x fw indicator %08x after 5 s; cold reset: %s",
 			    chip, fwi, why);
 			summary(line);
-			return;   /* chip may be held in reset or off the bus: no further BAR access */
+			return false;   /* chip may be held in reset or off the bus: no further BAR access */
 		}
 		t_valid = q_wait_init("after cold reset", 3000, true, &chip, &fwi);
 		q_snapshot("BAR0 regs after cold reset");
@@ -599,6 +602,17 @@ step2a(void)
 		    rev == Q_HW32_CHIP_REV ? "STEP 2a PASS" : "STEP 2a: unexpected chip rev", chip, rev, Q_HW32_CHIP_REV, fwi,
 		    t_valid, how);
 	}
+	summary(line);
+	return chip_id_valid(chip) && rev == Q_HW32_CHIP_REV;
+}
+
+/* step 2b (wifi=3): copy engines, diag window, target config, BMI_GET_TARGET_INFO (OP2Ath10k.cpp) */
+static void
+step2b(void)
+{
+	char line[200];
+	struct op2_ath10k_bus bus = { gBar0, gConf, gDbi, gPowerOnAbs };
+	(void)op2_ath10k_step2b(&bus, line, sizeof(line));
 	summary(line);
 }
 
@@ -767,8 +781,8 @@ bringup(void)
 	snprintf(line, sizeof(line), "%s: endpoint id %04x:%04x class/rev %08x bar0 %08x (QCA6174 is 168c:003e)",
 	    (id & 0xFFFF) == 0x168C ? "PASS" : "LINK UP, unexpected id", id & 0xFFFF, id >> 16, cls, bar0);
 	summary(line);
-	if (id == 0x003E168Cu) {
-		step2a();
+	if (id == 0x003E168Cu && step2a() && gMode >= 3) {
+		step2b();
 	}
 }
 
@@ -785,7 +799,7 @@ wifi_thread(__unused void *param, __unused wait_result_t wr_)
 	if (!gGcc || !gTlmm || !gParf || !gPhy || !gDbi || !gConf) {
 		summary("FAIL: ml_io_map");
 	} else {
-		W_LOG("mode %u (%s)", gMode, gMode == 1 ? "read-only probe" : "bring-up");
+		W_LOG("mode %u (%s)", gMode, gMode == 1 ? "read-only probe" : gMode == 2 ? "bring-up" : "bring-up + step 2b (DMA, BMI)");
 		dump_all("before");
 		if (gMode >= 2) {
 			bringup();
