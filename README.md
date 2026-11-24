@@ -68,6 +68,30 @@ its result every 60 s so the line survives in ramoops: `grep -a 'OP2 WIFI' op2-l
 
 Scanning, connecting, a network interface and Bluetooth come after the firmware boots.
 
+#### Progress so far (2026-11-23 to 11-24)
+
+| # | What ran (commit) | What the log showed | What it told us |
+|---|---|---|---|
+| 1 | Read-only probe, `wifi=1` (`28c5cb3`) | Everything for Wi-Fi off: the PCIe controller's power domain collapsed, its clocks gated, its resets held | Under iOS nothing powers the chip, so the driver has to do the whole power-up. (The PMIC's L28/L30 registers read as zero from our side; the RPM still accepts requests for them.) |
+| 2 | Step 1, `wifi=2` (`28c5cb3`) | **PASS** on the first run: `168c:003e`, class/rev `02800032`, link x1 Gen1; every RPM request acked, the TrustZone call returned 0 | The power sequence, clocks, PHY table and link training taken from Qualcomm's `cnss.c` and `pci-msm.c` work under XNU. |
+| 3 | Step 2a (`5ef26ed`) | FAIL: the chip's SoC never woke (`rtc_state 00000000`) | BAR0 sat at `0xf8900000`, not aligned to its 2 MB size; the chip decoded it at `0xf8800000`, so every access landed 1 MB off. |
+| 4 | BAR0 on a 2 MB boundary, checked by reading it back (`423f271`) | The SoC woke in 50 µs, but the chip ID and firmware indicator read `00000000` | Read too early: ath10k once had the same symptom (the ID reads 0 until the chip has initialised). |
+| 5 | Poll for up to 5 s, cold reset only as a fallback (`9290d11`) | **PASS**: chip ID `00342aff` (hw3.2), valid 83 ms after WLAN_EN, no reset needed; the firmware indicator stayed 0 | Register access works, and ath10k's cold reset, its riskiest step, isn't needed. |
+| 6 | Step 2b, `wifi=3` (`20094ef`) | Not run yet | The first DMA. So far only checked against a simulated copy engine (normal, boot ROM never ready, boot loader silent). |
+
+#### Testing a step
+
+1. Set `wifi=N` in the `CMDLINE=` line of `tools/build-daily.sh`, build, and boot as usual.
+2. Wait about 3 minutes after the UI comes up: the Wi-Fi thread starts 120 s after boot.
+3. Shut down from Settings → General → Shut Down, then in TWRP:
+
+```bash
+adb pull /sys/fs/pstore/console-ramoops-0 ./op2-last-boot.log
+grep -a 'OP2 WIFI' op2-last-boot.log | grep -v 'RESULT (repeat)' | tail -80
+```
+
+The `RESULT:` line is the verdict; the lines before it show where a failing step stopped.
+
 ---
 
 ## How a test round works
