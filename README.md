@@ -25,7 +25,7 @@ clone it to `xnu/xnu-4903.270.47` inside this checkout.
 | Battery | `OP2Battery` (PMI8994 fuel gauge → `IOPMPowerSource`) is in the kernel; not yet checked against a meter | kernel source |
 | **Internet over USB** | Through the Mac's NAT: configd makes `ue0` primary, DNS + HTTP verified from the phone ([setup](docs/SETUP.md)) | `op2net example.com` → `200 OK` |
 | Safari | Loads sites over HTTPS with JavaScript (JIT on): Google, Wikipedia, YouTube, apple.com (heavy sites still rough) | photos on the phone |
-| **Wi-Fi (QCA6174 on PCIe)** | Early bring-up, no networking yet: the chip is powered, the PCIe link is up and the chip ID reads `00342aff` (hw3.2); DMA and the chip's boot loader are next ([below](#wi-fi-bring-up-step-by-step)) | `OP2 WIFI: RESULT:` lines (boot-arg `wifi=2`) |
+| **Wi-Fi (QCA6174 on PCIe)** | Early bring-up, no networking yet: the chip is powered, the PCIe link is up, DMA works and the chip's boot loader answers (hw3.2); loading the firmware is next ([below](#wi-fi-bring-up-step-by-step)) | `OP2 WIFI: RESULT:` lines (boot-arg `wifi=2`) |
 | Not working yet | Wi-Fi networking and Bluetooth, RTC (clock does not keep time) | [docs/NEXT-PLAN.md](docs/NEXT-PLAN.md) |
 | Known issues | brief pale/partial frames while scrolling; logd SIGBUS/SIGSEGV loop, Spotlight extensions SIGABRT loop, occasional SpringBoard SIGSEGV | [CLAUDE.md](CLAUDE.md) |
 
@@ -63,7 +63,7 @@ its result every 60 s so the line survives in ramoops: `grep -a 'OP2 WIFI' op2-l
 | probe | 1 | Read-only: logs the chip's pins, PMIC supplies, PCIe clocks and power domain. |
 | **1** power + PCIe link | 2 | **Passes on the phone.** Chip power (bt_vreg, L30, bootstrap, WLAN_EN), the controller's supplies, clocks and TrustZone secure config, the 20 nm PHY and link training: the chip answers as `168c:003e`, class/rev `02800032`, link x1 Gen1. |
 | **2a** chip registers | 2 | **Passes on the phone.** BAR0 (2 MB, on a 2 MB boundary at `0xf8a00000`), SoC wake, chip ID `00342aff` (rev 10 = hw3.2), readable about 80 ms after WLAN_EN; no reset needed. |
-| **2b** DMA + boot loader | 3 | DMA **works on the phone**; the boot-loader answer is next: the copy engines (CE0/CE1 for boot-loader messages, CE7 as a window into the chip's memory), the target-side configuration, and the first boot-loader (BMI) command, `GET_TARGET_INFO`. Passes when the chip answers version `05030000`. |
+| **2b** DMA + boot loader | 3 | **Passes on the phone.** The copy engines (CE0/CE1 for boot-loader messages, CE7 as a window into the chip's memory), the target-side configuration and the first boot-loader (BMI) command, `GET_TARGET_INFO`: the chip answers version `05030000` (hw3.2) with no reset. |
 | **2c** firmware | — | Next: board data and firmware over BMI, then the firmware's ready message. Needs the firmware files, which are kept out of this public repository. |
 
 Scanning, connecting, a network interface and Bluetooth come after the firmware boots.
@@ -79,7 +79,7 @@ Scanning, connecting, a network interface and Bluetooth come after the firmware 
 | 5 | Poll for up to 5 s, cold reset only as a fallback (`9290d11`) | **PASS**: chip ID `00342aff` (hw3.2), valid 83 ms after WLAN_EN, no reset needed; the firmware indicator stayed 0 | Register access works, and ath10k's cold reset, its riskiest step, isn't needed. |
 | 6 | Step 2b, `wifi=3` (`20094ef`) | **First DMA works**: the chip read its own memory through copy engine 7 into phone RAM (`pcie_state at 00401ee0`), no crash. PARTIAL: the boot ROM never reported "initialized" in 10 s, so BMI wasn't tried | After a plain power-on the ROM doesn't raise that flag. The chip's copy engines see their own memory at `0xf8a00000`, the BAR0 address; our DMA block (`39e8d000`) is well clear of it. |
 | 7 | Try BMI without waiting; if it stays silent, reset only the chip's CPU and try again (`123f043`) | The chip's memory reads and writes all work, and the configuration read back correctly. But BMI got no answer, before or after the CPU reset: the chip never set up its side of the boot-loader channels (copy engine 0 has no receive ring, copy engine 1 no send ring) and never reported "initialized" | The boot ROM starts (it changes its reset-control register and has its tables in memory) but stops before announcing itself. Both reference drivers keep writing the chip's interrupt-enable register while they wait; we never did. |
-| 8 | Wait the way ath10k does (interrupt enable rewritten every 10 ms, with the chip's interrupt-disable bit set so nothing reaches the phone); register dumps; cold reset only if BMI stays silent | Not run yet | Checked against a simulated chip in six cases, including a cold reset that fails. |
+| 8 | Wait the way ath10k does (interrupt enable rewritten every 10 ms, with the chip's interrupt-disable bit set so nothing reaches the phone); register dumps; cold reset only if BMI stays silent (`c13dd84`) | **PASS** (no reset): the ROM reported "initialized" 440 ms into the wait (1.1 s after WLAN_EN), and BMI answered version `05030000` (hw3.2), type 8 | Most likely the ROM waits for the host to enable its interrupt: without those writes it stayed silent for 10 s. No reset of any kind is needed. |
 
 #### Testing a step
 
