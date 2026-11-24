@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: ISC
 /*
- * OP2Ath10k: Wi-Fi step 2b for the OnePlus 2's QCA6174 (docs/WIFI-BT-PLAN.md, first half of P1).
- * Polled, no firmware; no interrupt ever reaches the phone (the chip's "interrupt disable" bit is set):
+ * OP2Ath10k: Wi-Fi steps 2b, 2c and 3 for the OnePlus 2's QCA6174 (docs/WIFI-BT-PLAN.md, P1).
+ * Everything is polled; no interrupt ever reaches the phone (the chip's "interrupt disable" bit is set).
+ * Step 2b (wifi=3), no firmware yet:
  *   1. dump the chip's RTC_SOC (clock/reset) and SOC_CORE registers
- *   2. one 16 KB DMA block below 4 GB (cached; cleaned/invalidated around every device access, as OP2GPU
- *      does: the chip's DMA does not snoop the CPU caches), ASPM off on the chip, bus mastering on
+ *   2. one 64 KB DMA block below 4 GB (reached only through a non-cacheable mapping, see below: the chip's DMA
+ *      does not snoop the CPU caches), ASPM off on the chip, bus mastering on
  *   3. ath10k_pci_wait_for_target_init: up to 3 s for the boot ROM's FW_INDICATOR "initialized", rewriting
  *      PCIE_INTR_ENABLE every 10 ms as ath10k and qcacld do in interrupt-line mode, cleared afterwards
  *   4. host side of copy engines CE0 (host->target: BMI requests), CE1 (target->host: BMI responses) and
@@ -21,12 +22,19 @@
  *   hi_serial_enable 0; BMI_DONE; then the firmware's HTC "ready" message on CE1. The firmware is ath10k's
  *   firmware-6.bin from linux-firmware, embedded at build time from the gitignored firmware/qca6174/ by
  *   tools/gen-wifi-fw.py; without it 2c reports that no firmware is built in.
+ * Step 3 (wifi=5), after a 2c pass, starts the firmware the way ath10k_core_start goes on (still polled):
+ *   host side of CE2 (WMI events), CE3 (WMI commands), CE4 (HTT commands), CE5 (HTT messages) and receive
+ *   buffers on CE1/CE2/CE5; HTC connect of the HTT data and WMI control services, HTC setup complete; the WMI
+ *   service-ready event (TLV ABI checked, host memory the firmware asks for allocated); WMI init with
+ *   ath10k's TLV resource config; the WMI ready event, which carries the chip's MAC address; the HTT version;
+ *   a WMI echo. HTC credit reports in message trailers give the WMI endpoint its credits back.
  * All DMA memory is reached through a Normal non-cacheable mapping (ml_io_map_wcomb), like Linux's coherent
  * DMA memory on a non-coherent arm64 SoC: several receive buffers can be outstanding at once.
  * Afterwards bus mastering is switched off again and the DMA block is never freed, so nothing the chip might
  * still write can land in memory that belongs to someone else.
  *
- * Ported from Linux drivers/net/wireless/ath/ath10k (ce.c, pci.c, bmi.c, hw.c, targaddrs.h; v7.4-rc4):
+ * Ported from Linux drivers/net/wireless/ath/ath10k (ce.c, pci.c, bmi.c, hw.c, targaddrs.h, htc.c, htt.c,
+ * htt_tx.c, wmi.c, wmi-tlv.c; v7.4-rc4):
  *
  * Copyright (c) 2005-2011 Atheros Communications Inc.
  * Copyright (c) 2011-2017 Qualcomm Atheros, Inc.
@@ -65,7 +73,8 @@ static const uint8_t kOp2WifiBoard[1] = { 0 };
 
 extern "C" vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
 
-#define A_LOG(fmt, ...) IOLog("OP2 WIFI: 2b: " fmt "\n", __VA_ARGS__)   /* always >= 1 argument */
+static const char *gStep = "2b";   /* "2b", "2c" or "3": the step the log lines belong to */
+#define A_LOG(fmt, ...) IOLog("OP2 WIFI: %s: " fmt "\n", gStep, __VA_ARGS__)   /* always >= 1 argument */
 
 #if defined(__arm64__) || defined(__aarch64__)
 #define A_DSB()         __asm__ volatile("dsb sy" ::: "memory")
@@ -156,20 +165,114 @@ extern "C" vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
 #define BMI_SEND_FLAGS          0xFFFCu       /* ath10k_ce_send(..., transfer_id -1): META_DATA bits 15:2 set */
 
 /* ---- the DMA block; every area on its own 64-byte cache lines ---- */
-#define DMA_SIZE        0x8000u
+#define DMA_SIZE        0x10000u
 #define OFF_CE0_SRC     0x0000u   /* 16 descriptors x 8 B */
 #define OFF_CE1_DST     0x0100u   /* 16 x 8 B */
 #define OFF_CE7_SRC     0x0200u   /*  2 x 8 B */
 #define OFF_CE7_DST     0x0240u   /*  2 x 8 B */
+#define OFF_CE2_DST     0x0300u   /* step 3: 16 x 8 B each */
+#define OFF_CE3_SRC     0x0400u
+#define OFF_CE4_SRC     0x0500u
+#define OFF_CE5_DST     0x0600u
 #define OFF_BMI_REQ     0x1000u   /* 256 B */
 #define OFF_BMI_RESP    0x1800u   /* 2 KB */
 #define OFF_DIAG        0x2000u   /* 2 KB = DIAG_TRANSFER_LIMIT */
+#define OFF_HTC_TX      0x2800u   /* 256 B: HTC control messages (CE0) */
+#define OFF_HTT_TX      0x2900u   /* 256 B: HTT commands (CE4) */
+#define OFF_WMI_TX      0x3000u   /* 2 KB: WMI commands (CE3) */
 #define OFF_HTC_RX      0x4000u   /* 8 x 2 KB receive buffers for CE1 once the firmware runs */
+#define OFF_WMI_RX      0x8000u   /* 8 x 2 KB for CE2 */
+#define OFF_HTT_RX      0xC000u   /* 8 x 512 B for CE5 */
 #define HTC_RX_COUNT    8u
 #define HTC_RX_SIZE     2048u
+#define WMI_RX_COUNT    8u
+#define WMI_RX_SIZE     2048u
+#define HTT_RX_COUNT    8u
+#define HTT_RX_SIZE     512u      /* pci_target_ce_config_wlan CE5 nbytes_max */
+#define HTC_TX_MAX      256u      /* CE0 src_sz_max */
+#define HTT_TX_MAX      256u      /* CE4 src_sz_max */
+#define WMI_TX_MAX      2048u     /* CE3 src_sz_max */
 #define DIAG_MAX        2048u
 #define BMI_REQ_MAX     256u
 #define BMI_RESP_MAX    2048u
+
+/* ---- HTC (htc.h) ---- */
+#define HTC_HDR_LEN                 8u        /* eid, flags, len le16, trailer len / seq, 2 pad */
+#define HTC_FLAG_NEED_CREDIT_UPDATE 0x01u
+#define HTC_FLAG_TRAILER_PRESENT    0x02u
+#define HTC_MSG_CONNECT_SERVICE     2u
+#define HTC_MSG_CONNECT_SERVICE_RESP 3u
+#define HTC_MSG_SETUP_COMPLETE_EX   5u
+#define HTC_RECORD_CREDITS          1u
+#define HTC_EP_COUNT                9u        /* ATH10K_HTC_EP_COUNT */
+#define HTC_SVC_WMI_CONTROL         0x0100u
+#define HTC_SVC_HTT_DATA            0x0300u
+#define HTC_CONN_DISABLE_CREDIT_FLOW 0x0008u
+#define HTC_CONN_RECV_ALLOC_SHIFT   8u
+
+/* ---- WMI, TLV flavour (wmi-tlv.h, wmi.h, hw.h): firmware-6.bin says WMI op version 4 = TLV ---- */
+#define WMI_TLV_INIT_CMDID              0x00001u
+#define WMI_TLV_ECHO_CMDID              0x1d001u
+#define WMI_TLV_SERVICE_READY_EVENTID   0x00001u
+#define WMI_TLV_READY_EVENTID           0x00002u
+#define WMI_TLV_ECHO_EVENTID            0x1d001u
+#define WMI_CMD_ID_MASK                 0x00FFFFFFu
+#define WMI_TLV_TAG_ARRAY_UINT32        16u
+#define WMI_TLV_TAG_ARRAY_STRUCT        18u
+#define WMI_TLV_TAG_SERVICE_READY_EVENT 32u
+#define WMI_TLV_TAG_HAL_REG_CAPABILITIES 33u
+#define WMI_TLV_TAG_WLAN_HOST_MEM_REQ   34u
+#define WMI_TLV_TAG_READY_EVENT         35u
+#define WMI_TLV_TAG_ECHO_EVENT          54u
+#define WMI_TLV_TAG_INIT_CMD            74u
+#define WMI_TLV_TAG_RESOURCE_CONFIG     75u
+#define WMI_TLV_TAG_HOST_MEMORY_CHUNK   76u
+#define WMI_TLV_TAG_ECHO_CMD            149u
+#define WMI_TLV_ABI_VER0                0x01000000u   /* major 1, minor 0 */
+#define WMI_TLV_ABI_VER1                53u
+#define WMI_TLV_ABI_VER_NS0             0x5F414351u   /* "QCA_" */
+#define WMI_TLV_ABI_VER_NS1             0x00004C4Du   /* "ML" */
+#define WMI_TLV_SERVICE_RX_FULL_REORDER 65u
+#define WMI_TLV_FLAG_MGMT_BUNDLE_TX_COMPL (1u << 9)
+#define WMI_MAX_MEM_REQS                16u
+#define WMI_HOST_MEM_MAX                (4u << 20)    /* per request; ours, ath10k has no limit */
+#define NUM_UNITS_IS_NUM_VDEVS          0x1u
+#define NUM_UNITS_IS_NUM_PEERS          0x2u
+#define NUM_UNITS_IS_NUM_ACTIVE_PEERS   0x4u
+#define TARGET_TLV_NUM_VDEVS            4u
+#define TARGET_TLV_NUM_PEERS            33u           /* qca6174 hw3.2 PCI sets no num_peers of its own */
+#define TARGET_TLV_NUM_TIDS             (TARGET_TLV_NUM_PEERS * 2u)
+#define TARGET_TLV_NUM_TDLS_VDEVS       1u
+#define TARGET_TLV_NUM_MSDU_DESC        (1024u + 32u)
+#define TARGET_TLV_NUM_WOW_PATTERNS     22u
+#define HW_TXRX_NATIVE_WIFI             1u            /* ath10k's default rx decap mode */
+#define OP2_ECHO_VALUE                  0x4F503221u   /* "!2PO" */
+
+/* ---- HTT (htt.h) ---- */
+#define HTT_H2T_MSG_TYPE_VERSION_REQ    0u
+#define HTT_T2H_MSG_TYPE_VERSION_CONF   0u
+
+/* struct wmi_tlv_resource_config, word by word */
+enum : uint32_t {
+	RC_NUM_VDEVS, RC_NUM_PEERS, RC_NUM_OFFLOAD_PEERS, RC_NUM_OFFLOAD_REORDER_BUFS, RC_NUM_PEER_KEYS, RC_NUM_TIDS,
+	RC_AST_SKID_LIMIT, RC_TX_CHAIN_MASK, RC_RX_CHAIN_MASK, RC_RX_TIMEOUT_PRI0, RC_RX_TIMEOUT_PRI1, RC_RX_TIMEOUT_PRI2,
+	RC_RX_TIMEOUT_PRI3, RC_RX_DECAP_MODE, RC_SCAN_MAX_PENDING_REQS, RC_BMISS_OFFLOAD_MAX_VDEV,
+	RC_ROAM_OFFLOAD_MAX_VDEV, RC_ROAM_OFFLOAD_MAX_AP_PROFILES, RC_NUM_MCAST_GROUPS, RC_NUM_MCAST_TABLE_ELEMS,
+	RC_MCAST2UCAST_MODE, RC_TX_DBG_LOG_SIZE, RC_NUM_WDS_ENTRIES, RC_DMA_BURST_SIZE, RC_MAC_AGGR_DELIM,
+	RC_RX_SKIP_DEFRAG_TIMEOUT_DUP_DETECTION_CHECK, RC_VOW_CONFIG, RC_GTK_OFFLOAD_MAX_VDEV, RC_NUM_MSDU_DESC,
+	RC_MAX_FRAG_ENTRIES, RC_NUM_TDLS_VDEVS, RC_NUM_TDLS_CONN_TABLE_ENTRIES, RC_BEACON_TX_OFFLOAD_MAX_VDEV,
+	RC_NUM_MULTICAST_FILTER_ENTRIES, RC_NUM_WOW_FILTERS, RC_NUM_KEEP_ALIVE_PATTERN, RC_KEEP_ALIVE_PATTERN_SIZE,
+	RC_MAX_TDLS_CONCURRENT_SLEEP_STA, RC_MAX_TDLS_CONCURRENT_BUFFER_STA, RC_WMI_SEND_SEPARATE, RC_NUM_OCB_VDEVS,
+	RC_NUM_OCB_CHANNELS, RC_NUM_OCB_SCHEDULES, RC_HOST_CAPAB, RC_COUNT
+};
+
+/* struct wmi_tlv_svc_rdy_ev, word by word (up to hw_bd_id) */
+enum : uint32_t {
+	SR_FW_BUILD_VERS, SR_ABI_VER0, SR_ABI_VER1, SR_ABI_NS0, SR_ABI_NS1, SR_ABI_NS2, SR_ABI_NS3, SR_PHY_CAPABILITY,
+	SR_MAX_FRAG_ENTRY, SR_NUM_RF_CHAINS, SR_HT_CAP_INFO, SR_VHT_CAP_INFO, SR_VHT_SUPP_MCS, SR_HW_MIN_TX_POWER,
+	SR_HW_MAX_TX_POWER, SR_SYS_CAP_INFO, SR_MIN_PKT_SIZE_ENABLE, SR_MAX_BCN_IE_SIZE, SR_NUM_MEM_REQS,
+	SR_MAX_NUM_SCAN_CHANS, SR_HW_BD_ID, SR_COUNT
+};
 
 /* pci_target_ce_config_wlan[0..6] (NUM_TARGET_CE_CONFIG_WLAN = 7 on QCA6174), struct ce_pipe_config:
  * pipenum, pipedir (1 target->host, 2 host->target, 3 both), nentries, nbytes_max, flags, reserved */
@@ -216,8 +319,10 @@ static uint64_t gPowerOnAbs;
 static uint8_t *gDma;       /* non-cacheable alias of the DMA block, the only one used; never freed */
 static uint32_t gDmaPhys;
 static struct ce_pipe gCe0, gCe1, gCe7;
+static struct ce_pipe gCe2, gCe3, gCe4, gCe5;   /* step 3 */
 static bool (*gColdReset)(char *why, size_t len);
 static bool gChipGone;      /* the cold reset failed: no further access to the chip */
+static uint32_t gHtcCredits, gHtcCreditSize;    /* from the firmware's HTC ready message (2c) */
 
 static inline uint32_t
 rd32(volatile uint32_t *b, uint32_t off)
@@ -668,10 +773,17 @@ init_rings(bool first)
 /* The copy engines treat one 2 MB window as the chip's own memory (CORE_CTRL bits 10:0 << 21); the DMA block
  * must lie outside it. Checked again after a reset. */
 static bool
+clear_of_window(uint64_t phys, uint64_t size)
+{
+	uint64_t win = (uint64_t)((brd(Q_CORE_CTRL) & 0x7ffu) << 21);
+	return phys >= win + 0x200000u || phys + size <= win;
+}
+
+static bool
 dma_clear_of_window(char *res, size_t len)
 {
 	uint32_t win = (brd(Q_CORE_CTRL) & 0x7ffu) << 21;
-	if (gDmaPhys < win + 0x200000u && gDmaPhys + DMA_SIZE > win) {
+	if (!clear_of_window(gDmaPhys, DMA_SIZE)) {
 		snprintf(res, len, "STEP 2b FAIL: DMA block %08x lies in the chip's own 2 MB window at %08x", gDmaPhys, win);
 		return false;
 	}
@@ -1031,7 +1143,7 @@ htc_wait_ready(const char *fw_version, char *res, size_t len)
 		if (ce_recv_done(&gCe1, &n, &at)) {
 			const uint8_t *m = gDma + (at - gDmaPhys);
 			uint16_t mlen, id, credits, csize;
-			if (at < gDmaPhys + OFF_HTC_RX || at >= gDmaPhys + DMA_SIZE || n < 8u + 8u) {
+			if (at < gDmaPhys + OFF_HTC_RX || at >= gDmaPhys + OFF_HTC_RX + HTC_RX_COUNT * HTC_RX_SIZE || n < 8u + 8u) {
 				snprintf(res, len, "STEP 2c FAIL: odd first message from the firmware (%u bytes at %08x)", n, at);
 				return false;
 			}
@@ -1049,6 +1161,9 @@ htc_wait_ready(const char *fw_version, char *res, size_t len)
 			}
 			snprintf(res, len, "STEP 2c PASS: firmware %s booted: HTC ready, %u credits of %u bytes, %u endpoints%s",
 			    fw_version, credits, csize, m[14], mlen >= 10u ? ", extended" : "");
+			gHtcCredits = credits;
+			gHtcCreditSize = csize;
+			(void)ce_post_rx(&gCe1, at);   /* the buffer goes back on the ring for step 3 */
 			return true;
 		}
 		if (t % 10u == 0) {
@@ -1072,6 +1187,7 @@ static bool
 run2c(char *res, size_t len)
 {
 	struct fw_file f;
+	gStep = "2c";
 	if (kOp2WifiFwLen == 0 || kOp2WifiBoardLen == 0) {
 		snprintf(res, len, "%s", "STEP 2c SKIPPED: no firmware built in (firmware/qca6174/ with firmware-6.bin and "
 		    "bdwlan30.bin, then rebuild)");
@@ -1135,6 +1251,639 @@ run2c(char *res, size_t len)
 	}
 	A_LOG("%s", "BMI_DONE sent; waiting for the firmware's HTC ready");
 	return htc_wait_ready(f.version, res, len);
+}
+
+/* ---------------------------------------------------------------------------------------------------- */
+/* step 3: HTC services, WMI init and ready, HTT version (htc.c, wmi.c, wmi-tlv.c, htt.c, htt_tx.c)     */
+
+/* Receive pipes once the firmware runs. The service map written in 2b sends HTC control on pipe 1, WMI events
+ * on pipe 2 and HTT messages on pipe 5. */
+struct rx_pipe {
+	struct ce_pipe *ce;
+	uint32_t first, count, size;
+	const char *name;
+};
+
+static const struct rx_pipe gRxPipes[3] = {
+	{ &gCe1, OFF_HTC_RX, HTC_RX_COUNT, HTC_RX_SIZE, "CE1" },
+	{ &gCe2, OFF_WMI_RX, WMI_RX_COUNT, WMI_RX_SIZE, "CE2" },
+	{ &gCe5, OFF_HTT_RX, HTT_RX_COUNT, HTT_RX_SIZE, "CE5" },
+};
+
+static uint8_t gEpWmi = 0xFFu, gEpHtt = 0xFFu;
+static uint32_t gWmiCredits, gCreditReports, gOtherMsgs;
+static uint8_t gHtcSeq[HTC_EP_COUNT];
+static uint8_t gRx[HTC_RX_SIZE];   /* the message htc_rx_one delivered: payload without header and trailer */
+static uint32_t gRxLen;
+static uint8_t gRxEid;
+static uint8_t gWmiTx[WMI_TX_MAX];  /* one WMI command being put together */
+static uint32_t gInit[8u + 1u + RC_COUNT + 1u + WMI_MAX_MEM_REQS * 5u];
+
+struct mem_chunk {
+	uint32_t req_id, phys, len;
+};
+static struct mem_chunk gChunks[WMI_MAX_MEM_REQS];   /* never freed, like the DMA block */
+static uint32_t gNumChunks;
+
+struct svc_ready {
+	uint32_t ev[SR_COUNT], ev_len, reg[9], svc[4], nreq;
+	uint32_t req[WMI_MAX_MEM_REQS][4];   /* struct wlan_host_mem_req: req_id, unit_size, num_unit_info, num_units */
+	bool have_ev, have_reg, have_svc;
+};
+static struct svc_ready gSvc;
+
+static inline uint32_t
+le16(const uint8_t *p)
+{
+	return (uint32_t)p[0] | ((uint32_t)p[1] << 8);
+}
+
+static inline uint32_t
+le32(const uint8_t *p)
+{
+	uint32_t v;
+	memcpy(&v, p, 4u);
+	return v;
+}
+
+/* ath10k_htc_process_trailer: credit records { eid, credits, pad, pad }; lookahead records are skipped */
+static void
+htc_trailer(const uint8_t *t, uint32_t len)
+{
+	while (len >= 4u) {
+		uint32_t id = t[0], rlen = t[1];
+		if (rlen > len - 4u) {
+			A_LOG("HTC trailer: record %u of %u bytes overruns it (%u bytes left)", id, rlen, len - 4u);
+			return;
+		}
+		if (id == HTC_RECORD_CREDITS) {
+			for (uint32_t i = 0; i + 4u <= rlen; i += 4u) {
+				uint32_t eid = t[4u + i], n = t[5u + i];
+				if (eid >= HTC_EP_COUNT) {
+					break;
+				}
+				if (eid == gEpWmi) {
+					gWmiCredits += n;
+				}
+				if (gCreditReports++ < 4u) {
+					A_LOG("HTC credit report: endpoint %u +%u (WMI credits now %u)", eid, n, gWmiCredits);
+				}
+			}
+		}
+		t += 4u + rlen;
+		len -= 4u + rlen;
+	}
+}
+
+/* One completed receive on CE1, CE2 or CE5 (ath10k_htc_rx_completion_handler): header checked, trailer applied,
+ * the buffer posted again. 0: nothing completed; 1: completed, nothing to deliver; 2: a message is in gRx. */
+static int
+htc_rx_one(void)
+{
+	for (uint32_t i = 0; i < 3u; i++) {
+		const struct rx_pipe *p = &gRxPipes[i];
+		uint32_t n = 0, at = 0;
+		if (!ce_recv_done(p->ce, &n, &at)) {
+			continue;
+		}
+		uint32_t lo = gDmaPhys + p->first;
+		if (at < lo || at >= lo + p->count * p->size || (at - lo) % p->size != 0) {
+			A_LOG("%s: completion of a buffer that was never posted (%08x, %u bytes); dropped", p->name, at, n);
+			return 1;
+		}
+		const uint8_t *m = gDma + (at - gDmaPhys);
+		uint32_t plen = le16(m + 2), tlen = 0;
+		bool good = n >= HTC_HDR_LEN && n <= p->size && HTC_HDR_LEN + plen <= n && m[0] < HTC_EP_COUNT;
+		if (good && (m[1] & HTC_FLAG_TRAILER_PRESENT)) {
+			tlen = m[4];
+			good = tlen >= 4u && tlen <= plen;
+			if (good) {
+				htc_trailer(m + HTC_HDR_LEN + plen - tlen, tlen);
+			}
+		}
+		int r = 1;
+		if (!good) {
+			A_LOG("%s: bad HTC message, %u bytes: %02x %02x %02x %02x %02x %02x %02x %02x", p->name, n, m[0], m[1], m[2],
+			    m[3], m[4], m[5], m[6], m[7]);
+		} else if (plen > tlen) {
+			gRxEid = m[0];
+			gRxLen = plen - tlen;
+			memcpy(gRx, m + HTC_HDR_LEN, gRxLen);
+			r = 2;
+		}
+		(void)ce_post_rx(p->ce, at);
+		return r;
+	}
+	return 0;
+}
+
+/* HTC message id on endpoint 0, WMI event id on the WMI endpoint, HTT message type on the HTT endpoint */
+static uint32_t
+msg_id(void)
+{
+	if (gRxEid == 0u && gRxLen >= 2u) {
+		return le16(gRx);
+	}
+	if (gRxEid == gEpWmi && gRxLen >= 4u) {
+		return le32(gRx) & WMI_CMD_ID_MASK;
+	}
+	if (gRxEid == gEpHtt && gRxLen >= 1u) {
+		return gRx[0];
+	}
+	return 0xFFFFFFFFu;
+}
+
+static void
+other_msg(void)
+{
+	if (gOtherMsgs++ < 16u) {
+		A_LOG("unrequested message: endpoint %u id %x, %u bytes: %02x %02x %02x %02x %02x %02x %02x %02x", gRxEid, msg_id(),
+		    gRxLen, gRx[0], gRx[1], gRx[2], gRx[3], gRx[4], gRx[5], gRx[6], gRx[7]);
+	}
+}
+
+/* Everything that has arrived, without waiting for anything in particular (at most 64 messages). */
+static void
+drain(void)
+{
+	int r;
+	for (int k = 0; k < 64 && (r = htc_rx_one()) != 0; k++) {
+		if (r == 2) {
+			other_msg();
+		}
+	}
+}
+
+static bool
+fw_down(const char *what, char *res, size_t len)
+{
+	uint32_t fwi = brd(Q_FW_INDICATOR);
+	if (fwi == 0xFFFFFFFFu) {
+		snprintf(res, len, "STEP 3 FAIL: BAR0 reads all ones while waiting for %s", what);
+		return true;
+	}
+	if (fwi & Q_FW_IND_EVENT_PENDING) {
+		A_LOG("firmware crashed while we waited for %s (fw indicator %08x)", what, fwi);
+		dump_fw_crash();
+		snprintf(res, len, "STEP 3 FAIL: firmware crashed while we waited for %s (fw indicator %08x)", what, fwi);
+		return true;
+	}
+	return false;
+}
+
+/* Wait for one message (endpoint eid, msg_id() == id); others are logged (the first 16) and dropped. */
+static bool
+htc_wait(uint32_t eid, uint32_t id, uint32_t timeout_ms, const char *what, char *res, size_t len)
+{
+	for (uint32_t t = 0;; t++) {
+		int r;
+		for (int k = 0; k < 64 && (r = htc_rx_one()) != 0; k++) {
+			if (r == 2) {
+				if (gRxEid == eid && msg_id() == id) {
+					return true;
+				}
+				other_msg();
+			}
+		}
+		if (t % 10u == 0 && fw_down(what, res, len)) {
+			return false;
+		}
+		if (t >= timeout_ms) {
+			break;
+		}
+		IOSleep(1);
+	}
+	ce_dump("CE1", &gCe1);
+	ce_dump("CE2", &gCe2);
+	ce_dump("CE5", &gCe5);
+	snprintf(res, len, "STEP 3 FAIL: %s did not come within %u ms (fw indicator %08x)", what, timeout_ms,
+	    brd(Q_FW_INDICATOR));
+	return false;
+}
+
+/* ath10k_htc_send: the 8-byte HTC header and the payload as one descriptor whose transfer id is the endpoint;
+ * with credit flow (WMI) it first takes ceil(length / credit size) of the credits the firmware handed out. */
+static bool
+htc_send(uint32_t eid, struct ce_pipe *ce, uint32_t off, uint32_t max, const void *payload, uint32_t len, bool credit_flow)
+{
+	if (eid >= HTC_EP_COUNT || HTC_HDR_LEN + len > max) {
+		A_LOG("HTC send: %u bytes for endpoint %u do not fit (%u-byte buffer)", len, eid, max);
+		return false;
+	}
+	if (credit_flow) {
+		uint32_t need = (HTC_HDR_LEN + len + gHtcCreditSize - 1u) / gHtcCreditSize;
+		for (uint32_t t = 0; gWmiCredits < need; t++) {
+			if (t >= 3000u) {
+				A_LOG("no WMI credits for 3 s (have %u, need %u)", gWmiCredits, need);
+				return false;
+			}
+			drain();
+			IOSleep(1);
+		}
+		gWmiCredits -= need;
+	}
+	uint8_t *b = gDma + off;
+	bzero(b, HTC_HDR_LEN);
+	b[0] = (uint8_t)eid;
+	b[1] = credit_flow ? HTC_FLAG_NEED_CREDIT_UPDATE : 0u;
+	b[2] = (uint8_t)len;
+	b[3] = (uint8_t)(len >> 8);
+	b[5] = gHtcSeq[eid]++;
+	memcpy(b + HTC_HDR_LEN, payload, len);
+	if (!ce_send(ce, gDmaPhys + off, HTC_HDR_LEN + len, (eid << 2) & 0xFFFCu)) {
+		A_LOG("HTC send on endpoint %u: ring full", eid);
+		return false;
+	}
+	uint32_t unused = 0;
+	return ce_wait(ce, NULL, &unused, 1000000u, "HTC send");
+}
+
+/* ath10k_htc_connect_service: only WMI control gets credits (all of them) and credit flow control */
+static bool
+htc_connect(uint32_t svc, const char *name, uint8_t *eid_out, char *res, size_t len)
+{
+	uint32_t flags = svc == HTC_SVC_WMI_CONTROL ? ((gHtcCredits & 0xFFu) << HTC_CONN_RECV_ALLOC_SHIFT) :
+	    HTC_CONN_DISABLE_CREDIT_FLOW;
+	uint8_t req[8] = { HTC_MSG_CONNECT_SERVICE, 0, (uint8_t)svc, (uint8_t)(svc >> 8), (uint8_t)flags, (uint8_t)(flags >> 8),
+		0, 0 };
+	if (!htc_send(0u, &gCe0, OFF_HTC_TX, HTC_TX_MAX, req, sizeof(req), false)) {
+		snprintf(res, len, "STEP 3 FAIL: HTC connect request for %s could not be sent", name);
+		return false;
+	}
+	if (!htc_wait(0u, HTC_MSG_CONNECT_SERVICE_RESP, 1000u, "an HTC connect response", res, len)) {
+		return false;
+	}
+	/* { message_id, service_id le16, status, eid, max_msg_size le16 } */
+	uint32_t rsvc = gRxLen >= 8u ? le16(gRx + 2) : 0u, status = gRx[4], eid = gRx[5], maxmsg = le16(gRx + 6);
+	A_LOG("HTC service %s (%04x): status %u, endpoint %u, max message %u bytes", name, rsvc, status, eid, maxmsg);
+	if (rsvc != svc || status != 0 || eid == 0 || eid >= HTC_EP_COUNT || maxmsg == 0) {
+		snprintf(res, len, "STEP 3 FAIL: HTC connect of %s refused (service %04x, status %u, endpoint %u, max %u)", name,
+		    rsvc, status, eid, maxmsg);
+		return false;
+	}
+	*eid_out = (uint8_t)eid;
+	return true;
+}
+
+/* ath10k_wmi_cmd_send: { cmd_id } and the TLVs, on the WMI endpoint (CE3), with credit flow */
+static bool
+wmi_cmd(uint32_t cmd_id, const void *tlvs, uint32_t len)
+{
+	if (4u + len > sizeof(gWmiTx)) {
+		return false;
+	}
+	uint32_t hdr = cmd_id & WMI_CMD_ID_MASK;
+	memcpy(gWmiTx, &hdr, 4u);
+	memcpy(gWmiTx + 4, tlvs, len);
+	return htc_send(gEpWmi, &gCe3, OFF_WMI_TX, WMI_TX_MAX, gWmiTx, 4u + len, true);
+}
+
+struct tlv_it {
+	const uint8_t *p;
+	uint32_t left;
+};
+
+/* ath10k_wmi_tlv_iter: { len le16, tag le16 } then len bytes. 1: one TLV; 0: the end; -1: malformed. */
+static int
+tlv_next(struct tlv_it *it, uint32_t *tag, uint32_t *tlen, const uint8_t **val)
+{
+	if (it->left == 0) {
+		return 0;
+	}
+	if (it->left < 4u) {
+		return -1;
+	}
+	uint32_t l = le16(it->p), tg = le16(it->p + 2);
+	if (l > it->left - 4u) {
+		return -1;
+	}
+	*tag = tg;
+	*tlen = l;
+	*val = it->p + 4;
+	it->p += 4u + l;
+	it->left -= 4u + l;
+	return 1;
+}
+
+/* The TLV with this tag in the WMI event in gRx (after its 4-byte header), at least min bytes long */
+static const uint8_t *
+wmi_find(uint32_t want, uint32_t min)
+{
+	struct tlv_it it = { gRx + 4, gRxLen >= 4u ? gRxLen - 4u : 0u };
+	uint32_t tag = 0, tl = 0;
+	const uint8_t *v = NULL;
+	while (tlv_next(&it, &tag, &tl, &v) == 1) {
+		if (tag == want && tl >= min) {
+			return v;
+		}
+	}
+	return NULL;
+}
+
+/* ath10k_wmi_tlv_op_pull_svc_rdy_ev: the event, HAL regulatory capabilities, the first UINT32 array (the service
+ * bitmap) and the STRUCT array of host memory requests */
+static bool
+parse_svc_ready(struct svc_ready *s)
+{
+	bzero(s, sizeof(*s));
+	struct tlv_it it = { gRx + 4, gRxLen - 4u };
+	uint32_t tag = 0, tl = 0;
+	const uint8_t *v = NULL;
+	int r;
+	while ((r = tlv_next(&it, &tag, &tl, &v)) == 1) {
+		switch (tag) {
+		case WMI_TLV_TAG_SERVICE_READY_EVENT:
+			s->ev_len = tl;
+			memcpy(s->ev, v, tl < sizeof(s->ev) ? tl : sizeof(s->ev));
+			s->have_ev = true;
+			break;
+		case WMI_TLV_TAG_HAL_REG_CAPABILITIES:
+			if (tl >= sizeof(s->reg)) {
+				memcpy(s->reg, v, sizeof(s->reg));
+				s->have_reg = true;
+			}
+			break;
+		case WMI_TLV_TAG_ARRAY_UINT32:
+			if (!s->have_svc) {
+				memcpy(s->svc, v, tl < sizeof(s->svc) ? tl : sizeof(s->svc));
+				s->have_svc = true;
+			}
+			break;
+		case WMI_TLV_TAG_ARRAY_STRUCT: {
+			struct tlv_it in = { v, tl };
+			uint32_t t2 = 0, l2 = 0;
+			const uint8_t *v2 = NULL;
+			int r2;
+			while ((r2 = tlv_next(&in, &t2, &l2, &v2)) == 1) {
+				if (t2 != WMI_TLV_TAG_WLAN_HOST_MEM_REQ || l2 < 16u || s->nreq >= WMI_MAX_MEM_REQS) {
+					A_LOG("service ready: unexpected entry in the memory requests (tag %u, %u bytes, #%u)", t2, l2,
+					    s->nreq);
+					return false;
+				}
+				memcpy(s->req[s->nreq++], v2, 16u);
+			}
+			if (r2 < 0) {
+				return false;
+			}
+			break;
+		}
+		default:
+			break;
+		}
+	}
+	return r == 0 && s->have_ev && s->ev_len >= (SR_MAX_NUM_SCAN_CHANS + 1u) * 4u && s->have_reg && s->have_svc;
+}
+
+/* ath10k_wmi_event_service_ready_work + ath10k_wmi_alloc_host_mem: units derived from the resources we ask for */
+static bool
+alloc_chunks(const struct svc_ready *s, char *res, size_t len)
+{
+	uint32_t n = s->ev[SR_NUM_MEM_REQS] < s->nreq ? s->ev[SR_NUM_MEM_REQS] : s->nreq;
+	for (uint32_t i = 0; i < n; i++) {
+		uint32_t id = s->req[i][0], unit = s->req[i][1], info = s->req[i][2], units = s->req[i][3];
+		if (info & (NUM_UNITS_IS_NUM_ACTIVE_PEERS | NUM_UNITS_IS_NUM_PEERS)) {
+			units = TARGET_TLV_NUM_PEERS + 1u;   /* one more for the target's own peer */
+		} else if (info & NUM_UNITS_IS_NUM_VDEVS) {
+			units = TARGET_TLV_NUM_VDEVS + 1u;
+		}
+		uint64_t pool = (uint64_t)units * ((unit + 3u) & ~3u);
+		A_LOG("host memory request %u: id %u, %u units of %u bytes (num_units %u, info %x): %llu bytes", i, id, units, unit,
+		    s->req[i][3], info, (unsigned long long)pool);
+		if (pool == 0 || pool > WMI_HOST_MEM_MAX) {
+			snprintf(res, len, "STEP 3 FAIL: the firmware asks for %llu bytes of host memory (request id %u)",
+			    (unsigned long long)pool, id);
+			return false;
+		}
+		IOPhysicalAddress phys = 0;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+		void *va = IOMallocContiguous((vm_size_t)pool, 4096, &phys);
+#pragma clang diagnostic pop
+		if (va == NULL || phys == 0 || (uint64_t)phys + pool > 0x100000000ULL || !clear_of_window(phys, pool)) {
+			snprintf(res, len, "STEP 3 FAIL: no usable %llu bytes of host memory below 4 GB for the firmware (phys %llx)",
+			    (unsigned long long)pool, (unsigned long long)phys);
+			return false;
+		}
+		bzero(va, (size_t)pool);
+		cache_flush(va, (uint32_t)pool);   /* in RAM before the chip reads it; the CPU never touches it again */
+		gChunks[gNumChunks].req_id = id;
+		gChunks[gNumChunks].phys = (uint32_t)phys;
+		gChunks[gNumChunks].len = (uint32_t)pool;
+		gNumChunks++;
+	}
+	return true;
+}
+
+static inline uint32_t
+tlv_hdr(uint32_t tag, uint32_t len)
+{
+	return len | (tag << 16);
+}
+
+/* ath10k_wmi_tlv_op_gen_init: init_cmd (ABI, chunk count), resource_config, the host memory chunks. Bytes. */
+static uint32_t
+build_init(bool full_reorder)
+{
+	uint32_t *w = gInit, n = 0;
+	w[n++] = tlv_hdr(WMI_TLV_TAG_INIT_CMD, 28u);
+	w[n++] = WMI_TLV_ABI_VER0;
+	w[n++] = WMI_TLV_ABI_VER1;
+	w[n++] = WMI_TLV_ABI_VER_NS0;
+	w[n++] = WMI_TLV_ABI_VER_NS1;
+	w[n++] = 0u;
+	w[n++] = 0u;
+	w[n++] = gNumChunks;
+	w[n++] = tlv_hdr(WMI_TLV_TAG_RESOURCE_CONFIG, RC_COUNT * 4u);
+	uint32_t *c = &w[n];
+	bzero(c, RC_COUNT * 4u);
+	c[RC_NUM_VDEVS] = TARGET_TLV_NUM_VDEVS;
+	c[RC_NUM_PEERS] = TARGET_TLV_NUM_PEERS;
+	c[RC_NUM_OFFLOAD_PEERS] = full_reorder ? TARGET_TLV_NUM_VDEVS : 0u;
+	c[RC_NUM_OFFLOAD_REORDER_BUFS] = full_reorder ? TARGET_TLV_NUM_VDEVS : 0u;
+	c[RC_NUM_PEER_KEYS] = 2u;
+	c[RC_NUM_TIDS] = TARGET_TLV_NUM_TIDS;
+	c[RC_AST_SKID_LIMIT] = 0x10u;
+	c[RC_TX_CHAIN_MASK] = 0x7u;
+	c[RC_RX_CHAIN_MASK] = 0x7u;
+	c[RC_RX_TIMEOUT_PRI0] = 0x64u;
+	c[RC_RX_TIMEOUT_PRI1] = 0x64u;
+	c[RC_RX_TIMEOUT_PRI2] = 0x64u;
+	c[RC_RX_TIMEOUT_PRI3] = 0x28u;
+	c[RC_RX_DECAP_MODE] = HW_TXRX_NATIVE_WIFI;
+	c[RC_SCAN_MAX_PENDING_REQS] = 4u;
+	c[RC_BMISS_OFFLOAD_MAX_VDEV] = TARGET_TLV_NUM_VDEVS;
+	c[RC_ROAM_OFFLOAD_MAX_VDEV] = TARGET_TLV_NUM_VDEVS;
+	c[RC_ROAM_OFFLOAD_MAX_AP_PROFILES] = 8u;
+	c[RC_TX_DBG_LOG_SIZE] = 0x400u;
+	c[RC_NUM_WDS_ENTRIES] = 0x20u;
+	c[RC_GTK_OFFLOAD_MAX_VDEV] = 2u;
+	c[RC_NUM_MSDU_DESC] = TARGET_TLV_NUM_MSDU_DESC;
+	c[RC_MAX_FRAG_ENTRIES] = 2u;
+	c[RC_NUM_TDLS_VDEVS] = TARGET_TLV_NUM_TDLS_VDEVS;
+	c[RC_NUM_TDLS_CONN_TABLE_ENTRIES] = 0x20u;
+	c[RC_BEACON_TX_OFFLOAD_MAX_VDEV] = 2u;
+	c[RC_NUM_MULTICAST_FILTER_ENTRIES] = 5u;
+	c[RC_NUM_WOW_FILTERS] = TARGET_TLV_NUM_WOW_PATTERNS;
+	c[RC_NUM_KEEP_ALIVE_PATTERN] = 6u;
+	c[RC_MAX_TDLS_CONCURRENT_SLEEP_STA] = 1u;
+	c[RC_MAX_TDLS_CONCURRENT_BUFFER_STA] = 1u;
+	c[RC_HOST_CAPAB] = WMI_TLV_FLAG_MGMT_BUNDLE_TX_COMPL;
+	n += RC_COUNT;
+	w[n++] = tlv_hdr(WMI_TLV_TAG_ARRAY_STRUCT, gNumChunks * 20u);
+	for (uint32_t i = 0; i < gNumChunks; i++) {
+		w[n++] = tlv_hdr(WMI_TLV_TAG_HOST_MEMORY_CHUNK, 16u);
+		w[n++] = gChunks[i].req_id;
+		w[n++] = gChunks[i].phys;
+		w[n++] = gChunks[i].len;
+		w[n++] = 0u;   /* ptr_high: everything is below 4 GB */
+	}
+	return n * 4u;
+}
+
+/* ath10k_core_start from ath10k_htt_connect to ath10k_htt_setup's version check, plus a WMI echo */
+static bool
+run3(char *res, size_t len)
+{
+	gStep = "3";
+
+	/* host side of the remaining pipes (ath10k_pci_init_pipes): only the rings the host owns, the target set up
+	 * the other half of each copy engine itself; then receive buffers (ath10k_pci_rx_post) */
+	gCe2.base = Q_CE(2);
+	gCe3.base = Q_CE(3);
+	gCe4.base = Q_CE(4);
+	gCe5.base = Q_CE(5);
+	ce_quiet(&gCe2);
+	ce_quiet(&gCe3);
+	ce_quiet(&gCe4);
+	ce_quiet(&gCe5);
+	ce_init_dst(&gCe2, OFF_CE2_DST, 16u, true);
+	ce_init_src(&gCe3, OFF_CE3_SRC, 16u, WMI_TX_MAX, true);
+	ce_init_src(&gCe4, OFF_CE4_SRC, 16u, HTT_TX_MAX, true);
+	ce_init_dst(&gCe5, OFF_CE5_DST, 16u, true);
+	bool ok = true;
+	for (uint32_t i = 0; i < WMI_RX_COUNT; i++) {
+		ok = ok && ce_post_rx(&gCe2, gDmaPhys + OFF_WMI_RX + i * WMI_RX_SIZE);
+	}
+	for (uint32_t i = 0; i < HTT_RX_COUNT; i++) {
+		ok = ok && ce_post_rx(&gCe5, gDmaPhys + OFF_HTT_RX + i * HTT_RX_SIZE);
+	}
+	ce_dump("CE2", &gCe2);
+	ce_dump("CE3", &gCe3);
+	ce_dump("CE4", &gCe4);
+	ce_dump("CE5", &gCe5);
+	if (!ok) {
+		snprintf(res, len, "%s", "STEP 3 FAIL: could not post the receive buffers on CE2 / CE5");
+		return false;
+	}
+
+	/* ath10k_htt_connect, ath10k_wmi_connect, ath10k_htc_start (SETUP_COMPLETE_EX, all fields 0 on PCI) */
+	if (!htc_connect(HTC_SVC_HTT_DATA, "HTT data", &gEpHtt, res, len) ||
+	    !htc_connect(HTC_SVC_WMI_CONTROL, "WMI control", &gEpWmi, res, len)) {
+		return false;
+	}
+	gWmiCredits = gHtcCredits;
+	uint8_t setup[12] = { HTC_MSG_SETUP_COMPLETE_EX, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+	if (!htc_send(0u, &gCe0, OFF_HTC_TX, HTC_TX_MAX, setup, sizeof(setup), false)) {
+		snprintf(res, len, "%s", "STEP 3 FAIL: HTC setup complete could not be sent");
+		return false;
+	}
+	A_LOG("HTC started: HTT endpoint %u, WMI endpoint %u with %u credits of %u bytes", gEpHtt, gEpWmi, gWmiCredits,
+	    gHtcCreditSize);
+
+	/* ath10k_wmi_wait_for_service_ready (5 s) */
+	if (!htc_wait(gEpWmi, WMI_TLV_SERVICE_READY_EVENTID, 5000u, "the WMI service ready event", res, len)) {
+		return false;
+	}
+	struct svc_ready *s = &gSvc;
+	if (!parse_svc_ready(s)) {
+		snprintf(res, len, "STEP 3 FAIL: WMI service ready event unreadable (%u bytes, event TLV %u bytes)", gRxLen,
+		    s->ev_len);
+		return false;
+	}
+	const uint32_t *e = s->ev, *g = s->reg;
+	A_LOG("service ready: fw build %08x, abi %08x/%u ns %08x %08x %08x %08x; phy cap %x, %u RF chains, ht cap %08x, "
+	    "vht cap %08x, vht mcs %08x", e[SR_FW_BUILD_VERS], e[SR_ABI_VER0], e[SR_ABI_VER1], e[SR_ABI_NS0], e[SR_ABI_NS1],
+	    e[SR_ABI_NS2], e[SR_ABI_NS3], e[SR_PHY_CAPABILITY], e[SR_NUM_RF_CHAINS], e[SR_HT_CAP_INFO], e[SR_VHT_CAP_INFO],
+	    e[SR_VHT_SUPP_MCS]);
+	A_LOG("service ready: tx power %u-%u, sys cap %x, %u memory requests (%u listed), max %u scan channels, board id "
+	    "%x (event %u bytes)", e[SR_HW_MIN_TX_POWER], e[SR_HW_MAX_TX_POWER], e[SR_SYS_CAP_INFO], e[SR_NUM_MEM_REQS],
+	    s->nreq, e[SR_MAX_NUM_SCAN_CHANS], e[SR_HW_BD_ID], s->ev_len);
+	A_LOG("service ready: regdomain %x ext %x, cap %x/%x, modes %x, 2 GHz %u-%u MHz, 5 GHz %u-%u MHz; services %08x "
+	    "%08x %08x %08x", g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7], g[8], s->svc[0], s->svc[1], s->svc[2],
+	    s->svc[3]);
+	if (e[SR_ABI_VER0] != WMI_TLV_ABI_VER0 || e[SR_ABI_NS0] != WMI_TLV_ABI_VER_NS0 || e[SR_ABI_NS1] != WMI_TLV_ABI_VER_NS1 ||
+	    e[SR_ABI_NS2] != 0 || e[SR_ABI_NS3] != 0) {
+		snprintf(res, len, "STEP 3 FAIL: firmware WMI ABI %08x ns %08x %08x, ath10k's TLV ABI is %08x ns %08x %08x",
+		    e[SR_ABI_VER0], e[SR_ABI_NS0], e[SR_ABI_NS1], WMI_TLV_ABI_VER0, WMI_TLV_ABI_VER_NS0, WMI_TLV_ABI_VER_NS1);
+		return false;
+	}
+	if (s->ev[SR_NUM_MEM_REQS] > WMI_MAX_MEM_REQS) {
+		snprintf(res, len, "STEP 3 FAIL: the firmware asks for %u host memory chunks (limit %u)", s->ev[SR_NUM_MEM_REQS],
+		    WMI_MAX_MEM_REQS);
+		return false;
+	}
+	if (!alloc_chunks(s, res, len)) {
+		return false;
+	}
+
+	/* ath10k_wmi_cmd_init, ath10k_wmi_wait_for_unified_ready (5 s) */
+	bool full_reorder = (s->svc[WMI_TLV_SERVICE_RX_FULL_REORDER / 32u] >> (WMI_TLV_SERVICE_RX_FULL_REORDER % 32u)) & 1u;
+	uint32_t ilen = build_init(full_reorder);
+	A_LOG("WMI init: %u bytes, %u host memory chunks, rx full reorder %s, WMI credits %u", ilen, gNumChunks,
+	    full_reorder ? "yes" : "no", gWmiCredits);
+	if (!wmi_cmd(WMI_TLV_INIT_CMDID, gInit, ilen)) {
+		snprintf(res, len, "%s", "STEP 3 FAIL: WMI init could not be sent");
+		return false;
+	}
+	if (!htc_wait(gEpWmi, WMI_TLV_READY_EVENTID, 5000u, "the WMI ready event", res, len)) {
+		return false;
+	}
+	const uint8_t *rdy = wmi_find(WMI_TLV_TAG_READY_EVENT, 36u);   /* abi (24 B), mac_addr (8 B), status */
+	if (rdy == NULL) {
+		snprintf(res, len, "STEP 3 FAIL: WMI ready event without its ready TLV (%u bytes)", gRxLen);
+		return false;
+	}
+	uint8_t mac[6];
+	memcpy(mac, rdy + 24, sizeof(mac));
+	uint32_t status = le32(rdy + 32);
+	A_LOG("WMI ready: sw version %08x, abi %u, status %u, MAC %02x:%02x:%02x:%02x:%02x:%02x", le32(rdy), le32(rdy + 4),
+	    status, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
+	/* ath10k_htt_setup: version request on the HTT endpoint (CE4), the answer on pipe 5 (3 s) */
+	uint8_t vreq[4] = { HTT_H2T_MSG_TYPE_VERSION_REQ, 0, 0, 0 };
+	if (!htc_send(gEpHtt, &gCe4, OFF_HTT_TX, HTT_TX_MAX, vreq, sizeof(vreq), false)) {
+		snprintf(res, len, "%s", "STEP 3 FAIL: HTT version request could not be sent");
+		return false;
+	}
+	if (!htc_wait(gEpHtt, HTT_T2H_MSG_TYPE_VERSION_CONF, 3000u, "the HTT version", res, len)) {
+		return false;
+	}
+	uint32_t htt_minor = gRxLen >= 3u ? gRx[1] : 0u, htt_major = gRxLen >= 3u ? gRx[2] : 0u;
+	A_LOG("HTT version %u.%u", htt_major, htt_minor);
+	if (htt_major != 2u && htt_major != 3u) {
+		snprintf(res, len, "STEP 3 FAIL: HTT version %u.%u (ath10k supports major 2 and 3)", htt_major, htt_minor);
+		return false;
+	}
+
+	/* a WMI round trip after init; the step does not depend on it */
+	char why[120];
+	const char *echo = "no answer";
+	uint32_t ev[2] = { tlv_hdr(WMI_TLV_TAG_ECHO_CMD, 4u), OP2_ECHO_VALUE };
+	if (!wmi_cmd(WMI_TLV_ECHO_CMDID, ev, sizeof(ev))) {
+		echo = "not sent";
+	} else if (htc_wait(gEpWmi, WMI_TLV_ECHO_EVENTID, 1000u, "the WMI echo", why, sizeof(why))) {
+		const uint8_t *v = wmi_find(WMI_TLV_TAG_ECHO_EVENT, 4u);
+		echo = v != NULL && le32(v) == OP2_ECHO_VALUE ? "OK" : "wrong value";
+	} else {
+		A_LOG("%s", why);
+	}
+	drain();
+	A_LOG("WMI echo %s; WMI credits %u, %u credit reports, %u unrequested messages", echo, gWmiCredits, gCreditReports,
+	    gOtherMsgs);
+	snprintf(res, len, "STEP 3 PASS: firmware ready: MAC %02x:%02x:%02x:%02x:%02x:%02x, HTT %u.%u, %u RF chains, 2 GHz "
+	    "%u-%u MHz, 5 GHz %u-%u MHz, regdomain %x, WMI echo %s", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], htt_major,
+	    htt_minor, e[SR_NUM_RF_CHAINS], g[5], g[6], g[7], g[8], g[0], echo);
+	return true;
 }
 
 static bool
@@ -1241,6 +1990,10 @@ op2_ath10k_step2b(const struct op2_ath10k_bus *bus, char *result, size_t len)
 	if (ok && bus->boot_firmware) {
 		A_LOG("%s", result);   /* the 2b verdict; the result line becomes 2c's */
 		ok = run2c(result, len);
+	}
+	if (ok && bus->start_services) {
+		A_LOG("%s", result);   /* the 2c verdict; the result line becomes step 3's */
+		ok = run3(result, len);
 	}
 	/* The chip cannot DMA any more; the block stays allocated for good. */
 	wr32(gDbi, 0x04, rd32(gDbi, 0x04) & 0xFFFBu);
