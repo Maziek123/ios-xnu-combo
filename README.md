@@ -78,7 +78,8 @@ Scanning, connecting, a network interface and Bluetooth come after the firmware 
 | 4 | BAR0 on a 2 MB boundary, checked by reading it back (`423f271`) | The SoC woke in 50 µs, but the chip ID and firmware indicator read `00000000` | Read too early: ath10k once had the same symptom (the ID reads 0 until the chip has initialised). |
 | 5 | Poll for up to 5 s, cold reset only as a fallback (`9290d11`) | **PASS**: chip ID `00342aff` (hw3.2), valid 83 ms after WLAN_EN, no reset needed; the firmware indicator stayed 0 | Register access works, and ath10k's cold reset, its riskiest step, isn't needed. |
 | 6 | Step 2b, `wifi=3` (`20094ef`) | **First DMA works**: the chip read its own memory through copy engine 7 into phone RAM (`pcie_state at 00401ee0`), no crash. PARTIAL: the boot ROM never reported "initialized" in 10 s, so BMI wasn't tried | After a plain power-on the ROM doesn't raise that flag. The chip's copy engines see their own memory at `0xf8a00000`, the BAR0 address; our DMA block (`39e8d000`) is well clear of it. |
-| 7 | Try BMI without waiting; if it stays silent, reset only the chip's CPU and try again | Not run yet | Checked against a simulated chip, which also caught a bug: setting the rings up twice could have let the chip write to physical address 0. |
+| 7 | Try BMI without waiting; if it stays silent, reset only the chip's CPU and try again (`123f043`) | The chip's memory reads and writes all work, and the configuration read back correctly. But BMI got no answer, before or after the CPU reset: the chip never set up its side of the boot-loader channels (copy engine 0 has no receive ring, copy engine 1 no send ring) and never reported "initialized" | The boot ROM starts (it changes its reset-control register and has its tables in memory) but stops before announcing itself. Both reference drivers keep writing the chip's interrupt-enable register while they wait; we never did. |
+| 8 | Wait the way ath10k does (interrupt enable rewritten every 10 ms, with the chip's interrupt-disable bit set so nothing reaches the phone); register dumps; cold reset only if BMI stays silent | Not run yet | Checked against a simulated chip in six cases, including a cold reset that fails. |
 
 #### Testing a step
 
@@ -88,7 +89,7 @@ Scanning, connecting, a network interface and Bluetooth come after the firmware 
 
 ```bash
 adb pull /sys/fs/pstore/console-ramoops-0 ./op2-last-boot.log
-grep -a 'OP2 WIFI' op2-last-boot.log | grep -v 'RESULT (repeat)' | tail -80
+grep -a 'OP2 WIFI' op2-last-boot.log | grep -v 'RESULT (repeat)'
 ```
 
 The `RESULT:` line is the verdict; the lines before it show where a failing step stopped.

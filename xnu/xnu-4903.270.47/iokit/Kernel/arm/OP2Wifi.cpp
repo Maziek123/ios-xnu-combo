@@ -355,6 +355,8 @@ static const uint32_t kPhyInit[][2] = {
 /* step 2a: BAR0 + chip registers (link already up, iATU region 0 = config window of 01:00.0)           */
 
 static uint64_t gPowerOnAbs;   /* when WLAN_EN went high */
+static uint32_t gBar0Lo;   /* BAR0 low dword as programmed (address | flag bits), for the cold reset's repair */
+static bool gBar64;
 
 static uint32_t
 ms_since_power_on(void)
@@ -558,6 +560,9 @@ step2a(void)
 		return false;
 	}
 
+	gBar0Lo = (uint32_t)addr | (mask & 0xFu);
+	gBar64 = (mask & 0x6u) == 0x4u;
+
 	/* Wake the chip's SoC, then wait (no reset) until it has initialised itself. */
 	uint32_t rtc = 0;
 	if (!q_wake(&rtc)) {
@@ -607,11 +612,17 @@ step2a(void)
 }
 
 /* step 2b (wifi=3): copy engines, diag window, target config, BMI_GET_TARGET_INFO (OP2Ath10k.cpp) */
+static bool
+cold_reset_for_2b(char *why, size_t n)
+{
+	return q_cold_reset(gBar0Lo, gBar64, why, n);
+}
+
 static void
 step2b(void)
 {
 	char line[200];
-	struct op2_ath10k_bus bus = { gBar0, gConf, gDbi, gPowerOnAbs };
+	struct op2_ath10k_bus bus = { gBar0, gConf, gDbi, gPowerOnAbs, cold_reset_for_2b };
 	(void)op2_ath10k_step2b(&bus, line, sizeof(line));
 	summary(line);
 }

@@ -1,19 +1,19 @@
 // SPDX-License-Identifier: ISC
 /*
  * OP2Ath10k: Wi-Fi step 2b for the OnePlus 2's QCA6174 (docs/WIFI-BT-PLAN.md, first half of P1).
- * Polled, no interrupts, no firmware:
- *   1. wait up to 2 s for the boot ROM's FW_INDICATOR "initialized" (qcacld-2.0 FW sync); after a plain
- *      power-on it has not appeared on this phone, so this goes on either way
+ * Polled, no firmware; no interrupt ever reaches the phone (the chip's "interrupt disable" bit is set):
+ *   1. dump the chip's RTC_SOC (clock/reset) and SOC_CORE registers
  *   2. one 16 KB DMA block below 4 GB (cached; cleaned/invalidated around every device access, as OP2GPU
  *      does: the chip's DMA does not snoop the CPU caches), ASPM off on the chip, bus mastering on
- *   3. host side of copy engines CE0 (host->target: BMI requests), CE1 (target->host: BMI responses) and
+ *   3. ath10k_pci_wait_for_target_init: up to 3 s for the boot ROM's FW_INDICATOR "initialized", rewriting
+ *      PCIE_INTR_ENABLE every 10 ms as ath10k and qcacld do in interrupt-line mode, cleared afterwards
+ *   4. host side of copy engines CE0 (host->target: BMI requests), CE1 (target->host: BMI responses) and
  *      CE7 (the diagnostic window into target memory)
- *   4. first DMA: read hi_interconnect_state through CE7
- *   5. ath10k_pci_init_config(): target CE config, service map, L1 off, early alloc (9 IRAM banks on hw3.x),
- *      HI_OPTION_EARLY_CFG_DONE; then ath10k_pci_wake_target_cpu()
- *   6. BMI_GET_TARGET_INFO over CE0/CE1 (hw3.2 answers version 0x05030000)
- *   7. only if BMI stays silent: CPU warm reset (ath10k_pci_warm_reset_cpu), wait 3 s for "initialized", rings,
- *      then 4-6 again
+ *   5. read hi_interconnect_state through CE7; ath10k_pci_init_config() (target CE config, service map,
+ *      L1 off, early alloc with 9 IRAM banks on hw3.x, HI_OPTION_EARLY_CFG_DONE), verified by read-back;
+ *      ath10k_pci_wake_target_cpu(); BMI_GET_TARGET_INFO over CE0/CE1 (hw3.2 answers version 0x05030000)
+ *   6. only if BMI stays silent: the ath10k cold reset (SOC_GLOBAL_RESET, done by OP2Wifi.cpp with the link
+ *      and config space checked), then 3-5 again
  * Afterwards bus mastering is switched off again and the DMA block is never freed, so nothing the chip might
  * still write can land in memory that belongs to someone else.
  *
@@ -60,11 +60,13 @@
 #define Q_SOC_WAKE              0x00080004u
 #define Q_CORE_CTRL             0x0003a000u   /* SOC_CORE + 0x00 */
 #define Q_CORE_CTRL_CPU_INTR    0x00002000u
+#define Q_PCIE_INTR_ENABLE      0x0003a008u   /* SOC_CORE + 0x08 */
+#define Q_PCIE_INTR_CAUSE       0x0003a00cu
+#define Q_PCIE_INTR_CLR         0x0003a014u   /* pcie_intr_clr_address */
+#define Q_INTR_FW_AND_CE        0x0007fc00u   /* PCIE_INTR_FIRMWARE_MASK 0x400 | PCIE_INTR_CE_MASK_ALL 0x7f800 */
 #define Q_FW_INDICATOR          0x0003a028u
 #define Q_FW_IND_EVENT_PENDING  0x1u
 #define Q_FW_IND_INITIALIZED    0x2u
-#define Q_SOC_RESET_CONTROL     0x00000800u   /* RTC_SOC + 0x00 */
-#define Q_CPU_WARM_RST          0x00000040u   /* SOC_RESET_CONTROL_CPU_WARM_RST_MASK */
 #define Q_CE(n)                 (0x00034400u + (uint32_t)(n) * 0x400u)   /* CE0 0x34400 .. CE7 0x36000 */
 
 #define CE_SR_BA            0x00
@@ -159,6 +161,8 @@ static uint64_t gPowerOnAbs;
 static uint8_t *gDma;       /* never freed */
 static uint32_t gDmaPhys;
 static struct ce_pipe gCe0, gCe1, gCe7;
+static bool (*gColdReset)(char *why, size_t len);
+static bool gChipGone;      /* the cold reset failed: no further access to the chip */
 
 static inline uint32_t
 rd32(volatile uint32_t *b, uint32_t off)
@@ -261,42 +265,52 @@ ce_quiet(const struct ce_pipe *p)
 	bwr(p->base + CE_HOST_IS, 0x1Fu);
 }
 
-/* ath10k_ce_init_src_ring */
+/*
+ * ath10k_ce_init_src_ring / _dest_ring: software indexes from the hardware's and the ring contents kept, so a
+ * descriptor that is still posted keeps pointing into the DMA block. Only at the first set-up, when the ring
+ * memory is freshly zeroed, is a ring that already shows pending entries emptied: those entries would carry
+ * address 0.
+ */
 static void
-ce_init_src(struct ce_pipe *p, uint32_t off, uint32_t nentries, uint32_t dmax)
+ce_init_src(struct ce_pipe *p, uint32_t off, uint32_t nentries, uint32_t dmax, bool first)
 {
 	struct ce_ring *r = &p->src;
+	uint32_t mask = nentries - 1u;
 	r->desc = dma_words(off);
 	r->phys = gDmaPhys + off;
 	r->nentries = nentries;
-	bzero(r->desc, nentries * 8u);
-	dma_sync(r->desc, nentries * 8u);
-	/* Start empty: write index = the hardware's read index, so no stale descriptor (zeroed above, address 0)
-	 * can still count as posted when the rings are set up a second time. */
-	r->sw_index = brd(p->base + CE_CURRENT_SRRI) & (nentries - 1u);
+	r->sw_index = brd(p->base + CE_CURRENT_SRRI) & mask;
 	r->hw_index = r->sw_index;
-	r->write_index = r->sw_index;
-	bwr(p->base + CE_SR_WR_INDEX, r->write_index);
+	r->write_index = brd(p->base + CE_SR_WR_INDEX) & mask;
+	if (first && r->write_index != r->sw_index) {
+		A_LOG("CE at %05x: %u source entries pending at first set-up; emptied", p->base,
+		    (r->write_index - r->sw_index) & mask);
+		r->write_index = r->sw_index;
+		bwr(p->base + CE_SR_WR_INDEX, r->write_index);
+	}
 	bwr(p->base + CE_SR_BA, r->phys);
 	bwr(p->base + CE_SR_SIZE, nentries);
 	bwr(p->base + CE_CTRL1, (brd(p->base + CE_CTRL1) & ~0x1FFFFu) | (dmax & 0xFFFFu));   /* dmax, no byte swap */
 	bwr(p->base + CE_SRC_WATERMARK, nentries & 0xFFFFu);                                /* low 0, high nentries */
 }
 
-/* ath10k_ce_init_dest_ring */
 static void
-ce_init_dst(struct ce_pipe *p, uint32_t off, uint32_t nentries)
+ce_init_dst(struct ce_pipe *p, uint32_t off, uint32_t nentries, bool first)
 {
 	struct ce_ring *r = &p->dst;
+	uint32_t mask = nentries - 1u;
 	r->desc = dma_words(off);
 	r->phys = gDmaPhys + off;
 	r->nentries = nentries;
-	bzero(r->desc, nentries * 8u);
-	dma_sync(r->desc, nentries * 8u);
-	r->sw_index = brd(p->base + CE_CURRENT_DRRI) & (nentries - 1u);
+	r->sw_index = brd(p->base + CE_CURRENT_DRRI) & mask;
 	r->hw_index = r->sw_index;
-	r->write_index = r->sw_index;   /* empty, as in ce_init_src */
-	bwr(p->base + CE_DST_WR_INDEX, r->write_index);
+	r->write_index = brd(p->base + CE_DST_WR_INDEX) & mask;
+	if (first && r->write_index != r->sw_index) {
+		A_LOG("CE at %05x: %u destination entries pending at first set-up; emptied", p->base,
+		    (r->write_index - r->sw_index) & mask);
+		r->write_index = r->sw_index;
+		bwr(p->base + CE_DST_WR_INDEX, r->write_index);
+	}
 	bwr(p->base + CE_DR_BA, r->phys);
 	bwr(p->base + CE_DR_SIZE, nentries);
 	bwr(p->base + CE_CTRL1, brd(p->base + CE_CTRL1) & ~(1u << 17));   /* no byte swap */
@@ -483,8 +497,13 @@ bmi_exchange(const void *req, uint32_t req_len, void *resp, uint32_t *resp_len)
 	memcpy(rq, req, req_len);
 	dma_sync(rq, req_len);
 	dma_sync(rs, BMI_RESP_MAX);
-	if (!ce_post_rx(&gCe1, gDmaPhys + OFF_BMI_RESP) ||
-	    !ce_send(&gCe0, gDmaPhys + OFF_BMI_REQ, req_len, BMI_SEND_FLAGS)) {
+	if (gCe1.dst.write_index != gCe1.dst.sw_index) {
+		A_LOG("%s", "BMI: a response buffer is still posted on CE1 (same address); reusing it");
+	} else if (!ce_post_rx(&gCe1, gDmaPhys + OFF_BMI_RESP)) {
+		A_LOG("%s", "BMI: CE1 ring full");
+		return false;
+	}
+	if (!ce_send(&gCe0, gDmaPhys + OFF_BMI_REQ, req_len, BMI_SEND_FLAGS)) {
 		A_LOG("%s", "BMI: ring full");
 		return false;
 	}
@@ -503,7 +522,30 @@ bmi_exchange(const void *req, uint32_t req_len, void *resp, uint32_t *resp_len)
 
 /* ---------------------------------------------------------------------------------------------------- */
 
-/* Poll FW_INDICATOR (qcacld-2.0 "FW sync" / ath10k_pci_wait_for_target_init: 10 ms steps); logs each change. */
+/* Register dumps for the log: RTC_SOC (clock / reset / watchdog / sleep timers) and SOC_CORE. Reads only. */
+static void
+dump_block(const char *tag, const char *name, uint32_t base, uint32_t count)
+{
+	for (uint32_t i = 0; i < count; i += 8u) {
+		uint32_t o = base + i * 4u;
+		A_LOG("%s: %s %05x: %08x %08x %08x %08x %08x %08x %08x %08x", tag, name, o, brd(o), brd(o + 4u), brd(o + 8u),
+		    brd(o + 12u), brd(o + 16u), brd(o + 20u), brd(o + 24u), brd(o + 28u));
+	}
+}
+
+static void
+dump_chip(const char *tag)
+{
+	dump_block(tag, "rtc_soc", 0x800u, 64u);
+	dump_block(tag, "soc_core", 0x3a000u, 16u);
+}
+
+/*
+ * ath10k_pci_wait_for_target_init in interrupt-line mode (qcacld-2.0's "FW sync" does the same): poll
+ * FW_INDICATOR every 10 ms, rewriting PCIE_INTR_ENABLE each time ("fix potential race by repeating CORE_BASE
+ * writes"), then ath10k_pci_disable_and_clear_intx_irq. The chip's interrupt-disable bit keeps any
+ * interrupt from leaving the chip. Logs each change of the indicator.
+ */
 static uint32_t
 wait_rom(const char *tag, uint32_t max_ms, uint32_t *fwi_out)
 {
@@ -512,23 +554,31 @@ wait_rom(const char *tag, uint32_t max_ms, uint32_t *fwi_out)
 		(void)q_wake();
 		uint32_t v = brd(Q_FW_INDICATOR);
 		if (v != fwi) {
-			A_LOG("%s: fw indicator %08x at %u ms (%u ms after WLAN_EN)", tag, v, t, ms_since_power_on());
+			A_LOG("%s: fw indicator %08x at %u ms (%u ms after WLAN_EN), intr_cause %08x", tag, v, t,
+			    ms_since_power_on(), brd(Q_PCIE_INTR_CAUSE));
 			fwi = v;
 		}
 		if ((v != 0xFFFFFFFFu && (v & (Q_FW_IND_INITIALIZED | Q_FW_IND_EVENT_PENDING))) || t >= max_ms) {
 			break;
 		}
+		bwr(Q_PCIE_INTR_ENABLE, Q_INTR_FW_AND_CE);
+		(void)brd(Q_PCIE_INTR_ENABLE);   /* flush the posted write (ath10k) */
 		IOSleep(10);
 		t += 10;
 	}
+	uint32_t cause = brd(Q_PCIE_INTR_CAUSE);
+	bwr(Q_PCIE_INTR_ENABLE, 0u);                 /* INTR_CLR only works once ENABLE is 0 (ath10k) */
+	bwr(Q_PCIE_INTR_CLR, Q_INTR_FW_AND_CE);
+	(void)brd(Q_PCIE_INTR_ENABLE);
+	A_LOG("%s: boot ROM %s after %u ms (intr_cause %08x before clearing)", tag,
+	    (fwi != 0xFFFFFFFFu && (fwi & Q_FW_IND_INITIALIZED)) ? "initialized" : "NOT initialized", t, cause);
 	*fwi_out = fwi;
 	return t;
 }
 
-/* Copy engines, host side (pci_host_ce_config_wlan; fewer CE1 entries: one BMI response at a time).
- * Also run again after a CPU warm reset, as ath10k_pci_warm_reset() re-runs ath10k_pci_init_pipes(). */
+/* Copy engines, host side (pci_host_ce_config_wlan; fewer CE1 entries: one BMI response at a time). */
 static void
-init_rings(void)
+init_rings(bool first)
 {
 	gCe0.base = Q_CE(0);
 	gCe1.base = Q_CE(1);
@@ -536,13 +586,36 @@ init_rings(void)
 	ce_quiet(&gCe0);
 	ce_quiet(&gCe1);
 	ce_quiet(&gCe7);
-	ce_init_src(&gCe0, OFF_CE0_SRC, 16u, BMI_REQ_MAX);
-	ce_init_dst(&gCe1, OFF_CE1_DST, 16u);
-	ce_init_src(&gCe7, OFF_CE7_SRC, 2u, DIAG_MAX);
-	ce_init_dst(&gCe7, OFF_CE7_DST, 2u);
+	ce_init_src(&gCe0, OFF_CE0_SRC, 16u, BMI_REQ_MAX, first);
+	ce_init_dst(&gCe1, OFF_CE1_DST, 16u, first);
+	ce_init_src(&gCe7, OFF_CE7_SRC, 2u, DIAG_MAX, first);
+	ce_init_dst(&gCe7, OFF_CE7_DST, 2u, first);
 	ce_dump("CE0", &gCe0);
 	ce_dump("CE1", &gCe1);
 	ce_dump("CE7", &gCe7);
+}
+
+/* The copy engines treat one 2 MB window as the chip's own memory (CORE_CTRL bits 10:0 << 21); the DMA block
+ * must lie outside it. Checked again after a reset. */
+static bool
+dma_clear_of_window(char *res, size_t len)
+{
+	uint32_t win = (brd(Q_CORE_CTRL) & 0x7ffu) << 21;
+	if (gDmaPhys < win + 0x200000u && gDmaPhys + DMA_SIZE > win) {
+		snprintf(res, len, "STEP 2b FAIL: DMA block %08x lies in the chip's own 2 MB window at %08x", gDmaPhys, win);
+		return false;
+	}
+	return true;
+}
+
+/* Memory + bus master on both ends; on the chip also "interrupt disable" (no INTx message leaves it). */
+static void
+command_on(void)
+{
+	wr32(gDbi, 0x04, (rd32(gDbi, 0x04) & 0xFFFFu) | 0x6u);
+	wr32(gConf, 0x04, (rd32(gConf, 0x04) & 0xFFFFu) | 0x406u);
+	A_LOG("bus mastering on: rp command %08x, chip command %08x (interrupt disable set)", rd32(gDbi, 0x04),
+	    rd32(gConf, 0x04));
 }
 
 /*
@@ -617,27 +690,29 @@ attempt(const char *how, char *res, size_t len, bool *bmi_silent)
 }
 
 static bool
+rom_usable(const char *tag, uint32_t fwi, char *res, size_t len)
+{
+	if (fwi == 0xFFFFFFFFu) {
+		snprintf(res, len, "STEP 2b FAIL (%s): BAR0 reads all ones while waiting for the boot ROM", tag);
+		return false;
+	}
+	if (fwi & Q_FW_IND_EVENT_PENDING) {
+		snprintf(res, len, "STEP 2b FAIL (%s): chip reports a crash (fw indicator %08x)", tag, fwi);
+		return false;
+	}
+	return true;
+}
+
+static bool
 run(char *res, size_t len)
 {
-	/* 1. The boot ROM's "initialized". After a plain power-on it has never appeared (2026-11-24: not in 10 s), so
-	 * this only waits 2 s and goes on either way. */
 	if (!q_wake()) {
 		snprintf(res, len, "STEP 2b FAIL: chip SoC did not wake (rtc_state %08x)", brd(Q_RTC_STATE));
 		return false;
 	}
-	uint32_t fwi = 0;
-	uint32_t t = wait_rom("power-on", 2000u, &fwi);
-	if (fwi == 0xFFFFFFFFu) {
-		snprintf(res, len, "%s", "STEP 2b FAIL: BAR0 reads all ones while waiting for the boot ROM");
-		return false;
-	}
-	if (fwi & Q_FW_IND_EVENT_PENDING) {
-		snprintf(res, len, "STEP 2b FAIL: chip reports a crash (fw indicator %08x) before any host command", fwi);
-		return false;
-	}
-	A_LOG("boot ROM %s after %u ms", (fwi & Q_FW_IND_INITIALIZED) ? "initialized" : "not initialized (going on)", t);
+	dump_chip("start");
 
-	/* 2. DMA block (below 4 GB: 32-bit descriptors), chip ASPM off, bus mastering on. */
+	/* 1. DMA block (below 4 GB: 32-bit descriptors), chip ASPM off, bus mastering + interrupt disable. */
 	IOPhysicalAddress phys = 0;
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
@@ -650,16 +725,13 @@ run(char *res, size_t len)
 		return false;
 	}
 	gDmaPhys = (uint32_t)phys;
-	uint32_t win = (brd(Q_CORE_CTRL) & 0x7ffu) << 21;   /* addresses the copy engines keep inside the chip */
-	if (gDmaPhys < win + 0x200000u && gDmaPhys + DMA_SIZE > win) {
-		snprintf(res, len, "STEP 2b FAIL: DMA block %08x lies in the chip's own 2 MB window at %08x", gDmaPhys, win);
+	if (!dma_clear_of_window(res, len)) {
 		return false;
 	}
 	bzero(gDma, DMA_SIZE);
 	dma_sync(gDma, DMA_SIZE);
 	A_LOG("DMA block %u KB at phys %08x (va %p); core_ctrl %08x", DMA_SIZE / 1024u, gDmaPhys, (void *)gDma,
 	    brd(Q_CORE_CTRL));
-
 	uint32_t cap = chip_pcie_cap();
 	if (cap != 0) {
 		uint32_t lc = rd32(gConf, cap + 0x10u);
@@ -668,35 +740,41 @@ run(char *res, size_t len)
 		}
 		A_LOG("chip PCIe capability at %02x: lnkctl %04x -> %04x", cap, lc & 0xFFFFu, rd32(gConf, cap + 0x10u) & 0xFFFFu);
 	}
-	wr32(gDbi, 0x04, (rd32(gDbi, 0x04) & 0xFFFFu) | 0x6u);     /* root port: memory + bus master */
-	wr32(gConf, 0x04, (rd32(gConf, 0x04) & 0xFFFFu) | 0x6u);   /* chip: memory + bus master */
-	A_LOG("bus mastering on: rp command %08x, chip command %08x", rd32(gDbi, 0x04), rd32(gConf, 0x04));
+	command_on();
 
-	/* 3. Rings, then try BMI straight away: the ROM may already be listening without having said so. */
-	init_rings();
+	/* 2. Wait for "initialized" the way ath10k does, then rings and a first attempt without any reset. */
+	uint32_t fwi = 0;
+	(void)wait_rom("power-on", 3000u, &fwi);
+	if (!rom_usable("power-on", fwi, res, len)) {
+		return false;
+	}
+	init_rings(true);
 	bool silent = false;
 	if (attempt("no reset", res, len, &silent) || !silent) {
 		return strncmp(res, "STEP 2b PASS", 12) == 0;
 	}
 
-	/* 4. BMI silent: reset only the chip's CPU (ath10k_pci_warm_reset_cpu), not the PCIe core (cold reset) and not
-	 * the copy engines (ath10k warns that CE reset can hang the host). Then wait for "initialized", rings again,
-	 * and a second attempt. */
-	A_LOG("%s", "BMI silent: CPU warm reset (FW_INDICATOR = 0, SOC_RESET_CONTROL |= CPU_WARM_RST)");
-	bwr(Q_FW_INDICATOR, 0u);
-	uint32_t rc = brd(Q_SOC_RESET_CONTROL);
-	bwr(Q_SOC_RESET_CONTROL, rc | Q_CPU_WARM_RST);
-	A_LOG("reset_control %08x -> %08x", rc, brd(Q_SOC_RESET_CONTROL));
-	t = wait_rom("after CPU warm reset", 3000u, &fwi);
-	A_LOG("boot ROM %s %u ms after the CPU warm reset", (fwi != 0xFFFFFFFFu && (fwi & Q_FW_IND_INITIALIZED)) ?
-	    "initialized" : "NOT initialized", t);
-	if (fwi == 0xFFFFFFFFu || (fwi & Q_FW_IND_EVENT_PENDING)) {
-		snprintf(res, len, "STEP 2b FAIL: after the CPU warm reset the fw indicator is %08x (%s)", fwi,
-		    fwi == 0xFFFFFFFFu ? "reads all ones" : "chip reports a crash");
+	/* 3. BMI silent: the cold reset ath10k does on every QCA6174 power-up (ath10k_pci_qca6174_chip_reset). */
+	if (gColdReset == NULL) {
 		return false;
 	}
-	init_rings();
-	return attempt("after CPU warm reset", res, len, &silent);
+	A_LOG("%s", "BMI silent: cold reset (SOC_GLOBAL_RESET, the whole chip; link and config space checked)");
+	char why[120];
+	if (!gColdReset(why, sizeof(why))) {
+		gChipGone = true;
+		snprintf(res, len, "STEP 2b FAIL: BMI silent, then the cold reset failed: %s", why);
+		return false;
+	}
+	command_on();   /* the reset may have cleared the chip's command register */
+	if (!dma_clear_of_window(res, len)) {
+		return false;
+	}
+	(void)wait_rom("after cold reset", 3000u, &fwi);
+	if (!rom_usable("after cold reset", fwi, res, len)) {
+		return false;
+	}
+	init_rings(false);
+	return attempt("after cold reset", res, len, &silent);
 }
 
 extern "C" bool
@@ -706,10 +784,18 @@ op2_ath10k_step2b(const struct op2_ath10k_bus *bus, char *result, size_t len)
 	gConf = bus->conf;
 	gDbi = bus->dbi;
 	gPowerOnAbs = bus->power_on_abs;
+	gColdReset = bus->cold_reset;
 	bool ok = run(result, len);
-	/* The chip cannot DMA any more; the block stays allocated for good. The chip waits in BMI. */
-	wr32(gConf, 0x04, rd32(gConf, 0x04) & 0xFFFBu);
+	/* The chip cannot DMA any more; the block stays allocated for good. */
 	wr32(gDbi, 0x04, rd32(gDbi, 0x04) & 0xFFFBu);
+	if (gChipGone) {
+		A_LOG("done: root port bus mastering off (rp command %08x); chip left alone", rd32(gDbi, 0x04));
+		return ok;
+	}
+	if (!ok) {
+		dump_chip("end");
+	}
+	wr32(gConf, 0x04, rd32(gConf, 0x04) & 0xFFFBu);
 	bwr(Q_SOC_WAKE, 0u);
 	A_LOG("done: bus mastering off (chip command %08x, rp command %08x), SoC wake released", rd32(gConf, 0x04),
 	    rd32(gDbi, 0x04));
