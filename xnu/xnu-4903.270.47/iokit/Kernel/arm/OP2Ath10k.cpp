@@ -2,7 +2,8 @@
 /*
  * OP2Ath10k: Wi-Fi step 2b for the OnePlus 2's QCA6174 (docs/WIFI-BT-PLAN.md, first half of P1).
  * Polled, no interrupts, no firmware:
- *   1. wait for the boot ROM's FW_INDICATOR "initialized" (qcacld-2.0 hif_pci_configure: 10 ms polls, 10 s)
+ *   1. wait up to 2 s for the boot ROM's FW_INDICATOR "initialized" (qcacld-2.0 FW sync); after a plain
+ *      power-on it has not appeared on this phone, so this goes on either way
  *   2. one 16 KB DMA block below 4 GB (cached; cleaned/invalidated around every device access, as OP2GPU
  *      does: the chip's DMA does not snoop the CPU caches), ASPM off on the chip, bus mastering on
  *   3. host side of copy engines CE0 (host->target: BMI requests), CE1 (target->host: BMI responses) and
@@ -11,6 +12,8 @@
  *   5. ath10k_pci_init_config(): target CE config, service map, L1 off, early alloc (9 IRAM banks on hw3.x),
  *      HI_OPTION_EARLY_CFG_DONE; then ath10k_pci_wake_target_cpu()
  *   6. BMI_GET_TARGET_INFO over CE0/CE1 (hw3.2 answers version 0x05030000)
+ *   7. only if BMI stays silent: CPU warm reset (ath10k_pci_warm_reset_cpu), wait 3 s for "initialized", rings,
+ *      then 4-6 again
  * Afterwards bus mastering is switched off again and the DMA block is never freed, so nothing the chip might
  * still write can land in memory that belongs to someone else.
  *
@@ -60,6 +63,8 @@
 #define Q_FW_INDICATOR          0x0003a028u
 #define Q_FW_IND_EVENT_PENDING  0x1u
 #define Q_FW_IND_INITIALIZED    0x2u
+#define Q_SOC_RESET_CONTROL     0x00000800u   /* RTC_SOC + 0x00 */
+#define Q_CPU_WARM_RST          0x00000040u   /* SOC_RESET_CONTROL_CPU_WARM_RST_MASK */
 #define Q_CE(n)                 (0x00034400u + (uint32_t)(n) * 0x400u)   /* CE0 0x34400 .. CE7 0x36000 */
 
 #define CE_SR_BA            0x00
@@ -256,7 +261,7 @@ ce_quiet(const struct ce_pipe *p)
 	bwr(p->base + CE_HOST_IS, 0x1Fu);
 }
 
-/* ath10k_ce_init_src_ring: software indexes start where the hardware's are */
+/* ath10k_ce_init_src_ring */
 static void
 ce_init_src(struct ce_pipe *p, uint32_t off, uint32_t nentries, uint32_t dmax)
 {
@@ -266,9 +271,12 @@ ce_init_src(struct ce_pipe *p, uint32_t off, uint32_t nentries, uint32_t dmax)
 	r->nentries = nentries;
 	bzero(r->desc, nentries * 8u);
 	dma_sync(r->desc, nentries * 8u);
+	/* Start empty: write index = the hardware's read index, so no stale descriptor (zeroed above, address 0)
+	 * can still count as posted when the rings are set up a second time. */
 	r->sw_index = brd(p->base + CE_CURRENT_SRRI) & (nentries - 1u);
 	r->hw_index = r->sw_index;
-	r->write_index = brd(p->base + CE_SR_WR_INDEX) & (nentries - 1u);
+	r->write_index = r->sw_index;
+	bwr(p->base + CE_SR_WR_INDEX, r->write_index);
 	bwr(p->base + CE_SR_BA, r->phys);
 	bwr(p->base + CE_SR_SIZE, nentries);
 	bwr(p->base + CE_CTRL1, (brd(p->base + CE_CTRL1) & ~0x1FFFFu) | (dmax & 0xFFFFu));   /* dmax, no byte swap */
@@ -287,7 +295,8 @@ ce_init_dst(struct ce_pipe *p, uint32_t off, uint32_t nentries)
 	dma_sync(r->desc, nentries * 8u);
 	r->sw_index = brd(p->base + CE_CURRENT_DRRI) & (nentries - 1u);
 	r->hw_index = r->sw_index;
-	r->write_index = brd(p->base + CE_DST_WR_INDEX) & (nentries - 1u);
+	r->write_index = r->sw_index;   /* empty, as in ce_init_src */
+	bwr(p->base + CE_DST_WR_INDEX, r->write_index);
 	bwr(p->base + CE_DR_BA, r->phys);
 	bwr(p->base + CE_DR_SIZE, nentries);
 	bwr(p->base + CE_CTRL1, brd(p->base + CE_CTRL1) & ~(1u << 17));   /* no byte swap */
@@ -494,28 +503,130 @@ bmi_exchange(const void *req, uint32_t req_len, void *resp, uint32_t *resp_len)
 
 /* ---------------------------------------------------------------------------------------------------- */
 
-static bool
-run(char *res, size_t len)
+/* Poll FW_INDICATOR (qcacld-2.0 "FW sync" / ath10k_pci_wait_for_target_init: 10 ms steps); logs each change. */
+static uint32_t
+wait_rom(const char *tag, uint32_t max_ms, uint32_t *fwi_out)
 {
-	/* 1. The boot ROM's "initialized" (qcacld-2.0 hif_pci_configure "FW sync": 10 ms polls, 10 s). */
-	if (!q_wake()) {
-		snprintf(res, len, "STEP 2b FAIL: chip SoC did not wake (rtc_state %08x)", brd(Q_RTC_STATE));
-		return false;
-	}
 	uint32_t fwi = 0xDEADBEEFu, t = 0;
 	for (;;) {
 		(void)q_wake();
 		uint32_t v = brd(Q_FW_INDICATOR);
 		if (v != fwi) {
-			A_LOG("fw indicator %08x at %u ms (%u ms after WLAN_EN)", v, t, ms_since_power_on());
+			A_LOG("%s: fw indicator %08x at %u ms (%u ms after WLAN_EN)", tag, v, t, ms_since_power_on());
 			fwi = v;
 		}
-		if ((v != 0xFFFFFFFFu && (v & (Q_FW_IND_INITIALIZED | Q_FW_IND_EVENT_PENDING))) || t >= 10000u) {
+		if ((v != 0xFFFFFFFFu && (v & (Q_FW_IND_INITIALIZED | Q_FW_IND_EVENT_PENDING))) || t >= max_ms) {
 			break;
 		}
 		IOSleep(10);
 		t += 10;
 	}
+	*fwi_out = fwi;
+	return t;
+}
+
+/* Copy engines, host side (pci_host_ce_config_wlan; fewer CE1 entries: one BMI response at a time).
+ * Also run again after a CPU warm reset, as ath10k_pci_warm_reset() re-runs ath10k_pci_init_pipes(). */
+static void
+init_rings(void)
+{
+	gCe0.base = Q_CE(0);
+	gCe1.base = Q_CE(1);
+	gCe7.base = Q_CE(7);
+	ce_quiet(&gCe0);
+	ce_quiet(&gCe1);
+	ce_quiet(&gCe7);
+	ce_init_src(&gCe0, OFF_CE0_SRC, 16u, BMI_REQ_MAX);
+	ce_init_dst(&gCe1, OFF_CE1_DST, 16u);
+	ce_init_src(&gCe7, OFF_CE7_SRC, 2u, DIAG_MAX);
+	ce_init_dst(&gCe7, OFF_CE7_DST, 2u);
+	ce_dump("CE0", &gCe0);
+	ce_dump("CE1", &gCe1);
+	ce_dump("CE7", &gCe7);
+}
+
+/*
+ * One attempt: diag read of hi_interconnect_state, ath10k_pci_init_config (verified by read-back),
+ * ath10k_pci_wake_target_cpu, BMI_GET_TARGET_INFO. *bmi_silent = everything worked except that BMI never answered.
+ */
+static bool
+attempt(const char *how, char *res, size_t len, bool *bmi_silent)
+{
+	*bmi_silent = false;
+	uint32_t pcie_state = 0;
+	if (!diag_read32(HI_INTERCONNECT_STATE, &pcie_state)) {
+		ce_dump("CE7", &gCe7);
+		snprintf(res, len, "STEP 2b FAIL (%s): diag read of hi_interconnect_state (CE7 DMA) timed out", how);
+		return false;
+	}
+	A_LOG("%s: diag read hi_interconnect_state (target %08x = ce %08x): pcie_state at %08x", how, HI_INTERCONNECT_STATE,
+	    targ_to_ce(HI_INTERCONNECT_STATE), pcie_state);
+	if (pcie_state == 0 || pcie_state == 0xFFFFFFFFu) {
+		snprintf(res, len, "STEP 2b FAIL (%s): DMA works but hi_interconnect_state is %08x", how, pcie_state);
+		return false;
+	}
+
+	uint32_t pipe_cfg = 0, svc_map = 0, cfg_flags = 0, ealloc = 0, flag2 = 0;
+	bool ok = diag_read32(pcie_state + PCIE_STATE_PIPE_CFG, &pipe_cfg) &&
+	    diag_read32(pcie_state + PCIE_STATE_SVC_MAP, &svc_map) &&
+	    diag_read32(pcie_state + PCIE_STATE_CONFIG_FLAGS, &cfg_flags) &&
+	    diag_read32(HI_EARLY_ALLOC, &ealloc) &&
+	    diag_read32(HI_OPTION_FLAG2, &flag2);
+	A_LOG("%s: pipe_cfg %08x svc_map %08x config_flags %08x; hi_early_alloc %08x hi_option_flag2 %08x", how,
+	    pipe_cfg, svc_map, cfg_flags, ealloc, flag2);
+	if (!ok || pipe_cfg == 0 || svc_map == 0) {
+		snprintf(res, len, "STEP 2b FAIL (%s): target config pointers (pipe_cfg %08x svc_map %08x)%s", how, pipe_cfg,
+		    svc_map, ok ? "" : ", a diag read timed out");
+		return false;
+	}
+	ok = diag_write(pipe_cfg, kTargetCeConfig, sizeof(kTargetCeConfig)) &&
+	    diag_write(svc_map, kServiceMap, sizeof(kServiceMap)) &&
+	    diag_write32(pcie_state + PCIE_STATE_CONFIG_FLAGS, cfg_flags & ~PCIE_CONFIG_FLAG_ENABLE_L1) &&
+	    diag_write32(HI_EARLY_ALLOC, ealloc | (HI_EARLY_ALLOC_MAGIC << 16) | (HW3_IRAM_BANKS & 0xFu)) &&
+	    diag_write32(HI_OPTION_FLAG2, flag2 | HI_OPTION_EARLY_CFG_DONE);
+	uint32_t back[6] = { 0, 0, 0, 0, 0, 0 }, flag2_back = 0;
+	bool verified = ok && diag_read(pipe_cfg, back, sizeof(back)) && diag_read32(HI_OPTION_FLAG2, &flag2_back) &&
+	    memcmp(back, kTargetCeConfig[0], sizeof(back)) == 0 && (flag2_back & HI_OPTION_EARLY_CFG_DONE);
+	A_LOG("%s: target config written: %s (pipe 0 reads back %u/%u/%u/%u, hi_option_flag2 %08x)", how,
+	    verified ? "verified" : "NOT verified", back[0], back[1], back[2], back[3], flag2_back);
+	if (!verified) {
+		snprintf(res, len, "STEP 2b FAIL (%s): target config %s", how, ok ? "did not read back" : "diag write timed out");
+		return false;
+	}
+	bwr(Q_CORE_CTRL, brd(Q_CORE_CTRL) | Q_CORE_CTRL_CPU_INTR);
+
+	/* BMI_GET_TARGET_INFO (ath10k_bmi_get_target_info): 4-byte command, response { len, version, type }. */
+	uint32_t cmd = BMI_GET_TARGET_INFO, rsp[3] = { 0, 0, 0 }, rlen = sizeof(rsp);
+	if (!bmi_exchange(&cmd, sizeof(cmd), rsp, &rlen)) {
+		ce_dump("CE0", &gCe0);
+		ce_dump("CE1", &gCe1);
+		*bmi_silent = true;
+		snprintf(res, len, "STEP 2b FAIL (%s): no answer to BMI_GET_TARGET_INFO in 3 s (fw indicator %08x); DMA, diag "
+		    "and target config OK", how, brd(Q_FW_INDICATOR));
+		return false;
+	}
+	A_LOG("%s: BMI_GET_TARGET_INFO: %u bytes: len %u version %08x type %u", how, rlen, rsp[0], rsp[1], rsp[2]);
+	if (rlen < sizeof(rsp)) {
+		snprintf(res, len, "STEP 2b FAIL (%s): BMI_GET_TARGET_INFO answered %u bytes, expected 12", how, rlen);
+		return false;
+	}
+	snprintf(res, len, "%s (%s): BMI target version %08x type %u (hw3.2 = %08x); DMA, diag window, target config OK",
+	    rsp[1] == QCA6174_HW_3_2_VERSION ? "STEP 2b PASS" : "STEP 2b: unexpected target version", how, rsp[1], rsp[2],
+	    QCA6174_HW_3_2_VERSION);
+	return rsp[1] == QCA6174_HW_3_2_VERSION;
+}
+
+static bool
+run(char *res, size_t len)
+{
+	/* 1. The boot ROM's "initialized". After a plain power-on it has never appeared (2026-11-24: not in 10 s), so
+	 * this only waits 2 s and goes on either way. */
+	if (!q_wake()) {
+		snprintf(res, len, "STEP 2b FAIL: chip SoC did not wake (rtc_state %08x)", brd(Q_RTC_STATE));
+		return false;
+	}
+	uint32_t fwi = 0;
+	uint32_t t = wait_rom("power-on", 2000u, &fwi);
 	if (fwi == 0xFFFFFFFFu) {
 		snprintf(res, len, "%s", "STEP 2b FAIL: BAR0 reads all ones while waiting for the boot ROM");
 		return false;
@@ -524,8 +635,7 @@ run(char *res, size_t len)
 		snprintf(res, len, "STEP 2b FAIL: chip reports a crash (fw indicator %08x) before any host command", fwi);
 		return false;
 	}
-	bool rom_ready = (fwi & Q_FW_IND_INITIALIZED) != 0;
-	A_LOG("boot ROM %s after %u ms", rom_ready ? "initialized" : "NOT initialized", t);
+	A_LOG("boot ROM %s after %u ms", (fwi & Q_FW_IND_INITIALIZED) ? "initialized" : "not initialized (going on)", t);
 
 	/* 2. DMA block (below 4 GB: 32-bit descriptors), chip ASPM off, bus mastering on. */
 	IOPhysicalAddress phys = 0;
@@ -562,88 +672,31 @@ run(char *res, size_t len)
 	wr32(gConf, 0x04, (rd32(gConf, 0x04) & 0xFFFFu) | 0x6u);   /* chip: memory + bus master */
 	A_LOG("bus mastering on: rp command %08x, chip command %08x", rd32(gDbi, 0x04), rd32(gConf, 0x04));
 
-	/* 3. Copy engines, host side (pci_host_ce_config_wlan; fewer CE1 entries: one BMI response at a time). */
-	gCe0.base = Q_CE(0);
-	gCe1.base = Q_CE(1);
-	gCe7.base = Q_CE(7);
-	ce_quiet(&gCe0);
-	ce_quiet(&gCe1);
-	ce_quiet(&gCe7);
-	ce_init_src(&gCe0, OFF_CE0_SRC, 16u, BMI_REQ_MAX);
-	ce_init_dst(&gCe1, OFF_CE1_DST, 16u);
-	ce_init_src(&gCe7, OFF_CE7_SRC, 2u, DIAG_MAX);
-	ce_init_dst(&gCe7, OFF_CE7_DST, 2u);
-	ce_dump("CE0", &gCe0);
-	ce_dump("CE1", &gCe1);
-	ce_dump("CE7", &gCe7);
-
-	/* 4. First DMA, both directions: CE7 reads our descriptors and writes the answer into our buffer. */
-	uint32_t pcie_state = 0;
-	if (!diag_read32(HI_INTERCONNECT_STATE, &pcie_state)) {
-		ce_dump("CE7", &gCe7);
-		snprintf(res, len, "%s", "STEP 2b FAIL: diag read of hi_interconnect_state (first DMA, CE7) timed out");
-		return false;
-	}
-	A_LOG("diag read hi_interconnect_state (target %08x = ce %08x): pcie_state at %08x", HI_INTERCONNECT_STATE,
-	    targ_to_ce(HI_INTERCONNECT_STATE), pcie_state);
-	if (!rom_ready) {
-		snprintf(res, len, "STEP 2b PARTIAL: DMA works (pcie_state %08x), but the boot ROM never reported "
-		    "initialized in 10 s; BMI not tried", pcie_state);
-		return false;
-	}
-	if (pcie_state == 0 || pcie_state == 0xFFFFFFFFu) {
-		snprintf(res, len, "STEP 2b FAIL: DMA works but hi_interconnect_state is %08x", pcie_state);
-		return false;
+	/* 3. Rings, then try BMI straight away: the ROM may already be listening without having said so. */
+	init_rings();
+	bool silent = false;
+	if (attempt("no reset", res, len, &silent) || !silent) {
+		return strncmp(res, "STEP 2b PASS", 12) == 0;
 	}
 
-	/* 5. ath10k_pci_init_config, then ath10k_pci_wake_target_cpu. */
-	uint32_t pipe_cfg = 0, svc_map = 0, cfg_flags = 0, ealloc = 0, flag2 = 0;
-	bool ok = diag_read32(pcie_state + PCIE_STATE_PIPE_CFG, &pipe_cfg) &&
-	    diag_read32(pcie_state + PCIE_STATE_SVC_MAP, &svc_map) &&
-	    diag_read32(pcie_state + PCIE_STATE_CONFIG_FLAGS, &cfg_flags) &&
-	    diag_read32(HI_EARLY_ALLOC, &ealloc) &&
-	    diag_read32(HI_OPTION_FLAG2, &flag2);
-	A_LOG("pcie_state: pipe_cfg %08x svc_map %08x config_flags %08x; hi_early_alloc %08x hi_option_flag2 %08x",
-	    pipe_cfg, svc_map, cfg_flags, ealloc, flag2);
-	if (!ok || pipe_cfg == 0 || svc_map == 0) {
-		snprintf(res, len, "STEP 2b FAIL: target config pointers (pipe_cfg %08x svc_map %08x)%s", pipe_cfg, svc_map,
-		    ok ? "" : ", a diag read timed out");
+	/* 4. BMI silent: reset only the chip's CPU (ath10k_pci_warm_reset_cpu), not the PCIe core (cold reset) and not
+	 * the copy engines (ath10k warns that CE reset can hang the host). Then wait for "initialized", rings again,
+	 * and a second attempt. */
+	A_LOG("%s", "BMI silent: CPU warm reset (FW_INDICATOR = 0, SOC_RESET_CONTROL |= CPU_WARM_RST)");
+	bwr(Q_FW_INDICATOR, 0u);
+	uint32_t rc = brd(Q_SOC_RESET_CONTROL);
+	bwr(Q_SOC_RESET_CONTROL, rc | Q_CPU_WARM_RST);
+	A_LOG("reset_control %08x -> %08x", rc, brd(Q_SOC_RESET_CONTROL));
+	t = wait_rom("after CPU warm reset", 3000u, &fwi);
+	A_LOG("boot ROM %s %u ms after the CPU warm reset", (fwi != 0xFFFFFFFFu && (fwi & Q_FW_IND_INITIALIZED)) ?
+	    "initialized" : "NOT initialized", t);
+	if (fwi == 0xFFFFFFFFu || (fwi & Q_FW_IND_EVENT_PENDING)) {
+		snprintf(res, len, "STEP 2b FAIL: after the CPU warm reset the fw indicator is %08x (%s)", fwi,
+		    fwi == 0xFFFFFFFFu ? "reads all ones" : "chip reports a crash");
 		return false;
 	}
-	ok = diag_write(pipe_cfg, kTargetCeConfig, sizeof(kTargetCeConfig)) &&
-	    diag_write(svc_map, kServiceMap, sizeof(kServiceMap)) &&
-	    diag_write32(pcie_state + PCIE_STATE_CONFIG_FLAGS, cfg_flags & ~PCIE_CONFIG_FLAG_ENABLE_L1) &&
-	    diag_write32(HI_EARLY_ALLOC, ealloc | (HI_EARLY_ALLOC_MAGIC << 16) | (HW3_IRAM_BANKS & 0xFu)) &&
-	    diag_write32(HI_OPTION_FLAG2, flag2 | HI_OPTION_EARLY_CFG_DONE);
-	uint32_t back[6] = { 0, 0, 0, 0, 0, 0 }, flag2_back = 0;
-	bool verified = ok && diag_read(pipe_cfg, back, sizeof(back)) && diag_read32(HI_OPTION_FLAG2, &flag2_back) &&
-	    memcmp(back, kTargetCeConfig[0], sizeof(back)) == 0 && (flag2_back & HI_OPTION_EARLY_CFG_DONE);
-	A_LOG("target config written: %s (pipe 0 reads back %u/%u/%u/%u, hi_option_flag2 %08x)", verified ? "verified" : "NOT verified",
-	    back[0], back[1], back[2], back[3], flag2_back);
-	if (!verified) {
-		snprintf(res, len, "STEP 2b FAIL: target config %s", ok ? "did not read back" : "diag write timed out");
-		return false;
-	}
-	bwr(Q_CORE_CTRL, brd(Q_CORE_CTRL) | Q_CORE_CTRL_CPU_INTR);
-
-	/* 6. BMI_GET_TARGET_INFO (ath10k_bmi_get_target_info): 4-byte command, response { len, version, type }. */
-	uint32_t cmd = BMI_GET_TARGET_INFO, rsp[3] = { 0, 0, 0 }, rlen = sizeof(rsp);
-	if (!bmi_exchange(&cmd, sizeof(cmd), rsp, &rlen)) {
-		ce_dump("CE0", &gCe0);
-		ce_dump("CE1", &gCe1);
-		snprintf(res, len, "STEP 2b FAIL: no answer to BMI_GET_TARGET_INFO in 3 s (fw indicator %08x); DMA, diag and "
-		    "target config OK", brd(Q_FW_INDICATOR));
-		return false;
-	}
-	A_LOG("BMI_GET_TARGET_INFO: %u bytes: len %u version %08x type %u", rlen, rsp[0], rsp[1], rsp[2]);
-	if (rlen < sizeof(rsp)) {
-		snprintf(res, len, "STEP 2b FAIL: BMI_GET_TARGET_INFO answered %u bytes, expected 12", rlen);
-		return false;
-	}
-	snprintf(res, len, "%s: BMI target version %08x type %u (hw3.2 = %08x); DMA, diag window, target config OK",
-	    rsp[1] == QCA6174_HW_3_2_VERSION ? "STEP 2b PASS" : "STEP 2b: unexpected target version", rsp[1], rsp[2],
-	    QCA6174_HW_3_2_VERSION);
-	return rsp[1] == QCA6174_HW_3_2_VERSION;
+	init_rings();
+	return attempt("after CPU warm reset", res, len, &silent);
 }
 
 extern "C" bool

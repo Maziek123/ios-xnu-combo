@@ -63,7 +63,7 @@ its result every 60 s so the line survives in ramoops: `grep -a 'OP2 WIFI' op2-l
 | probe | 1 | Read-only: logs the chip's pins, PMIC supplies, PCIe clocks and power domain. |
 | **1** power + PCIe link | 2 | **Passes on the phone.** Chip power (bt_vreg, L30, bootstrap, WLAN_EN), the controller's supplies, clocks and TrustZone secure config, the 20 nm PHY and link training: the chip answers as `168c:003e`, class/rev `02800032`, link x1 Gen1. |
 | **2a** chip registers | 2 | **Passes on the phone.** BAR0 (2 MB, on a 2 MB boundary at `0xf8a00000`), SoC wake, chip ID `00342aff` (rev 10 = hw3.2), readable about 80 ms after WLAN_EN; no reset needed. |
-| **2b** DMA + boot loader | 3 | Written, not yet run on the phone: the copy engines (CE0/CE1 for boot-loader messages, CE7 as a window into the chip's memory), the target-side configuration, and the first boot-loader (BMI) command, `GET_TARGET_INFO`. Passes when the chip answers version `05030000`. |
+| **2b** DMA + boot loader | 3 | DMA **works on the phone**; the boot-loader answer is next: the copy engines (CE0/CE1 for boot-loader messages, CE7 as a window into the chip's memory), the target-side configuration, and the first boot-loader (BMI) command, `GET_TARGET_INFO`. Passes when the chip answers version `05030000`. |
 | **2c** firmware | — | Next: board data and firmware over BMI, then the firmware's ready message. Needs the firmware files, which are kept out of this public repository. |
 
 Scanning, connecting, a network interface and Bluetooth come after the firmware boots.
@@ -77,7 +77,8 @@ Scanning, connecting, a network interface and Bluetooth come after the firmware 
 | 3 | Step 2a (`5ef26ed`) | FAIL: the chip's SoC never woke (`rtc_state 00000000`) | BAR0 sat at `0xf8900000`, not aligned to its 2 MB size; the chip decoded it at `0xf8800000`, so every access landed 1 MB off. |
 | 4 | BAR0 on a 2 MB boundary, checked by reading it back (`423f271`) | The SoC woke in 50 µs, but the chip ID and firmware indicator read `00000000` | Read too early: ath10k once had the same symptom (the ID reads 0 until the chip has initialised). |
 | 5 | Poll for up to 5 s, cold reset only as a fallback (`9290d11`) | **PASS**: chip ID `00342aff` (hw3.2), valid 83 ms after WLAN_EN, no reset needed; the firmware indicator stayed 0 | Register access works, and ath10k's cold reset, its riskiest step, isn't needed. |
-| 6 | Step 2b, `wifi=3` (`20094ef`) | Not run yet | The first DMA. So far only checked against a simulated copy engine (normal, boot ROM never ready, boot loader silent). |
+| 6 | Step 2b, `wifi=3` (`20094ef`) | **First DMA works**: the chip read its own memory through copy engine 7 into phone RAM (`pcie_state at 00401ee0`), no crash. PARTIAL: the boot ROM never reported "initialized" in 10 s, so BMI wasn't tried | After a plain power-on the ROM doesn't raise that flag. The chip's copy engines see their own memory at `0xf8a00000`, the BAR0 address; our DMA block (`39e8d000`) is well clear of it. |
+| 7 | Try BMI without waiting; if it stays silent, reset only the chip's CPU and try again | Not run yet | Checked against a simulated chip, which also caught a bug: setting the rings up twice could have let the chip write to physical address 0. |
 
 #### Testing a step
 
