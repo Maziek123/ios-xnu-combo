@@ -9,8 +9,10 @@
  *   0  (default) nothing runs
  *   1  read-only probe: log GPIO / PMIC / clock / power-domain states; writes nothing
  *   2  bring-up: power + clocks + PHY + link training + config read (step 1), then step 2a: give BAR0 an
- *      address, enable memory decoding (no bus mastering: the chip cannot DMA yet), wake the chip's SoC
- *      and read its chip ID and firmware indicator (ath10k pci.c / hw.c qca6174_regs)
+ *      address, enable memory decoding (no bus mastering: the chip cannot DMA yet), wake the chip's SoC,
+ *      wait up to 5 s for it to initialise (the chip ID reads 0 until then), and read its chip ID and
+ *      firmware indicator (ath10k pci.c / hw.c qca6174_regs). Only if the ID is still 0: the ath10k cold
+ *      reset (SOC_GLOBAL_RESET) and a 3 s wait for the boot ROM's "initialized"
  *
  * Runs in its own kernel thread 120 s after the framebuffer starts (RPM is up by then, the UI is running),
  * and repeats a one-line summary every 60 s so it survives in the ramoops ring.
@@ -49,13 +51,21 @@ extern "C" void op2_wifi_start(void);   /* called from op2_threaddump_start (osf
 #define W_BARS_PHYS       0xf8900000ULL   /* "bars": 7 MB memory window, passed to PCIe untranslated */
 #define W_BARS_SIZE       0x700000ULL
 
-/* ---- QCA6174 BAR0 (ath10k hw.c qca6174_regs, hw.h) ---- */
+/* ---- QCA6174 BAR0 (ath10k hw.c qca6174_regs, hw.h, pci.c) ---- */
 #define Q_RTC_SOC_BASE      0x00000800
-#define Q_SOC_CHIP_ID       (Q_RTC_SOC_BASE + 0xf0)
+#define Q_SOC_RESET_CONTROL (Q_RTC_SOC_BASE + 0x00)        /* read-only here (warm reset bits: step 2b) */
+#define Q_SOC_LF_TIMER0     (Q_RTC_SOC_BASE + 0x50)
+#define Q_SOC_CHIP_ID       (Q_RTC_SOC_BASE + 0xf0)        /* 0 until the chip has initialised */
 #define Q_PCIE_LOCAL_BASE   0x00080000
 #define Q_RTC_STATE         (Q_PCIE_LOCAL_BASE + 0x0000)   /* bits 2:0 == 3: SoC awake */
 #define Q_SOC_WAKE          (Q_PCIE_LOCAL_BASE + 0x0004)   /* 1 = request wake, 0 = release */
-#define Q_FW_INDICATOR      0x0003a028                     /* 0 until firmware runs */
+#define Q_SOC_GLOBAL_RESET  (Q_PCIE_LOCAL_BASE + 0x0008)   /* bit 0: whole chip, PCIe core included, in reset */
+#define Q_SOC_CORE_BASE     0x0003a000
+#define Q_PCIE_INTR_ENABLE  (Q_SOC_CORE_BASE + 0x08)
+#define Q_PCIE_INTR_CAUSE   (Q_SOC_CORE_BASE + 0x0c)
+#define Q_FW_INDICATOR      (Q_SOC_CORE_BASE + 0x28)       /* 0x3a028 */
+#define Q_FW_IND_EVENT_PENDING 0x1u                        /* target crashed */
+#define Q_FW_IND_INITIALIZED   0x2u                        /* boot ROM / firmware ready */
 #define Q_HW32_CHIP_REV     10                             /* QCA6174_HW_3_2_CHIP_ID_REV */
 
 /* ---- GCC (clock-gcc-8994.c) ---- */
@@ -341,6 +351,156 @@ static const uint32_t kPhyInit[][2] = {
 /* ---------------------------------------------------------------------------------------------------- */
 /* step 2a: BAR0 + chip registers (link already up, iATU region 0 = config window of 01:00.0)           */
 
+static uint64_t gPowerOnAbs;   /* when WLAN_EN went high */
+
+static uint32_t
+ms_since_power_on(void)
+{
+	uint64_t now = 0, ns = 0;
+	clock_get_uptime(&now);
+	absolutetime_to_nanoseconds(now - gPowerOnAbs, &ns);
+	return (uint32_t)(ns / 1000000u);
+}
+
+/* RC side only (ELBI/DBI registers): safe to read whatever the link is doing. */
+static bool
+rc_link_up(void)
+{
+	return (rd(gDbi, ELBI_SYS_STTS) & XMLH_LINK_UP) && (rd(gDbi, DBI_LINK_STATUS) & (1u << 29));
+}
+
+static bool
+wait_rc_link(uint32_t ms)
+{
+	for (uint32_t i = 0; i < ms && !rc_link_up(); i++) {
+		IOSleep(1);
+	}
+	return rc_link_up();
+}
+
+/* Ask the SoC to stay awake; wait for RTC_STATE "on" (ath10k_pci_wake_wait: 30 ms limit). */
+static bool
+q_wake(uint32_t *rtc)
+{
+	wr(gBar0, Q_SOC_WAKE, 1u);
+	uint32_t st = 0;
+	for (int us = 0; us < 30000; us += 50) {
+		st = rd(gBar0, Q_RTC_STATE);
+		if ((st & 7u) == 3u) {
+			break;
+		}
+		IODelay(50);
+	}
+	*rtc = st;
+	return (st & 7u) == 3u;
+}
+
+/* Registers ath10k / qcacld read anyway; reading has no side effects. */
+static void
+q_snapshot(const char *when)
+{
+	W_LOG("%s: rtc_state %08x soc_wake %08x global_reset %08x | reset_ctl %08x lf_timer0 %08x chip_id %08x | "
+	    "fw_ind %08x intr_en %08x intr_cause %08x", when, rd(gBar0, Q_RTC_STATE), rd(gBar0, Q_SOC_WAKE),
+	    rd(gBar0, Q_SOC_GLOBAL_RESET), rd(gBar0, Q_SOC_RESET_CONTROL), rd(gBar0, Q_SOC_LF_TIMER0),
+	    rd(gBar0, Q_SOC_CHIP_ID), rd(gBar0, Q_FW_INDICATOR), rd(gBar0, Q_PCIE_INTR_ENABLE), rd(gBar0, Q_PCIE_INTR_CAUSE));
+}
+
+static inline bool
+chip_id_valid(uint32_t c)
+{
+	return c != 0u && c != 0xFFFFFFFFu;
+}
+
+static inline bool
+fw_ind_done(uint32_t f)
+{
+	return f != 0xFFFFFFFFu && (f & (Q_FW_IND_INITIALIZED | Q_FW_IND_EVENT_PENDING)) != 0;
+}
+
+/*
+ * Hold the SoC awake and poll every 10 ms until the chip has initialised, logging each change of chip ID /
+ * FW_INDICATOR. ath10k reads SOC_CHIP_ID only after ath10k_pci_wait_for_target_init (10 ms polls, 3 s);
+ * read too early, "the device doesn't init quickly enough" and the ID reads 0 (ath10k commit "reset chip
+ * before reading chip_id in probe"). fw_init: stop when FW_INDICATOR reports initialized (after a reset);
+ * otherwise stop 500 ms after the chip ID turns valid, or sooner if FW_INDICATOR reports first.
+ * Returns the ms at which the chip ID was first valid (or the ms waited, if it never was).
+ */
+static uint32_t
+q_wait_init(const char *tag, uint32_t max_ms, bool fw_init, uint32_t *chip, uint32_t *fwi)
+{
+	uint32_t c = 0xDEADBEEFu, f = 0xDEADBEEFu, rtc = 0, t = 0, valid_at = 0;
+	bool valid = false;
+	for (;;) {
+		bool awake = q_wake(&rtc);
+		uint32_t nc = rd(gBar0, Q_SOC_CHIP_ID), nf = rd(gBar0, Q_FW_INDICATOR);
+		if (nc != c || nf != f || !awake) {
+			W_LOG("%s %4u ms (%u ms after WLAN_EN): chip id %08x fw indicator %08x rtc_state %08x%s", tag, t,
+			    ms_since_power_on(), nc, nf, rtc, awake ? "" : " NOT AWAKE");
+			c = nc;
+			f = nf;
+		}
+		if (!valid && chip_id_valid(c)) {
+			valid = true;
+			valid_at = t;
+		}
+		bool done = fw_init ? fw_ind_done(f) : (valid && (fw_ind_done(f) || t - valid_at >= 500u));
+		if (done || t >= max_ms) {
+			break;
+		}
+		IOSleep(10);
+		t += 10;
+	}
+	*chip = rd(gBar0, Q_SOC_CHIP_ID);   /* still awake: final values */
+	*fwi = rd(gBar0, Q_FW_INDICATOR);
+	return valid ? valid_at : t;
+}
+
+/*
+ * ath10k_pci_cold_reset: SOC_GLOBAL_RESET bit 0 resets the whole chip, its PCIe core included; no PCIe
+ * access for 20 ms after setting or clearing it. qcacld-2.0 (hif_pci_device_reset): never write it without
+ * WAKE_V, "the Target may scribble over Host memory" (bus mastering is off here anyway). Added here: before
+ * each BAR access, check the link from the RC side and the endpoint's config space (BAR0, memory decoding),
+ * and rewrite those if the reset cleared them.
+ */
+static bool
+q_cold_reset(uint32_t bar_lo, bool bar64, char *why, size_t n)
+{
+	uint32_t rtc = 0;
+	if (!q_wake(&rtc)) {
+		snprintf(why, n, "SoC not awake (rtc_state %08x)", rtc);
+		return false;
+	}
+	uint32_t v = rd(gBar0, Q_SOC_GLOBAL_RESET);
+	W_LOG("cold reset: global_reset %08x, setting bit 0", v);
+	wr(gBar0, Q_SOC_GLOBAL_RESET, v | 1u);
+	IOSleep(20);
+	for (int phase = 0; phase < 2; phase++) {
+		const char *what = phase == 0 ? "in reset" : "released";
+		bool up = wait_rc_link(200);
+		uint32_t id = up ? rd(gConf, 0x0) : 0xFFFFFFFFu, bar = up ? rd(gConf, 0x10) : 0u, cmd = up ? rd(gConf, 0x04) : 0u;
+		W_LOG("cold reset, %s: rc link %s (elbi %08x lnksta %08x ltssm %08x), ep id %08x bar0 %08x command %08x", what,
+		    up ? "up" : "DOWN", rd(gDbi, ELBI_SYS_STTS), rd(gDbi, DBI_LINK_STATUS), rd(gParf, PARF_LTSSM), id, bar, cmd);
+		if (!up || id != 0x003E168Cu) {
+			snprintf(why, n, "%s: link %s, ep id %08x", what, up ? "up" : "down", id);
+			return false;
+		}
+		if ((bar & ~0xFu) != (bar_lo & ~0xFu) || !(cmd & 2u)) {
+			wr(gConf, 0x10, bar_lo);
+			if (bar64) {
+				wr(gConf, 0x14, 0u);
+			}
+			wr(gConf, 0x04, (cmd & ~0x7u) | 0x2u);
+			W_LOG("cold reset, %s: config space was cleared; rewritten: bar0 %08x command %08x", what,
+			    rd(gConf, 0x10), rd(gConf, 0x04));
+		}
+		if (phase == 0) {
+			wr(gBar0, Q_SOC_GLOBAL_RESET, v & ~1u);
+			IOSleep(20);
+		}
+	}
+	return true;
+}
+
 static void
 step2a(void)
 {
@@ -395,28 +555,50 @@ step2a(void)
 		return;
 	}
 
-	/* Wake the chip's SoC (ath10k_pci_wake: 30 ms limit), read, release. */
-	wr(gBar0, Q_SOC_WAKE, 1u);
-	uint32_t st = 0;
-	int us = 0;
-	for (; us < 30000; us += 50) {
-		st = rd(gBar0, Q_RTC_STATE);
-		if ((st & 7u) == 3u) {
-			break;
-		}
-		IODelay(50);
-	}
-	if ((st & 7u) != 3u) {
+	/* Wake the chip's SoC, then wait (no reset) until it has initialised itself. */
+	uint32_t rtc = 0;
+	if (!q_wake(&rtc)) {
 		wr(gBar0, Q_SOC_WAKE, 0u);
-		snprintf(line, sizeof(line), "STEP 2a FAIL: chip SoC did not wake in 30 ms (rtc_state %08x)", st);
+		snprintf(line, sizeof(line), "STEP 2a FAIL: chip SoC did not wake in 30 ms (rtc_state %08x)", rtc);
 		summary(line);
 		return;
 	}
-	uint32_t chip = rd(gBar0, Q_SOC_CHIP_ID), fwi = rd(gBar0, Q_FW_INDICATOR);
+	W_LOG("SoC awake %u ms after WLAN_EN", ms_since_power_on());
+	q_snapshot("BAR0 regs");
+	uint32_t chip = 0, fwi = 0;
+	uint32_t t_valid = q_wait_init("wait", 5000, false, &chip, &fwi);
+	const char *how = "no reset";
+	if (chip == 0xFFFFFFFFu) {
+		snprintf(line, sizeof(line), "STEP 2a FAIL: BAR0 reads all ones after the wait (link %s): no reset tried",
+		    rc_link_up() ? "up" : "down");
+		summary(line);
+		return;
+	}
+	if (!chip_id_valid(chip)) {
+		/* Fallback, the ath10k path: cold reset, then wait for the boot ROM's "initialized" (3 s). */
+		q_snapshot("BAR0 regs after 5 s, before cold reset");
+		char why[120];
+		if (!q_cold_reset((uint32_t)addr | (mask & 0xFu), (mask & 0x6u) == 0x4u, why, sizeof(why))) {
+			snprintf(line, sizeof(line), "STEP 2a FAIL: chip id %08x fw indicator %08x after 5 s; cold reset: %s",
+			    chip, fwi, why);
+			summary(line);
+			return;   /* chip may be held in reset or off the bus: no further BAR access */
+		}
+		t_valid = q_wait_init("after cold reset", 3000, true, &chip, &fwi);
+		q_snapshot("BAR0 regs after cold reset");
+		how = "after cold reset";
+	}
 	wr(gBar0, Q_SOC_WAKE, 0u);
+
 	uint32_t rev = (chip >> 8) & 0xFu;
-	snprintf(line, sizeof(line), "%s: chip id %08x (rev %u, hw3.2 = %u), fw indicator %08x, awake after %d us",
-	    rev == Q_HW32_CHIP_REV ? "STEP 2a PASS" : "STEP 2a: unexpected chip rev", chip, rev, Q_HW32_CHIP_REV, fwi, us);
+	if (!chip_id_valid(chip)) {
+		snprintf(line, sizeof(line), "STEP 2a FAIL: chip id %08x fw indicator %08x after 5 s wait + cold reset + 3 s wait%s",
+		    chip, fwi, fwi == 0xFFFFFFFFu ? " (reads all ones)" : (fwi & Q_FW_IND_EVENT_PENDING) ? " (target crashed)" : "");
+	} else {
+		snprintf(line, sizeof(line), "%s: chip id %08x (rev %u, hw3.2 = %u), fw indicator %08x, valid at %u ms (%s)",
+		    rev == Q_HW32_CHIP_REV ? "STEP 2a PASS" : "STEP 2a: unexpected chip rev", chip, rev, Q_HW32_CHIP_REV, fwi,
+		    t_valid, how);
+	}
 	summary(line);
 }
 
@@ -463,6 +645,7 @@ bringup(void)
 	pin_out(PIN_BOOTSTRAP, 7, true);
 	IOSleep(10);
 	pin_out(PIN_WLAN_EN, 7, true);
+	clock_get_uptime(&gPowerOnAbs);
 	IOSleep(10);
 	W_LOG("%s", "chip power on: bt_vreg, L30, bootstrap, WLAN_EN");
 
