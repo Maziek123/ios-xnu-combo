@@ -15,6 +15,8 @@
  *      reset (SOC_GLOBAL_RESET) and a 3 s wait for the boot ROM's "initialized"
  *   3  as 2, then step 2b (OP2Ath10k.cpp): DMA through the copy engines, the diagnostic window into the
  *      chip's memory, the target-side config, and the first boot-loader (BMI) command; no firmware yet
+ *   4  as 3, then step 2c (OP2Ath10k.cpp): board data, OTP and firmware download, BMI_DONE, and the firmware's
+ *      HTC ready message (firmware embedded from the gitignored firmware/qca6174/ by tools/gen-wifi-fw.py)
  *
  * Runs in its own kernel thread 120 s after the framebuffer starts (RPM is up by then, the UI is running),
  * and repeats a one-line summary every 60 s so it survives in the ramoops ring.
@@ -622,7 +624,7 @@ static void
 step2b(void)
 {
 	char line[200];
-	struct op2_ath10k_bus bus = { gBar0, gConf, gDbi, gPowerOnAbs, cold_reset_for_2b };
+	struct op2_ath10k_bus bus = { gBar0, gConf, gDbi, gPowerOnAbs, cold_reset_for_2b, gMode >= 4 };
 	(void)op2_ath10k_step2b(&bus, line, sizeof(line));
 	summary(line);
 }
@@ -810,7 +812,8 @@ wifi_thread(__unused void *param, __unused wait_result_t wr_)
 	if (!gGcc || !gTlmm || !gParf || !gPhy || !gDbi || !gConf) {
 		summary("FAIL: ml_io_map");
 	} else {
-		W_LOG("mode %u (%s)", gMode, gMode == 1 ? "read-only probe" : gMode == 2 ? "bring-up" : "bring-up + step 2b (DMA, BMI)");
+		W_LOG("mode %u (%s)", gMode, gMode == 1 ? "read-only probe" : gMode == 2 ? "bring-up" : gMode == 3 ?
+		    "bring-up + step 2b (DMA, BMI)" : "bring-up + 2b + step 2c (firmware boot)");
 		dump_all("before");
 		if (gMode >= 2) {
 			bringup();

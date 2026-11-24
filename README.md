@@ -64,7 +64,7 @@ its result every 60 s so the line survives in ramoops: `grep -a 'OP2 WIFI' op2-l
 | **1** power + PCIe link | 2 | **Passes on the phone.** Chip power (bt_vreg, L30, bootstrap, WLAN_EN), the controller's supplies, clocks and TrustZone secure config, the 20 nm PHY and link training: the chip answers as `168c:003e`, class/rev `02800032`, link x1 Gen1. |
 | **2a** chip registers | 2 | **Passes on the phone.** BAR0 (2 MB, on a 2 MB boundary at `0xf8a00000`), SoC wake, chip ID `00342aff` (rev 10 = hw3.2), readable about 80 ms after WLAN_EN; no reset needed. |
 | **2b** DMA + boot loader | 3 | **Passes on the phone.** The copy engines (CE0/CE1 for boot-loader messages, CE7 as a window into the chip's memory), the target-side configuration and the first boot-loader (BMI) command, `GET_TARGET_INFO`: the chip answers version `05030000` (hw3.2) with no reset. |
-| **2c** firmware | — | Next: board data and firmware over BMI, then the firmware's ready message. Needs the firmware files, which are kept out of this public repository. |
+| **2c** firmware boot | 4 | Written, not yet run on the phone: board data, the OTP image and the firmware over BMI and the diagnostic window, `BMI_DONE`, then the firmware's HTC "ready" message. Uses ath10k's `firmware-6.bin` and the phone's own `bdwlan30.bin`, which stay out of this repository ([below](#wi-fi-firmware-files)). |
 
 Scanning, connecting, a network interface and Bluetooth come after the firmware boots.
 
@@ -80,6 +80,7 @@ Scanning, connecting, a network interface and Bluetooth come after the firmware 
 | 6 | Step 2b, `wifi=3` (`20094ef`) | **First DMA works**: the chip read its own memory through copy engine 7 into phone RAM (`pcie_state at 00401ee0`), no crash. PARTIAL: the boot ROM never reported "initialized" in 10 s, so BMI wasn't tried | After a plain power-on the ROM doesn't raise that flag. The chip's copy engines see their own memory at `0xf8a00000`, the BAR0 address; our DMA block (`39e8d000`) is well clear of it. |
 | 7 | Try BMI without waiting; if it stays silent, reset only the chip's CPU and try again (`123f043`) | The chip's memory reads and writes all work, and the configuration read back correctly. But BMI got no answer, before or after the CPU reset: the chip never set up its side of the boot-loader channels (copy engine 0 has no receive ring, copy engine 1 no send ring) and never reported "initialized" | The boot ROM starts (it changes its reset-control register and has its tables in memory) but stops before announcing itself. Both reference drivers keep writing the chip's interrupt-enable register while they wait; we never did. |
 | 8 | Wait the way ath10k does (interrupt enable rewritten every 10 ms, with the chip's interrupt-disable bit set so nothing reaches the phone); register dumps; cold reset only if BMI stays silent (`c13dd84`) | **PASS** (no reset): the ROM reported "initialized" 440 ms into the wait (1.1 s after WLAN_EN), and BMI answered version `05030000` (hw3.2), type 8 | Most likely the ROM waits for the host to enable its interrupt: without those writes it stayed silent for 10 s. No reset of any kind is needed. |
+| 9 | Step 2c, `wifi=4`: firmware download and boot; all DMA memory now non-cacheable, so several receive buffers can be outstanding | Not run yet | Checked against a simulated chip with the real `firmware-6.bin`: board data, OTP stream and all six firmware segments arrive byte for byte; firmware crash and silence are reported. |
 
 #### Testing a step
 
@@ -93,6 +94,20 @@ grep -a 'OP2 WIFI' op2-last-boot.log | grep -v 'RESULT (repeat)'
 ```
 
 The `RESULT:` line is the verdict; the lines before it show where a failing step stopped.
+
+#### Wi-Fi firmware files
+
+Step 2c (`wifi=4`) needs two files in `firmware/qca6174/` of the checkout you build from. That folder is in
+`.gitignore`: the firmware is Qualcomm's and is not redistributed here.
+
+* `firmware-6.bin`: ath10k's firmware for this chip, from linux-firmware (`ath10k/QCA6174/hw3.0/firmware-6.bin`,
+  version `WLAN.RM.4.4.1`). Most Linux PCs already have it in `/lib/firmware/ath10k/QCA6174/hw3.0/`; if it is
+  compressed there, unpack it: `zstd -d firmware-6.bin.zst -o firmware-6.bin` or `xz -dk firmware-6.bin.xz`.
+* `bdwlan30.bin`: the phone's own board data (its calibration), 8124 bytes, from the phone's Android firmware.
+
+`tools/build-xnu.sh` runs `tools/gen-wifi-fw.py`, which embeds both in the kernel and prints
+`[wifi-fw] embedding firmware WLAN.RM.4.4.1-...`. Without them the kernel still builds, and step 2c reports that no
+firmware is built in.
 
 ---
 

@@ -1,0 +1,3 @@
+# Wi-Fi firmware (Qualcomm, not redistributed in this repository) and the header generated from it
+/firmware/qca6174/
+/xnu/xnu-4903.270.47/iokit/Kernel/arm/op2_wifi_fw.h

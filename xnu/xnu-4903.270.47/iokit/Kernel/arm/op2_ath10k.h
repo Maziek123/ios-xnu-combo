@@ -1,6 +1,7 @@
 /*
  * OP2Ath10k.cpp: Wi-Fi step 2b (QCA6174 copy engines, diagnostic window, first BMI command).
- * Called by OP2Wifi.cpp with boot-arg wifi=3 once step 2a has read a valid chip ID.
+ * Called by OP2Wifi.cpp with boot-arg wifi=3 (wifi=4: and step 2c, the firmware boot) once step 2a has read a
+ * valid chip ID.
  * Include after <IOKit/IOLib.h>.
  */
 
@@ -15,6 +16,7 @@ struct op2_ath10k_bus {
 	/* ath10k cold reset (SOC_GLOBAL_RESET) with the link and config space checked around it (OP2Wifi.cpp);
 	 * false = the chip may be off the bus: no further access to it */
 	bool (*cold_reset)(char *why, size_t len);
+	bool boot_firmware;        /* wifi=4: after a 2b pass, step 2c (firmware download, BMI_DONE, HTC ready) */
 };
 
 /* Runs step 2b; writes a one-line result ("STEP 2b PASS: ..." / "STEP 2b FAIL: ...") into result. */
