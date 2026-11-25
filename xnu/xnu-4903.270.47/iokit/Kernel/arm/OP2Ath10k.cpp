@@ -3006,7 +3006,9 @@ extern "C" void read_random(void *buffer, unsigned int numBytes);
 #define WMI_MODE_11B                      2u
 #define HTT_H2T_MSG_TYPE_TX_FRM           1u
 #define HTT_T2H_MSG_TYPE_PEER_MAP         3u
-#define HTT_T2H_MSG_TYPE_TX_COMPL_IND     7u
+#define HTT_T2H_MSG_TYPE_PEER_UNMAP       4u
+#define HTT_T2H_MSG_TYPE_TX_COMPL_IND     7u      /* data frames */
+#define HTT_T2H_MSG_TYPE_MGMT_TX_COMPL_IND 0xeu   /* management frames sent as TX_FRM (HTT >= 3) */
 #define HTT_T2H_MSG_TYPE_SEC_IND          0xbu
 #define HTT_T2H_MSG_TYPE_RX_IN_ORD_PADDR_IND 0x12u
 #define HTT_TX_FLAGS0_MAC_HDR_PRESENT     0x01u
@@ -3698,6 +3700,18 @@ on_htt_msg(void)
 				gTxStatus = gRx[1] & 7u;
 			}
 		}
+		return;
+	case HTT_T2H_MSG_TYPE_MGMT_TX_COMPL_IND:
+		/* htt_mgmt_tx_completion: rsvd, rsvd, flags, desc_id (le32 at 4), status (le32 at 8: 0 ok, 1 retried out,
+		 * 2 dropped); this firmware sends the 12-byte form */
+		gTxCompl++;
+		if (gRxLen >= 12u && le32(gRx + 4) == gTxWant) {
+			uint32_t s = le32(gRx + 8);
+			gTxDone = true;
+			gTxStatus = s == 0 ? 0u : s == 1u ? 2u : 1u;   /* as TX_COMPL_IND: acknowledged, no ack, discarded */
+		}
+		return;
+	case HTT_T2H_MSG_TYPE_PEER_UNMAP:
 		return;
 	case HTT_T2H_MSG_TYPE_SEC_IND:
 		gSecInd++;

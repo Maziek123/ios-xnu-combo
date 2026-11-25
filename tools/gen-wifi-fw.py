@@ -75,7 +75,14 @@ def network():
         print("[wifi-net] no firmware/qca6174/wifi-network.txt: Wi-Fi step 5 (wifi=7) will report it")
         return 0
     with open(path, "rb") as f:
-        lines = [l[:-1] if l.endswith(b"\r") else l for l in f.read().split(b"\n")]
+        raw = f.read()
+    if raw.startswith(b"{\\rtf"):
+        sys.stderr.write("[wifi-net] %s is rich text (RTF); save it as plain text, e.g.\n"
+                         "  printf 'NAME\\nPASSWORD\\n' > firmware/qca6174/wifi-network.txt\n" % path)
+        return 1
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raw = raw[3:]   # a UTF-8 byte order mark some editors add
+    lines = [l[:-1] if l.endswith(b"\r") else l for l in raw.split(b"\n")]
     ssid = lines[0] if lines else b""
     pw = lines[1] if len(lines) > 1 else b""
     if not 1 <= len(ssid) <= 32:
@@ -101,7 +108,7 @@ def network():
     ])
     write_if_changed(NET_OUT, text)
     name = "".join(chr(c) if 32 <= c < 127 else "?" for c in ssid)
-    print("[wifi-net] network %s (%s) for Wi-Fi steps 5 and 6" % (name, kind))
+    print("[wifi-net] network %s (%d bytes, %s) for Wi-Fi steps 5 and 6" % (name, len(ssid), kind))
     return 0
 
 
