@@ -1424,6 +1424,8 @@ static const struct rx_pipe gRxPipes[2] = {
 static uint8_t gEpWmi = 0xFFu, gEpHtt = 0xFFu;
 static uint32_t gWmiCredits, gCreditReports, gOtherMsgs, gDebugMsgs;
 static bool gFwDown;                /* fw_down() saw a crash or a dead link */
+static uint8_t gMac[6];             /* from WMI ready (step 3), for step 4's interface */
+static uint32_t gEepromRd;          /* from WMI service ready: the board's regulatory domain */
 static uint8_t gHtcSeq[HTC_EP_COUNT];
 static uint8_t gRx[HTC_RX_SIZE];   /* the message htc_rx_one delivered: payload without header and trailer */
 static uint32_t gRxLen;
@@ -2153,6 +2155,8 @@ run3(char *res, size_t len)
 	}
 	uint8_t mac[6];
 	memcpy(mac, rdy + 24, sizeof(mac));
+	memcpy(gMac, mac, sizeof(mac));
+	gEepromRd = g[0];
 	uint32_t status = le32(rdy + 32);
 	A_LOG("WMI ready: sw version %08x, abi %u, status %u, MAC %02x:%02x:%02x:%02x:%02x:%02x", le32(rdy), le32(rdy + 4),
 	    status, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
@@ -2181,6 +2185,393 @@ run3(char *res, size_t len)
 	snprintf(res, len, "STEP 3 PASS: firmware ready: MAC %02x:%02x:%02x:%02x:%02x:%02x, HTT %u.%u, %u RF chains, 2 GHz "
 	    "%u-%u MHz, 5 GHz %u-%u MHz, regdomain %x, WMI echo %s", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], htt_major,
 	    htt_minor, e[SR_NUM_RF_CHAINS], g[5], g[6], g[7], g[8], g[0], echo);
+	return true;
+}
+
+/* ---------------------------------------------------------------------------------------------------- */
+/* step 4: a scan that only listens (mac.c ath10k_regd_update, ath10k_update_channel_list,              */
+/* ath10k_core_reset_rx_filter, ath10k_add_interface, ath10k_hw_scan; wmi-tlv.c builders and parsers)  */
+
+#define WMI_TLV_START_SCAN_CMDID          0x3001u
+#define WMI_TLV_SCAN_CHAN_LIST_CMDID      0x3003u
+#define WMI_TLV_PDEV_SET_REGDOMAIN_CMDID  0x4001u
+#define WMI_TLV_VDEV_CREATE_CMDID         0x5001u
+#define WMI_TLV_VDEV_DELETE_CMDID         0x5002u
+#define WMI_TLV_SCAN_EVENTID              0x3001u
+#define WMI_TLV_MGMT_RX_EVENTID           0x7001u
+#define WMI_TLV_TAG_ARRAY_BYTE            17u
+#define WMI_TLV_TAG_ARRAY_FIXED_STRUCT    19u
+#define WMI_TLV_TAG_SCAN_EVENT            36u
+#define WMI_TLV_TAG_MGMT_RX_HDR           44u
+#define WMI_TLV_TAG_START_SCAN_CMD        77u
+#define WMI_TLV_TAG_SCAN_CHAN_LIST_CMD    79u
+#define WMI_TLV_TAG_CHANNEL               80u
+#define WMI_TLV_TAG_PDEV_SET_REGDOMAIN_CMD 81u
+#define WMI_TLV_TAG_VDEV_CREATE_CMD       86u
+#define WMI_TLV_TAG_VDEV_DELETE_CMD       87u
+#define WMI_VDEV_TYPE_STA                 2u
+#define WMI_CHAN_FLAG_PASSIVE             (1u << 7)
+#define WMI_CHAN_FLAG_DFS                 (1u << 10)
+#define WMI_CHAN_FLAG_ALLOW_HT            (1u << 11)
+#define WMI_CHAN_FLAG_ALLOW_VHT           (1u << 12)
+#define WMI_MODE_11A                      0u
+#define WMI_MODE_11G                      1u
+#define WMI_SCAN_FLAG_PASSIVE             0x1u
+#define WMI_SCAN_CHAN_STAT_EVENT          0x10u
+#define WMI_SCAN_FILTER_PROBE_REQ         0x20u
+#define WMI_SCAN_EVENT_STARTED            0x001u
+#define WMI_SCAN_EVENT_COMPLETED          0x002u
+#define WMI_SCAN_EVENT_BSS_CHANNEL        0x004u
+#define WMI_SCAN_EVENT_FOREIGN_CHANNEL    0x008u
+#define WMI_SCAN_EVENT_DEQUEUED           0x010u
+#define WMI_SCAN_EVENT_PREEMPTED          0x020u
+#define WMI_SCAN_EVENT_START_FAILED       0x040u
+#define WMI_SCAN_EVENT_FOREIGN_CHANNEL_EXIT 0x100u
+#define WMI_HOST_SCAN_ID_PREFIX           0xA000u
+#define WMI_RX_STATUS_ERR_CRC             0x01u
+#define NO_CTL                            0xFFu
+#define ATH10K_DEFAULT_NOISE_FLOOR        (-95)
+#define SCAN_MAX_BSS                      40u
+
+/* Every channel the chip's bands cover in Europe and the world-roaming domain the board names, all passive: the
+ * chip listens and never transmits. DFS marks the radar channels, as cfg80211 would. */
+static const uint16_t kScanMhz[] = {
+	2412, 2417, 2422, 2427, 2432, 2437, 2442, 2447, 2452, 2457, 2462, 2467, 2472,
+	5180, 5200, 5220, 5240, 5260, 5280, 5300, 5320,
+	5500, 5520, 5540, 5560, 5580, 5600, 5620, 5640, 5660, 5680, 5700,
+	5745, 5765, 5785, 5805, 5825,
+};
+#define SCAN_NCHAN ((uint32_t)(sizeof(kScanMhz) / sizeof(kScanMhz[0])))
+
+struct bss {
+	uint8_t bssid[6];
+	uint8_t ssid_len;
+	char ssid[33];
+	uint32_t chan;
+	int32_t dbm;            /* strongest seen */
+	uint32_t frames;
+	const char *sec;
+};
+static struct bss gBss[SCAN_MAX_BSS];
+static uint32_t gNumBss, gScanFrames, gScanDropped, gScanForeign, gScanEvent, gScanReason;
+static bool gScanStarted, gScanDone;
+static uint32_t gScanCmd[2 + 25u + 1u + SCAN_NCHAN + 1u + 1u + 2u + 1u];
+static uint32_t gChanCmd[2 + 1u + SCAN_NCHAN * 7u];
+
+static bool
+wmi_cmd_words(uint32_t cmd_id, const uint32_t *w, uint32_t nwords)
+{
+	return wmi_cmd(cmd_id, w, nwords * 4u);
+}
+
+/* ath10k_wmi_tlv_op_gen_pdev_set_rd with the board's EEPROM domain (WORC_WORLD 0x6c on this phone: no CTLs) */
+static bool
+scan_set_regdomain(void)
+{
+	uint32_t rd = gEepromRd & 0xFFFFu;
+	uint32_t w[7] = { tlv_hdr(WMI_TLV_TAG_PDEV_SET_REGDOMAIN_CMD, 24u), 0u, rd, rd, rd, NO_CTL, NO_CTL };
+	return wmi_cmd_words(WMI_TLV_PDEV_SET_REGDOMAIN_CMDID, w, 7u);
+}
+
+/* ath10k_wmi_tlv_op_gen_scan_chan_list: struct wmi_channel { mhz, band_center_freq1, band_center_freq2,
+ * mode | flags, min/max/reg power, classid (0.5 dBm), antenna_max, max_tx_power } per channel */
+static bool
+scan_chan_list(void)
+{
+	uint32_t *w = gChanCmd, n = 0;
+	w[n++] = tlv_hdr(WMI_TLV_TAG_SCAN_CHAN_LIST_CMD, 4u);
+	w[n++] = SCAN_NCHAN;
+	w[n++] = tlv_hdr(WMI_TLV_TAG_ARRAY_STRUCT, SCAN_NCHAN * 28u);
+	for (uint32_t i = 0; i < SCAN_NCHAN; i++) {
+		uint32_t mhz = kScanMhz[i];
+		bool g5 = mhz > 5000u, dfs = (mhz >= 5260u && mhz <= 5320u) || (mhz >= 5500u && mhz <= 5700u);
+		w[n++] = tlv_hdr(WMI_TLV_TAG_CHANNEL, 24u);
+		w[n++] = mhz;
+		w[n++] = mhz;
+		w[n++] = 0u;
+		w[n++] = (g5 ? WMI_MODE_11A : WMI_MODE_11G) | WMI_CHAN_FLAG_PASSIVE | WMI_CHAN_FLAG_ALLOW_HT |
+		    (g5 ? WMI_CHAN_FLAG_ALLOW_VHT : 0u) | (dfs ? WMI_CHAN_FLAG_DFS : 0u);
+		w[n++] = (40u << 8) | (40u << 16);   /* max power, reg power: 20 dBm */
+		w[n++] = 40u << 8;                    /* max tx power */
+	}
+	return wmi_cmd_words(WMI_TLV_SCAN_CHAN_LIST_CMDID, w, n);
+}
+
+static bool
+vdev_create(uint32_t id)
+{
+	uint32_t w[6] = { tlv_hdr(WMI_TLV_TAG_VDEV_CREATE_CMD, 20u), id, WMI_VDEV_TYPE_STA, 0u, 0u, 0u };
+	memcpy(&w[4], gMac, 6u);
+	return wmi_cmd_words(WMI_TLV_VDEV_CREATE_CMDID, w, 6u);
+}
+
+static bool
+vdev_delete(uint32_t id)
+{
+	uint32_t w[2] = { tlv_hdr(WMI_TLV_TAG_VDEV_DELETE_CMD, 4u), id };
+	return wmi_cmd_words(WMI_TLV_VDEV_DELETE_CMDID, w, 2u);
+}
+
+/* ath10k_wmi_start_scan_init + ath10k_hw_scan without SSIDs (passive) + ath10k_wmi_tlv_op_gen_start_scan */
+static bool
+scan_start(void)
+{
+	uint32_t *w = gScanCmd, n = 0;
+	w[n++] = tlv_hdr(WMI_TLV_TAG_START_SCAN_CMD, 100u);
+	w[n++] = WMI_HOST_SCAN_ID_PREFIX | 0u;        /* scan_id (ATH10K_SCAN_ID) */
+	w[n++] = WMI_HOST_SCAN_ID_PREFIX | 1u;        /* scan_req_id */
+	w[n++] = 0u;                                  /* vdev_id */
+	w[n++] = 1u;                                  /* WMI_SCAN_PRIORITY_LOW */
+	w[n++] = WMI_SCAN_EVENT_STARTED | WMI_SCAN_EVENT_COMPLETED | WMI_SCAN_EVENT_BSS_CHANNEL |
+	    WMI_SCAN_EVENT_FOREIGN_CHANNEL | WMI_SCAN_EVENT_FOREIGN_CHANNEL_EXIT | WMI_SCAN_EVENT_DEQUEUED;
+	w[n++] = 50u;                                 /* dwell active */
+	w[n++] = 150u;                                /* dwell passive */
+	w[n++] = 50u;                                 /* min rest */
+	w[n++] = 500u;                                /* max rest */
+	w[n++] = 0u;                                  /* repeat probe */
+	w[n++] = 0u;                                  /* probe spacing */
+	w[n++] = 0u;                                  /* idle */
+	w[n++] = 20000u;                              /* max scan time */
+	w[n++] = 5u;                                  /* probe delay */
+	/* the TLV firmware inverts WMI_SCAN_FILTER_PROBE_REQ (ath10k's FIXME) */
+	w[n++] = (WMI_SCAN_CHAN_STAT_EVENT | WMI_SCAN_FLAG_PASSIVE) ^ WMI_SCAN_FILTER_PROBE_REQ;
+	w[n++] = 0u;                                  /* burst duration */
+	w[n++] = SCAN_NCHAN;
+	w[n++] = 1u;                                  /* num_bssids: the broadcast one */
+	w[n++] = 0u;                                  /* num_ssids */
+	w[n++] = 0u;                                  /* ie_len */
+	w[n++] = 3u;                                  /* num_probes */
+	w[n++] = 0u; w[n++] = 0u;                     /* mac_addr */
+	w[n++] = 0u; w[n++] = 0u;                     /* mac_mask */
+	w[n++] = tlv_hdr(WMI_TLV_TAG_ARRAY_UINT32, SCAN_NCHAN * 4u);
+	for (uint32_t i = 0; i < SCAN_NCHAN; i++) {
+		w[n++] = kScanMhz[i];
+	}
+	w[n++] = tlv_hdr(WMI_TLV_TAG_ARRAY_FIXED_STRUCT, 0u);   /* SSIDs */
+	w[n++] = tlv_hdr(WMI_TLV_TAG_ARRAY_FIXED_STRUCT, 8u);   /* BSSIDs: ff:ff:ff:ff:ff:ff */
+	w[n++] = 0xFFFFFFFFu;
+	w[n++] = 0x0000FFFFu;
+	w[n++] = tlv_hdr(WMI_TLV_TAG_ARRAY_BYTE, 0u);           /* extra IEs */
+	return wmi_cmd_words(WMI_TLV_START_SCAN_CMDID, w, n);
+}
+
+static const char *
+scan_event_name(uint32_t t)
+{
+	switch (t) {
+	case WMI_SCAN_EVENT_STARTED: return "started";
+	case WMI_SCAN_EVENT_COMPLETED: return "completed";
+	case WMI_SCAN_EVENT_BSS_CHANNEL: return "back on the home channel";
+	case WMI_SCAN_EVENT_FOREIGN_CHANNEL: return "on a channel";
+	case WMI_SCAN_EVENT_DEQUEUED: return "dequeued";
+	case WMI_SCAN_EVENT_PREEMPTED: return "preempted";
+	case WMI_SCAN_EVENT_START_FAILED: return "start failed";
+	case WMI_SCAN_EVENT_FOREIGN_CHANNEL_EXIT: return "left a channel";
+	default: return "other";
+	}
+}
+
+static void
+on_scan_event(void)
+{
+	const uint8_t *e = wmi_find(WMI_TLV_TAG_SCAN_EVENT, 24u);
+	if (e == NULL) {
+		A_LOG("%s", "scan event without its TLV");
+		return;
+	}
+	uint32_t type = le32(e), reason = le32(e + 4), freq = le32(e + 8);
+	if (type == WMI_SCAN_EVENT_FOREIGN_CHANNEL) {
+		gScanForeign++;
+		return;
+	}
+	if (type == WMI_SCAN_EVENT_FOREIGN_CHANNEL_EXIT || type == WMI_SCAN_EVENT_BSS_CHANNEL) {
+		return;
+	}
+	A_LOG("scan event: %s (type %x, reason %u, freq %u, scan id %x)", scan_event_name(type), type, reason, freq,
+	    le32(e + 16));
+	if (type == WMI_SCAN_EVENT_STARTED) {
+		gScanStarted = true;
+	} else if (type == WMI_SCAN_EVENT_COMPLETED || type == WMI_SCAN_EVENT_START_FAILED ||
+	    type == WMI_SCAN_EVENT_PREEMPTED) {
+		gScanDone = true;
+		gScanEvent = type;
+		gScanReason = reason;
+	}
+}
+
+/* One beacon or probe response (ath10k_wmi_event_mgmt_rx): BSSID, SSID, channel, strongest signal, security */
+static void
+on_mgmt_rx(void)
+{
+	struct tlv_it it = { gRx + 4, gRxLen - 4u };
+	uint32_t tag = 0, tl = 0, flen = 0;
+	const uint8_t *v = NULL, *hdr = NULL, *f = NULL;
+	while (tlv_next(&it, &tag, &tl, &v) == 1) {
+		if (tag == WMI_TLV_TAG_MGMT_RX_HDR && tl >= 24u && hdr == NULL) {
+			hdr = v;
+		} else if (tag == WMI_TLV_TAG_ARRAY_BYTE && f == NULL) {
+			f = v;
+			flen = tl;
+		}
+	}
+	if (hdr == NULL || f == NULL) {
+		gScanDropped++;
+		return;
+	}
+	uint32_t chan = le32(hdr), snr = le32(hdr + 4), buf_len = le32(hdr + 16), status = le32(hdr + 20);
+	if (buf_len < flen) {
+		flen = buf_len;
+	}
+	gScanFrames++;
+	/* 24-byte header, then timestamp (8), beacon interval (2), capabilities (2), elements */
+	if ((status & WMI_RX_STATUS_ERR_CRC) || flen < 36u || (f[0] != 0x80u && f[0] != 0x50u)) {
+		gScanDropped++;
+		return;
+	}
+	const uint8_t *bssid = f + 16;
+	uint32_t cap = le16(f + 34);
+	bool rsn = false, wpa = false;
+	uint32_t ssid_len = 0, ds = 0;
+	const uint8_t *ssid = NULL;
+	for (uint32_t o = 36u; o + 2u <= flen;) {
+		uint32_t id = f[o], l = f[o + 1u];
+		if (o + 2u + l > flen) {
+			break;
+		}
+		const uint8_t *p = f + o + 2u;
+		if (id == 0u && ssid == NULL) {
+			ssid = p;
+			ssid_len = l > 32u ? 32u : l;
+		} else if (id == 3u && l >= 1u) {
+			ds = p[0];
+		} else if (id == 48u) {
+			rsn = true;
+		} else if (id == 221u && l >= 4u && p[0] == 0x00u && p[1] == 0x50u && p[2] == 0xF2u && p[3] == 1u) {
+			wpa = true;
+		}
+		o += 2u + l;
+	}
+	int32_t dbm = (int32_t)snr + ATH10K_DEFAULT_NOISE_FLOOR;
+	struct bss *b = NULL;
+	for (uint32_t i = 0; i < gNumBss; i++) {
+		if (memcmp(gBss[i].bssid, bssid, 6u) == 0) {
+			b = &gBss[i];
+			break;
+		}
+	}
+	if (b == NULL) {
+		if (gNumBss >= SCAN_MAX_BSS) {
+			return;
+		}
+		b = &gBss[gNumBss++];
+		bzero(b, sizeof(*b));
+		memcpy(b->bssid, bssid, 6u);
+		b->dbm = dbm;
+	}
+	b->frames++;
+	if (dbm > b->dbm) {
+		b->dbm = dbm;
+	}
+	b->chan = ds != 0 ? ds : chan;
+	b->sec = rsn ? "WPA2" : wpa ? "WPA" : (cap & 0x10u) ? "WEP" : "open";
+	if (ssid != NULL && ssid_len > 0 && b->ssid_len == 0) {
+		bool hidden = true;
+		for (uint32_t i = 0; i < ssid_len; i++) {
+			hidden = hidden && ssid[i] == 0;
+		}
+		if (!hidden) {
+			for (uint32_t i = 0; i < ssid_len; i++) {
+				b->ssid[i] = (ssid[i] >= 0x20u && ssid[i] < 0x7Fu) ? (char)ssid[i] : '?';
+			}
+			b->ssid[ssid_len] = 0;
+			b->ssid_len = (uint8_t)ssid_len;
+		}
+	}
+}
+
+static bool
+run4(char *res, size_t len)
+{
+	gStep = "4";
+	gNumBss = gScanFrames = gScanDropped = gScanForeign = 0;
+	gScanStarted = gScanDone = false;
+	uint32_t t0 = ms_since_power_on();
+
+	/* ath10k_regd_update (regdomain, channel list), ath10k_core_reset_rx_filter (QCA6174 hw3.2:
+	 * hw_filter_reset_required: a station vdev created and deleted, then a WMI barrier), ath10k_add_interface */
+	const char *echo = "not tried";
+	bool ok = scan_set_regdomain() && scan_chan_list() && vdev_create(0u) && vdev_delete(0u);
+	if (ok) {
+		echo = wmi_echo(1000u);
+		ok = vdev_create(0u) && scan_start();
+	}
+	A_LOG("regdomain %x, %u channels (all passive), station interface with the chip's MAC, barrier echo %s; scan %s",
+	    gEepromRd & 0xFFFFu, SCAN_NCHAN, echo, ok ? "requested" : "NOT requested");
+	if (!ok) {
+		snprintf(res, len, "%s", "STEP 4 FAIL: a scan setup command could not be sent (see the lines above)");
+		return false;
+	}
+
+	/* events until the scan completes: 37 channels x 150 ms dwell is about 6 s; 25 s at most */
+	for (uint32_t t = 0; t < 25000u && !gScanDone; t++) {
+		int r;
+		for (int k = 0; k < 64 && (r = htc_rx_one()) != 0; k++) {
+			if (r != 2) {
+				continue;
+			}
+			uint32_t id = msg_id();
+			if (gRxEid == gEpWmi && id == WMI_TLV_MGMT_RX_EVENTID) {
+				on_mgmt_rx();
+			} else if (gRxEid == gEpWmi && id == WMI_TLV_SCAN_EVENTID) {
+				on_scan_event();
+			} else {
+				other_msg();
+			}
+		}
+		if (t % 10u == 0 && fw_down("the scan", res, len)) {
+			dump_dbglog();
+			return false;
+		}
+		IOSleep(1);
+	}
+	uint32_t took = ms_since_power_on() - t0;
+	A_LOG("scan: %s after %u ms, %u channel visits, %u frames (%u not beacons or damaged), %u networks", gScanDone ?
+	    scan_event_name(gScanEvent) : "NOT finished", took, gScanForeign, gScanFrames, gScanDropped, gNumBss);
+
+	/* strongest first */
+	for (uint32_t i = 1; i < gNumBss; i++) {
+		struct bss x = gBss[i];
+		uint32_t j = i;
+		for (; j > 0 && gBss[j - 1u].dbm < x.dbm; j--) {
+			gBss[j] = gBss[j - 1u];
+		}
+		gBss[j] = x;
+	}
+	for (uint32_t i = 0; i < gNumBss; i++) {
+		const struct bss *b = &gBss[i];
+		A_LOG("network %2u: %-32s ch %3u %4d dBm %-4s %3u frames, BSSID %02x:%02x:%02x:%02x:%02x:%02x", i + 1u,
+		    b->ssid_len ? b->ssid : "(hidden)", b->chan, b->dbm, b->sec, b->frames, b->bssid[0], b->bssid[1],
+		    b->bssid[2], b->bssid[3], b->bssid[4], b->bssid[5]);
+	}
+	if (!gScanStarted && !gScanDone) {
+		snprintf(res, len, "STEP 4 FAIL: the firmware never started the scan (%u frames, fw indicator %08x)", gScanFrames,
+		    brd(Q_FW_INDICATOR));
+		dump_dbglog();
+		return false;
+	}
+	if (gScanDone && gScanEvent != WMI_SCAN_EVENT_COMPLETED) {
+		snprintf(res, len, "STEP 4 FAIL: scan %s (reason %u) after %u ms", scan_event_name(gScanEvent), gScanReason, took);
+		return false;
+	}
+	if (gNumBss == 0) {
+		snprintf(res, len, "STEP 4 FAIL: scan %s after %u ms but no beacons arrived (%u frames, %u channel visits)",
+		    gScanDone ? "completed" : "unfinished", took, gScanFrames, gScanForeign);
+		return false;
+	}
+	const struct bss *top = &gBss[0];
+	snprintf(res, len, "STEP 4 PASS: listen-only scan found %u networks in %u ms (%u beacons, %u channels); strongest: "
+	    "%s, ch %u, %d dBm, %s", gNumBss, took, gScanFrames - gScanDropped, gScanForeign,
+	    top->ssid_len ? top->ssid : "(hidden)", top->chan, top->dbm, top->sec);
 	return true;
 }
 
@@ -2292,6 +2683,10 @@ op2_ath10k_step2b(const struct op2_ath10k_bus *bus, char *result, size_t len)
 	if (ok && bus->start_services) {
 		A_LOG("%s", result);   /* the 2c verdict; the result line becomes step 3's */
 		ok = run3(result, len);
+	}
+	if (ok && bus->scan) {
+		A_LOG("%s", result);   /* the step 3 verdict; the result line becomes step 4's */
+		ok = run4(result, len);
 	}
 	/* The chip cannot DMA any more; the block stays allocated for good. */
 	if (!gChipGone) {

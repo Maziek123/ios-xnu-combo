@@ -19,6 +19,7 @@
  *      HTC ready message (firmware embedded from the gitignored firmware/qca6174/ by tools/gen-wifi-fw.py)
  *   5  as 4, then step 3 (OP2Ath10k.cpp): HTC services (HTT data, WMI control), WMI service ready, WMI init,
  *      WMI ready with the chip's MAC address, HTT version, a WMI echo
+ *   6  as 5, then step 4 (OP2Ath10k.cpp): a scan that only listens; the log lists the networks heard
  *
  * Runs in its own kernel thread 120 s after the framebuffer starts (RPM is up by then, the UI is running),
  * and repeats a one-line summary every 60 s so it survives in the ramoops ring.
@@ -626,7 +627,8 @@ static void
 step2b(void)
 {
 	char line[200];
-	struct op2_ath10k_bus bus = { gBar0, gConf, gDbi, gPowerOnAbs, cold_reset_for_2b, gMode >= 4, gMode >= 5 };
+	struct op2_ath10k_bus bus = { gBar0, gConf, gDbi, gPowerOnAbs, cold_reset_for_2b, gMode >= 4, gMode >= 5,
+		gMode >= 6 };
 	(void)op2_ath10k_step2b(&bus, line, sizeof(line));
 	summary(line);
 }
@@ -816,7 +818,7 @@ wifi_thread(__unused void *param, __unused wait_result_t wr_)
 	} else {
 		W_LOG("mode %u (%s)", gMode, gMode == 1 ? "read-only probe" : gMode == 2 ? "bring-up" : gMode == 3 ?
 		    "bring-up + step 2b (DMA, BMI)" : gMode == 4 ? "bring-up + 2b + step 2c (firmware boot)" :
-		    "bring-up + 2b + 2c + step 3 (WMI, HTT)");
+		    gMode == 5 ? "bring-up + 2b + 2c + step 3 (WMI, HTT)" : "bring-up + 2b + 2c + 3 + step 4 (listen-only scan)");
 		dump_all("before");
 		if (gMode >= 2) {
 			bringup();
