@@ -7,10 +7,10 @@ Reads, if present:
   firmware/qca6174/bdwlan30.bin     this phone's board data (calibration), from its Android firmware
 and writes xnu/xnu-4903.270.47/iokit/Kernel/arm/op2_wifi_fw.h, which OP2Ath10k.cpp includes when it exists.
 Both paths are gitignored: the firmware is Qualcomm's and stays out of the public repository.
-Without the two files the header is removed and Wi-Fi step 2c (wifi=4) reports that no firmware is built in.
+Without the two files the header is removed and Wi-Fi step 2c (wifi=5) reports that no firmware is built in.
 
 Also reads, if present:
-  firmware/qca6174/wifi-network.txt the network for Wi-Fi steps 5 and 6 (wifi=7, wifi=8): its name on the first
+  firmware/qca6174/wifi-network.txt the network for Wi-Fi steps 5 to 7 (wifi=8 to wifi=10): its name on the first
                                     line, its password on the second (none, or an empty line: an open network)
 and writes op2_wifi_net.h (gitignored too) with the name and the WPA2 pairwise master key derived from the
 password (PBKDF2-HMAC-SHA1, 4096 rounds, as wpa_passphrase does). The password itself is not written anywhere.
@@ -72,7 +72,7 @@ def network():
         if os.path.exists(NET_OUT):
             os.remove(NET_OUT)
             touch(CPP)
-        print("[wifi-net] no firmware/qca6174/wifi-network.txt: Wi-Fi step 5 (wifi=7) will report it")
+        print("[wifi-net] no firmware/qca6174/wifi-network.txt: Wi-Fi step 5 (wifi=8) will report it")
         return 0
     with open(path, "rb") as f:
         raw = f.read()

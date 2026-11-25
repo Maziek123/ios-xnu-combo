@@ -8,22 +8,22 @@
  * Boot-arg wifi:
  *   0  (default) nothing runs
  *   1  read-only probe: log GPIO / PMIC / clock / power-domain states; writes nothing
- *   2  bring-up: power + clocks + PHY + link training + config read (step 1), then step 2a: give BAR0 an
- *      address, enable memory decoding (no bus mastering: the chip cannot DMA yet), wake the chip's SoC,
- *      wait up to 5 s for it to initialise (the chip ID reads 0 until then), and read its chip ID and
- *      firmware indicator (ath10k pci.c / hw.c qca6174_regs). Only if the ID is still 0: the ath10k cold
- *      reset (SOC_GLOBAL_RESET) and a 3 s wait for the boot ROM's "initialized"
- *   3  as 2, then step 2b (OP2Ath10k.cpp): DMA through the copy engines, the diagnostic window into the
+ *   2  step 1: power + clocks + PHY + link training + config read; stops once the chip answers on the link
+ *   3  as 2, then step 2a: give BAR0 an address, enable memory decoding (no bus mastering: the chip
+ *      cannot DMA yet), wake the chip's SoC, wait up to 5 s for it to initialise (the chip ID reads 0 until
+ *      then), and read its chip ID and firmware indicator (ath10k pci.c / hw.c qca6174_regs). Only if the
+ *      ID is still 0: the ath10k cold reset (SOC_GLOBAL_RESET) and a 3 s wait for the boot ROM's "initialized"
+ *   4  as 3, then step 2b (OP2Ath10k.cpp): DMA through the copy engines, the diagnostic window into the
  *      chip's memory, the target-side config, and the first boot-loader (BMI) command; no firmware yet
- *   4  as 3, then step 2c (OP2Ath10k.cpp): board data, OTP and firmware download, BMI_DONE, and the firmware's
+ *   5  as 4, then step 2c (OP2Ath10k.cpp): board data, OTP and firmware download, BMI_DONE, and the firmware's
  *      HTC ready message (firmware embedded from the gitignored firmware/qca6174/ by tools/gen-wifi-fw.py)
- *   5  as 4, then step 3 (OP2Ath10k.cpp): HTC services (HTT data, WMI control), WMI service ready, WMI init,
+ *   6  as 5, then step 3 (OP2Ath10k.cpp): HTC services (HTT data, WMI control), WMI service ready, WMI init,
  *      WMI ready with the chip's MAC address, HTT version, a WMI echo
- *   6  as 5, then step 4 (OP2Ath10k.cpp): a scan that only listens; the log lists the networks heard
- *   7  as 6, then step 5 (OP2Ath10k.cpp): join the network named in the gitignored firmware/qca6174/wifi-network.txt
+ *   7  as 6, then step 4 (OP2Ath10k.cpp): a scan that only listens; the log lists the networks heard
+ *   8  as 7, then step 5 (OP2Ath10k.cpp): join the network named in the gitignored firmware/qca6174/wifi-network.txt
  *      (authentication, association), then leave it
- *   8  as 7, then step 6 (OP2Ath10k.cpp): the WPA2-PSK 4-way handshake, keys into the chip, 5 s connected, leave
- *   9  as 8, then step 7 (OP2Ath10k.cpp): data through the keys: DHCP with the network, ARP and ping its router, leave
+ *   9  as 8, then step 6 (OP2Ath10k.cpp): the WPA2-PSK 4-way handshake, keys into the chip, 5 s connected, leave
+ *  10  as 9, then step 7 (OP2Ath10k.cpp): data through the keys: DHCP with the network, ARP and ping its router, leave
  *
  * Runs in its own kernel thread 120 s after the framebuffer starts (RPM is up by then, the UI is running),
  * and repeats a one-line summary every 60 s so it survives in the ramoops ring.
@@ -625,7 +625,7 @@ step2a(void)
 	return chip_id_valid(chip) && rev == Q_HW32_CHIP_REV;
 }
 
-/* steps 2b, 2c, 3 (wifi=3, 4, 5): copy engines and BMI, firmware boot, WMI/HTT services (OP2Ath10k.cpp) */
+/* steps 2b to 7 (wifi=4 to 10): copy engines and BMI, firmware boot, WMI/HTT services (OP2Ath10k.cpp) */
 static bool
 cold_reset_for_2b(char *why, size_t n)
 {
@@ -636,8 +636,8 @@ static void
 step2b(void)
 {
 	char line[320];
-	struct op2_ath10k_bus bus = { gBar0, gConf, gDbi, gPowerOnAbs, cold_reset_for_2b, gMode >= 4, gMode >= 5,
-		gMode >= 6, gMode >= 7, gMode >= 8, gMode >= 9 };
+	struct op2_ath10k_bus bus = { gBar0, gConf, gDbi, gPowerOnAbs, cold_reset_for_2b, gMode >= 5, gMode >= 6,
+		gMode >= 7, gMode >= 8, gMode >= 9, gMode >= 10 };
 	(void)op2_ath10k_step2b(&bus, line, sizeof(line));
 	summary(line);
 }
@@ -807,7 +807,7 @@ bringup(void)
 	snprintf(line, sizeof(line), "%s: endpoint id %04x:%04x class/rev %08x bar0 %08x (QCA6174 is 168c:003e)",
 	    (id & 0xFFFF) == 0x168C ? "PASS" : "LINK UP, unexpected id", id & 0xFFFF, id >> 16, cls, bar0);
 	summary(line);
-	if (id == 0x003E168Cu && step2a() && gMode >= 3) {
+	if (id == 0x003E168Cu && gMode >= 3 && step2a() && gMode >= 4) {
 		step2b();
 	}
 }
@@ -825,12 +825,11 @@ wifi_thread(__unused void *param, __unused wait_result_t wr_)
 	if (!gGcc || !gTlmm || !gParf || !gPhy || !gDbi || !gConf) {
 		summary("FAIL: ml_io_map");
 	} else {
-		W_LOG("mode %u (%s)", gMode, gMode == 1 ? "read-only probe" : gMode == 2 ? "bring-up" : gMode == 3 ?
-		    "bring-up + step 2b (DMA, BMI)" : gMode == 4 ? "bring-up + 2b + step 2c (firmware boot)" :
-		    gMode == 5 ? "bring-up + 2b + 2c + step 3 (WMI, HTT)" : gMode == 6 ?
-		    "bring-up + 2b + 2c + 3 + step 4 (listen-only scan)" : gMode == 7 ? "bring-up + 2b + 2c + 3 + 4 + step 5 (join)" :
-		    gMode == 8 ? "bring-up + 2b + 2c + 3 + 4 + 5 + step 6 (WPA2)" :
-		    "bring-up + 2b + 2c + 3 + 4 + 5 + 6 + step 7 (DHCP, ping)");
+		W_LOG("mode %u (%s)", gMode, gMode == 1 ? "read-only probe" : gMode == 2 ? "step 1 (power, link)" :
+		    gMode == 3 ? "steps 1, 2a (chip registers)" : gMode == 4 ? "steps 1, 2a + 2b (DMA, BMI)" :
+		    gMode == 5 ? "steps 1-2b + 2c (firmware boot)" : gMode == 6 ? "steps 1-2c + 3 (WMI, HTT)" :
+		    gMode == 7 ? "steps 1-3 + 4 (listen-only scan)" : gMode == 8 ? "steps 1-4 + 5 (join)" :
+		    gMode == 9 ? "steps 1-5 + 6 (WPA2)" : "steps 1-6 + 7 (DHCP, ping)");
 		dump_all("before");
 		if (gMode >= 2) {
 			bringup();

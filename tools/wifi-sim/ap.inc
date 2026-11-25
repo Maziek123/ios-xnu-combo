@@ -4,15 +4,15 @@
  * 24: the access point refuses the association (status 17)
  * 25: the access point has another password: message 2's MIC fails, message 1 three times, deauth reason 15
  * 26: the access point is WPA3-only (SAE): STEP 5 FAIL before anything is sent
- * 27: wifi=7: join only (STEP 5 PASS), then leave
+ * 27: wifi=8: join only (STEP 5 PASS), then leave
  * 29: as 22, but in rx full reorder mode as the phone's firmware does it: right after the association the chip takes a
  *     buffer it never finishes, message 1 and the data frames come offloaded, message 3 with a descriptor, each
  *     announced by an in-order indication
  * 30: as 22, but as on the phone: tx pause events come with message 3 (station add BA stop/wake, ignored; MCC
  *     stop/wake for vdev 0) and the firmware never confirms message 4
- * 31: wifi=9: as 22, then data through the keys: DHCP (offer 172.20.10.2/28, router and DNS .1), our ARP for the
+ * 31: wifi=10: as 22, then data through the keys: DHCP (offer 172.20.10.2/28, router and DNS .1), our ARP for the
  *     router answered, the hotspot ARPs for us (we must answer), 3 pings answered
- * 32: wifi=9, the DHCP server stays silent: STEP 7 FAIL after 4 discovers
+ * 32: wifi=10, the DHCP server stays silent: STEP 7 FAIL after 4 discovers
  * 28: the hotspot never beacons where we listen but answers our probe request in the second directed round: WPA2 as 22 */
 #include <openssl/hmac.h>
 #include <openssl/evp.h>

@@ -1,7 +1,7 @@
 /*
  * OP2Ath10k.cpp: Wi-Fi step 2b (QCA6174 copy engines, diagnostic window, first BMI command).
- * Called by OP2Wifi.cpp with boot-arg wifi=3 (wifi=4: and step 2c, the firmware boot; wifi=5: and step 3, the
- * firmware's HTC/WMI/HTT services up to WMI ready; wifi=6: and step 4, a listen-only scan) once step 2a has read a valid chip ID.
+ * Called by OP2Wifi.cpp with boot-arg wifi=4 and up once step 2a has read a valid chip ID; the flags below say
+ * which later steps run (wifi=5: step 2c, the firmware boot ... wifi=10: step 7, data).
  * Include after <IOKit/IOLib.h>.
  */
 
@@ -16,12 +16,12 @@ struct op2_ath10k_bus {
 	/* ath10k cold reset (SOC_GLOBAL_RESET) with the link and config space checked around it (OP2Wifi.cpp);
 	 * false = the chip may be off the bus: no further access to it */
 	bool (*cold_reset)(char *why, size_t len);
-	bool boot_firmware;        /* wifi=4: after a 2b pass, step 2c (firmware download, BMI_DONE, HTC ready) */
-	bool start_services;       /* wifi=5: after a 2c pass, step 3 (HTC services, WMI init + ready, HTT version) */
-	bool scan;                 /* wifi=6: after a step 3 pass, step 4 (a scan that only listens) */
-	bool join;                 /* wifi=7: after a step 4 pass, step 5 (join the configured network) */
-	bool wpa2;                 /* wifi=8: after a step 5 pass, step 6 (WPA2-PSK 4-way handshake, keys, 5 s) */
-	bool data;                 /* wifi=9: after a step 6 pass, step 7 (DHCP through the keys, ARP, ping the router) */
+	bool boot_firmware;        /* wifi=5: after a 2b pass, step 2c (firmware download, BMI_DONE, HTC ready) */
+	bool start_services;       /* wifi=6: after a 2c pass, step 3 (HTC services, WMI init + ready, HTT version) */
+	bool scan;                 /* wifi=7: after a step 3 pass, step 4 (a scan that only listens) */
+	bool join;                 /* wifi=8: after a step 4 pass, step 5 (join the configured network) */
+	bool wpa2;                 /* wifi=9: after a step 5 pass, step 6 (WPA2-PSK 4-way handshake, keys, 5 s) */
+	bool data;                 /* wifi=10: after a step 6 pass, step 7 (DHCP through the keys, ARP, ping the router) */
 };
 
 /* Runs step 2b (and 2c, 3); writes the last step's one-line result ("STEP 2b PASS: ...", "STEP 3 FAIL: ...")

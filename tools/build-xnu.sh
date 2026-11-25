@@ -8,7 +8,7 @@ set -o pipefail
 source "$(cd "$(dirname "$0")" && pwd)/env.sh"
 op2_require_xcode || exit 1
 
-# Wi-Fi firmware for step 2c (wifi=4): embedded from the gitignored firmware/qca6174/ when present.
+# Wi-Fi firmware for step 2c (wifi=5): embedded from the gitignored firmware/qca6174/ when present.
 python3 "${REPO_ROOT}/tools/gen-wifi-fw.py"
 TOOLCHAIN="${XCODE_ROOT}/Toolchains/XcodeDefault.xctoolchain/usr/bin"
 SDK="${XCODE_ROOT}/Platforms/MacOSX.platform/Developer/SDKs/MacOSX10.14.sdk"

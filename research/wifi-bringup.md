@@ -2,9 +2,9 @@
 
 What was learned bringing up the QCA6174 under XNU, from the phone's own device tree, Qualcomm's and Linux's drivers,
 and the phone's logs. The step-by-step results are in the main README ("Wi-Fi bring-up, step by step", progress
-rows 1-20); the code is `iokit/Kernel/arm/OP2Wifi.cpp` + `OP2Ath10k.cpp`, checked with `tools/wifi-sim`.
-State at the end of this period: **WPA2 connection to an iPhone hotspot works** (`wifi=8`, STEP 6 PASS); no data
-has been sent through the keys yet and iOS has no network interface for it.
+rows 1-21); the code is `iokit/Kernel/arm/OP2Wifi.cpp` + `OP2Ath10k.cpp`, checked with `tools/wifi-sim`.
+State at the end of this period: **WPA2 connection to an iPhone hotspot works and carries data** (`wifi=10`, STEP 7
+PASS: DHCP lease, ping 2-3 ms, all encrypted by the chip); iOS has no network interface for it yet.
 
 ## Hardware truth (research/hardware/live.dts, OnePlus2_14_A.12_160226 kernel)
 
@@ -27,7 +27,8 @@ has been sent through the keys yet and iOS has no network interface for it.
 - **Open lead: `switch_antenna`** (`oneplus,switch-antenna`, driver `drivers/input/misc/switch_antenna.c`):
   four GPIOs, **120, 121, 122, 124**, one-hot (state 0 = all low, 1-4 = one of them high), set from Android userspace
   through `/proc/antenna_switch`; the driver drives all four low at probe. What they switch is not in the source
-  (a one-of-four switch fits the cellular antennas better than Wi-Fi). Under iOS nobody drives them.
+  (a one-of-four switch fits the cellular antennas better than Wi-Fi). **Read on the phone under iOS (2026-11-25): all
+  four are outputs driven low**, the state the driver sets at probe, so they are not what differs from Android.
 
 ## What the firmware needs (each found from a failing run)
 
@@ -57,12 +58,16 @@ HTT SEC_IND and also a WMI install-key-complete event (0x5003); PEER_STATE event
 - With the buffer fix a 5.6 s scan collects about 20 beacons from 5 networks, the hotspot next to the phone at
   -41 to -54 dBm. 5 GHz from the house router (-72 to -78 dBm) reads stronger than its 2.4 GHz (-84 dBm).
 - Transmit works: authentication, association and EAPOL frames are acknowledged by the hotspot.
+- Data (step 7): native wifi data frames marked Protected are encrypted by the chip with the pairwise key; frames
+  from the hotspot arrive decrypted, as offloaded or descriptor buffers named by in-order indications (DHCP replies
+  came on tid 18, EAPOL on tid 16). DHCP lease in 763 ms, ping 2-3 ms.
 
 ## Next
 
-1. Data through the keys: DHCP with the hotspot (proves encryption both ways), then an `ifnet` for iOS like
-   `ue0` (bsd/dev/op2_usb.c) and configd service publication like `op2shell` does for USB.
-2. Read GPIO 120-124 under iOS (and drive them low as Android does at probe) to rule the antenna switch in or out.
+1. ~~Data through the keys~~ (done, step 7). An `ifnet` for iOS like `ue0` (bsd/dev/op2_usb.c), the driver staying
+   connected in its own thread with several frames in flight (step 7 sends one at a time and waits), and configd
+   service publication like `op2shell` does for USB.
+2. ~~GPIO 120-124~~ (read: driven low, as under Android; ruled out).
 3. Noise floor: compare with the firmware's own reports under Android if a log can be had there.
 
 ## References

@@ -2,7 +2,7 @@
 /*
  * OP2Ath10k: Wi-Fi steps 2b, 2c and 3 for the OnePlus 2's QCA6174 (docs/WIFI-BT-PLAN.md, P1).
  * Everything is polled; no interrupt ever reaches the phone (the chip's "interrupt disable" bit is set).
- * Step 2b (wifi=3), no firmware yet:
+ * Step 2b (wifi=4), no firmware yet:
  *   1. dump the chip's RTC_SOC (clock/reset) and SOC_CORE registers
  *   2. one 64 KB DMA block below 4 GB (reached only through a non-cacheable mapping, see below: the chip's DMA
  *      does not snoop the CPU caches), ASPM off on the chip, bus mastering on
@@ -15,14 +15,14 @@
  *      ath10k_pci_wake_target_cpu(); BMI_GET_TARGET_INFO over CE0/CE1 (hw3.2 answers version 0x05030000)
  *   6. only if BMI stays silent: the ath10k cold reset (SOC_GLOBAL_RESET, done by OP2Wifi.cpp with the link
  *      and config space checked), then 3-5 again
- * Step 2c (wifi=4), after a 2b pass, boots the firmware (ath10k_core_start up to ath10k_htc_wait_target):
+ * Step 2c (wifi=5), after a 2b pass, boots the firmware (ath10k_core_start up to ath10k_htc_wait_target):
  *   ath10k_init_configure_target; board data (the phone's bdwlan30.bin) to hi_board_data; the OTP image over BMI
  *   (LZ stream to 0x1234, BMI_EXECUTE); the firmware image segment by segment through the diagnostic window
  *   (ath10k_hw_diag_fast_download, CPU_ADDR_MSB window per segment; BMI LZ stream as the fallback);
  *   hi_serial_enable 0; BMI_DONE; then the firmware's HTC "ready" message on CE1. The firmware is ath10k's
  *   firmware-6.bin from linux-firmware, embedded at build time from the gitignored firmware/qca6174/ by
  *   tools/gen-wifi-fw.py; without it 2c reports that no firmware is built in.
- * Step 3 (wifi=5), after a 2c pass, starts the firmware the way ath10k_core_start goes on (still polled):
+ * Step 3 (wifi=6), after a 2c pass, starts the firmware the way ath10k_core_start goes on (still polled):
  *   host side of CE2 (WMI events), CE3 (WMI commands), CE4 (HTT commands) and receive buffers on CE1/CE2 (CE5
  *   is the firmware's own on QCA6174; HTT messages come on CE1); HTC connect of the HTT data and WMI control services, HTC setup complete; the WMI
  *   service-ready event (TLV ABI checked, host memory the firmware asks for allocated); WMI init with
