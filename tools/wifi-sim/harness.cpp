@@ -796,7 +796,7 @@ main(int argc, char **argv)
 	st32(0x804, 0x00435000u);           /* hi_failure_state */
 	for (uint32_t i = 0; i < 60; i++) st32(0x35000 + 4 * i, 0xc0de0000u + i);
 	struct op2_ath10k_bus bus = { bar, conf, dbi, 0, cold_reset, scenario >= 6, scenario >= 9, scenario >= 18, ap_scenario(),
-		ap_scenario() && scenario != 27 };
+		ap_scenario() && scenario != 27, scenario == 31 || scenario == 32 };
 	PKCS5_PBKDF2_HMAC_SHA1(scenario == 25 ? "another-password" : "simulated-ap", scenario == 25 ? 16 : 12, (const unsigned char *)"iPhone", 6, 4096, 32, ap_pmk);
 	fflush(stdout);
 	char res[320];
@@ -948,7 +948,7 @@ main(int argc, char **argv)
 		}
 		break;
 	}
-	case 22: case 23: case 24: case 25: case 26: case 27: case 28: case 29: case 30: {
+	case 22: case 23: case 24: case 25: case 26: case 27: case 28: case 29: case 30: case 31: case 32: {
 		CHECK(regd_seen && ring_cfg_before_regd && pdev_params.size() == 7);
 		CHECK(ap_rescans == (scenario == 23 ? 5u : scenario == 28 ? 2u : 0u));
 		CHECK(directed_scans == (scenario == 23 ? 4u : scenario == 28 ? 2u : 0u));
@@ -978,6 +978,18 @@ main(int argc, char **argv)
 			break;
 		case 23: CHECK(!ok && strstr(res, "STEP 5 FAIL: joining iPhone: not heard in 2 listen-only scans, and no answer to "
 		    "probe requests on 2.4 GHz (4 rounds)")); break;
+		case 31:
+			CHECK(ok && strstr(res, "STEP 7 PASS: data through WPA2 with iPhone: DHCP lease 172.20.10.2/28 (router 172.20.10.1, DNS "
+			    "172.20.10.1, 86400 s) in "));
+			CHECK(strstr(res, "ping 172.20.10.1: 3 of 3 replies") && strstr(res, "1 ARP requests for us answered"));
+			CHECK(ap_discovers == 1 && ap_requests == 1 && ap_arp_from_sta == 1 && ap_arp_reply_from_sta == 1 && ap_pings == 3 &&
+			    ap_bad_csum == 0);
+			CHECK(logbuf.find("DHCP offer: 172.20.10.2 from 172.20.10.1") != std::string::npos);
+			break;
+		case 32:
+			CHECK(!ok && strstr(res, "STEP 7 FAIL: data with iPhone: no DHCP offer to 4 discovers") && ap_discovers == 4);
+			CHECK(logbuf.find("STEP 6 PASS") != std::string::npos);
+			break;
 		case 30:
 			CHECK(ok && strstr(res, "STEP 6 PASS: WPA2 connected to iPhone") && ap_keys_ok == 2 && ap_authorized == 1);
 			CHECK(logbuf.find("message 4: sent, but the firmware never confirmed it (2 s)") != std::string::npos);

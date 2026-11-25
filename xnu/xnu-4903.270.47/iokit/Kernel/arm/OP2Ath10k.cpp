@@ -3677,6 +3677,9 @@ join_mgmt(const uint8_t *f, uint32_t n)
 	}
 }
 
+/* step 7: received IPv4 / ARP payloads (ethertype, payload, length, destination and source MAC) */
+static void (*gIpHook)(uint32_t ethertype, const uint8_t *p, uint32_t n, const uint8_t *da, const uint8_t *sa);
+
 /* data frames in native wifi format (the 802.11 header without QoS control): EAPOL from the network is queued */
 static void
 join_data(const uint8_t *f, uint32_t n)
@@ -3706,6 +3709,10 @@ join_data(const uint8_t *f, uint32_t n)
 	gDataFromAp++;
 	if (gAuthorized) {
 		gDataAfterKeys++;
+		/* LLC/SNAP: IPv4 and ARP to step 7; DA is addr1, SA addr3 (from DS) */
+		if (gIpHook != NULL && l[0] == 0xAAu && l[1] == 0xAAu && l[2] == 0x03u && l[3] == 0 && l[4] == 0 && l[5] == 0) {
+			gIpHook(be16(l + 6), l + 8, n - hl - 8u, f + 4, f + 16);
+		}
 	}
 }
 
@@ -4698,6 +4705,370 @@ run6(char *res, size_t len)
 	return true;
 }
 
+/* ---- step 7: data through the keys - DHCP with the network (RFC 2131), then ARP and ping its router ---- */
+
+#define ETH_IPV4                          0x0800u
+#define ETH_ARP                           0x0806u
+#define DHCP_DISCOVER                     1u
+#define DHCP_OFFER                        2u
+#define DHCP_REQUEST                      3u
+#define DHCP_ACK                          5u
+#define DHCP_NAK                          6u
+#define PING_COUNT                        3u
+
+static const uint8_t kBcast[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+static uint32_t gXid, gMyIp, gServerIp, gRouterIp, gNetmask, gDns, gLease;   /* addresses big-endian in a uint32 */
+static uint32_t gDhcpGot, gDhcpType, gOfferIp, gOfferServer, gIpFrames, gArpFrames, gArpAnswered, gOtherIp;
+static uint8_t gRouterMac[6];
+static bool gRouterMacKnown;
+static uint32_t gPingSeqSeen[PING_COUNT], gPingRtt[PING_COUNT], gPingSentAt[PING_COUNT];
+static const uint16_t kPingId = 0x4F32;   /* "O2" */
+
+static inline uint32_t
+rd_be32(const uint8_t *p)
+{
+	return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+}
+
+static inline void
+wr_be32(uint8_t *p, uint32_t v)
+{
+	p[0] = (uint8_t)(v >> 24);
+	p[1] = (uint8_t)(v >> 16);
+	p[2] = (uint8_t)(v >> 8);
+	p[3] = (uint8_t)v;
+}
+
+static uint32_t
+ip_sum(const uint8_t *p, uint32_t n)   /* the Internet checksum (RFC 1071) */
+{
+	uint32_t s = 0;
+	for (uint32_t i = 0; i + 1u < n; i += 2u) {
+		s += be16(p + i);
+	}
+	if (n & 1u) {
+		s += (uint32_t)p[n - 1u] << 8;
+	}
+	while (s >> 16) {
+		s = (s & 0xFFFFu) + (s >> 16);
+	}
+	return ~s & 0xFFFFu;
+}
+
+static void
+ip_str(uint32_t ip, char out[16])
+{
+	snprintf(out, 16, "%u.%u.%u.%u", ip >> 24, (ip >> 16) & 0xFFu, (ip >> 8) & 0xFFu, ip & 0xFFu);
+}
+
+/* An Ethernet-type payload to dst as a native wifi data frame to the access point: to DS, Protected (the chip adds
+ * CCMP with the installed pairwise key, as mac80211 marks frames for ath10k), LLC/SNAP + ethertype. */
+static const char *
+send_eth(const uint8_t dst[6], uint32_t ethertype, const uint8_t *payload, uint32_t plen, char *res, size_t len)
+{
+	uint8_t f[24u + 8u + 600u];
+	if (plen > 600u) {
+		return "payload too long";
+	}
+	bzero(f, 32u);
+	f[0] = 0x08u;
+	f[1] = 0x01u | 0x40u;                             /* to DS, Protected */
+	memcpy(f + 4, gBssid, 6u);
+	memcpy(f + 10, gMac, 6u);
+	memcpy(f + 16, dst, 6u);
+	put16(f + 22, (uint32_t)(gSeq++ & 0xFFFu) << 4);
+	f[24] = 0xAAu;
+	f[25] = 0xAAu;
+	f[26] = 0x03u;
+	put_be16(f + 30, ethertype);
+	memcpy(f + 32, payload, plen);
+	uint32_t st = 0;
+	const char *e = htt_tx(f, 32u + plen, false, false, &st, res, len, false);
+	return e;
+}
+
+/* IPv4 + UDP (checksum 0: optional over IPv4) */
+static uint32_t
+build_udp(uint8_t *p, uint32_t src, uint32_t dst, uint32_t sport, uint32_t dport, const uint8_t *data, uint32_t dlen)
+{
+	uint32_t total = 20u + 8u + dlen;
+	bzero(p, 28u);
+	p[0] = 0x45u;
+	put_be16(p + 2, total);
+	put_be16(p + 4, gSeq);                            /* identification */
+	p[8] = 64u;
+	p[9] = 17u;
+	wr_be32(p + 12, src);
+	wr_be32(p + 16, dst);
+	put_be16(p + 10, ip_sum(p, 20u));
+	put_be16(p + 20, sport);
+	put_be16(p + 22, dport);
+	put_be16(p + 24, 8u + dlen);
+	memcpy(p + 28, data, dlen);
+	return total;
+}
+
+static const char *
+dhcp_send(uint32_t type, char *res, size_t len)
+{
+	uint8_t b[300], pkt[340];
+	bzero(b, sizeof(b));
+	b[0] = 1u;                                        /* BOOTREQUEST, Ethernet, 6-byte address */
+	b[1] = 1u;
+	b[2] = 6u;
+	wr_be32(b + 4, gXid);
+	put_be16(b + 10, 0x8000u);                        /* broadcast: we cannot take unicast before having the address */
+	memcpy(b + 28, gMac, 6u);
+	wr_be32(b + 236, 0x63825363u);                    /* magic cookie */
+	uint32_t o = 240u;
+	b[o++] = 53; b[o++] = 1; b[o++] = (uint8_t)type;
+	b[o++] = 61; b[o++] = 7; b[o++] = 1;
+	memcpy(b + o, gMac, 6u);
+	o += 6u;
+	if (type == DHCP_REQUEST) {
+		b[o++] = 50; b[o++] = 4; wr_be32(b + o, gOfferIp); o += 4u;
+		b[o++] = 54; b[o++] = 4; wr_be32(b + o, gOfferServer); o += 4u;
+	}
+	b[o++] = 57; b[o++] = 2; put_be16(b + o, 1500u); o += 2u;
+	b[o++] = 55; b[o++] = 4; b[o++] = 1; b[o++] = 3; b[o++] = 6; b[o++] = 51;
+	b[o++] = 255;
+	uint32_t n = build_udp(pkt, 0u, 0xFFFFFFFFu, 68u, 67u, b, sizeof(b));
+	return send_eth(kBcast, ETH_IPV4, pkt, n, res, len);
+}
+
+static void
+on_dhcp(const uint8_t *b, uint32_t n)
+{
+	if (n < 240u || b[0] != 2u || rd_be32(b + 4) != gXid || rd_be32(b + 236) != 0x63825363u ||
+	    memcmp(b + 28, gMac, 6u) != 0) {
+		return;
+	}
+	uint32_t type = 0, server = 0, mask = 0, router = 0, dns = 0, lease = 0;
+	for (uint32_t o = 240u; o < n && b[o] != 255;) {
+		if (b[o] == 0) {
+			o++;
+			continue;
+		}
+		if (o + 2u > n || o + 2u + b[o + 1u] > n) {
+			break;
+		}
+		uint32_t id = b[o], l = b[o + 1u];
+		const uint8_t *v = b + o + 2u;
+		if (id == 53 && l >= 1u) type = v[0];
+		if (id == 54 && l >= 4u) server = rd_be32(v);
+		if (id == 1 && l >= 4u) mask = rd_be32(v);
+		if (id == 3 && l >= 4u) router = rd_be32(v);
+		if (id == 6 && l >= 4u) dns = rd_be32(v);
+		if (id == 51 && l >= 4u) lease = rd_be32(v);
+		o += 2u + l;
+	}
+	if (type == DHCP_OFFER && gDhcpType == 0) {
+		gOfferIp = rd_be32(b + 16);
+		gOfferServer = server;
+		gDhcpType = DHCP_OFFER;
+	} else if ((type == DHCP_ACK || type == DHCP_NAK) && gDhcpType == DHCP_OFFER) {
+		gDhcpType = type;
+		if (type == DHCP_ACK) {
+			gMyIp = rd_be32(b + 16);
+			gServerIp = server;
+			gNetmask = mask;
+			gRouterIp = router;
+			gDns = dns;
+			gLease = lease;
+		}
+	}
+	gDhcpGot++;
+}
+
+/* everything IPv4 / ARP that reaches us: DHCP replies, ARP (answered when it asks for our address), ping replies */
+static void
+on_ip(uint32_t ethertype, const uint8_t *p, uint32_t n, const uint8_t *da, const uint8_t *sa)
+{
+	(void)da;
+	if (ethertype == ETH_ARP && n >= 28u && be16(p) == 1u && be16(p + 2) == ETH_IPV4 && p[4] == 6u && p[5] == 4u) {
+		gArpFrames++;
+		uint32_t op = be16(p + 6), spa = rd_be32(p + 14), tpa = rd_be32(p + 24);
+		if (op == 2u && gRouterIp != 0 && spa == gRouterIp) {
+			memcpy(gRouterMac, p + 8, 6u);
+			gRouterMacKnown = true;
+		} else if (op == 1u && gMyIp != 0 && tpa == gMyIp) {
+			uint8_t r[28];
+			memcpy(r, p, 6u);
+			put_be16(r + 6, 2u);
+			memcpy(r + 8, gMac, 6u);
+			wr_be32(r + 14, gMyIp);
+			memcpy(r + 18, p + 8, 6u);
+			wr_be32(r + 24, spa);
+			char res[96];
+			if (send_eth(sa, ETH_ARP, r, sizeof(r), res, sizeof(res)) == NULL) {
+				gArpAnswered++;
+			}
+		}
+		return;
+	}
+	if (ethertype != ETH_IPV4 || n < 20u || (p[0] >> 4) != 4u) {
+		gOtherIp++;
+		return;
+	}
+	gIpFrames++;
+	uint32_t ihl = (p[0] & 0xFu) * 4u, total = be16(p + 2);
+	if (ihl < 20u || total > n || total < ihl) {
+		return;
+	}
+	const uint8_t *l4 = p + ihl;
+	uint32_t l4n = total - ihl;
+	if (p[9] == 17u && l4n >= 8u && be16(l4) == 67u && be16(l4 + 2) == 68u) {
+		on_dhcp(l4 + 8, l4n - 8u);
+	} else if (p[9] == 1u && l4n >= 8u && l4[0] == 0 && be16(l4 + 4) == kPingId && gMyIp != 0 &&
+	    rd_be32(p + 16) == gMyIp) {
+		uint32_t seq = be16(l4 + 6);
+		if (seq >= 1u && seq <= PING_COUNT && gPingSeqSeen[seq - 1u] == 0) {
+			gPingSeqSeen[seq - 1u] = 1u;
+			gPingRtt[seq - 1u] = ms_since_power_on() - gPingSentAt[seq - 1u];
+		}
+	}
+}
+
+static bool
+data_fail(char *res, size_t len, const char *what)
+{
+	char name[33];
+	ssid_print(name, sizeof(name));
+	snprintf(res, len, "STEP 7 FAIL: data with %s: %s (%u IPv4 and %u ARP frames from it after the keys, %u other)", name,
+	    what, gIpFrames, gArpFrames, gOtherIp);
+	return false;
+}
+
+static bool
+run7(char *res, size_t len)
+{
+	gStep = "7";
+	char name[33];
+	ssid_print(name, sizeof(name));
+	uint32_t t0 = ms_since_power_on();
+	read_random(&gXid, sizeof(gXid));
+	gIpHook = on_ip;
+
+	/* DHCP: DISCOVER until an OFFER (4 tries, 2 s each), then REQUEST until an ACK or NAK */
+	for (uint32_t i = 0; i < 4u && gDhcpType == 0; i++) {
+		const char *e = dhcp_send(DHCP_DISCOVER, res, len);
+		if (e != NULL) {
+			return gFwDown ? false : data_fail(res, len, e);
+		}
+		A_LOG("DHCP discover %u sent (encrypted, broadcast)", i + 1u);
+		(void)wait_for([]() { return gDhcpType != 0 || gDeauth || gKickout; }, 2000u, "a DHCP offer", res, len);
+		if (gFwDown) {
+			return false;
+		}
+	}
+	if (gDeauth || gKickout) {
+		return data_fail(res, len, gKickout ? "the firmware dropped the access point" : "it deauthenticated us");
+	}
+	if (gDhcpType == 0) {
+		return data_fail(res, len, "no DHCP offer to 4 discovers");
+	}
+	char a[16], b[16], c[16], d[16];
+	ip_str(gOfferIp, a);
+	ip_str(gOfferServer, b);
+	A_LOG("DHCP offer: %s from %s (the first encrypted frame from the network decrypted by the chip)", a, b);
+	for (uint32_t i = 0; i < 4u && gDhcpType == DHCP_OFFER; i++) {
+		const char *e = dhcp_send(DHCP_REQUEST, res, len);
+		if (e != NULL) {
+			return gFwDown ? false : data_fail(res, len, e);
+		}
+		(void)wait_for([]() { return gDhcpType != DHCP_OFFER || gDeauth; }, 2000u, "a DHCP ack", res, len);
+		if (gFwDown) {
+			return false;
+		}
+	}
+	if (gDhcpType != DHCP_ACK) {
+		return data_fail(res, len, gDhcpType == DHCP_NAK ? "the DHCP server refused our request (NAK)" :
+		    "no DHCP ack to 4 requests");
+	}
+	uint32_t dhcp_ms = ms_since_power_on() - t0;
+	uint32_t prefix = 0;
+	for (uint32_t m = gNetmask; m & 0x80000000u; m <<= 1) {
+		prefix++;
+	}
+	ip_str(gMyIp, a);
+	ip_str(gRouterIp, b);
+	ip_str(gDns, c);
+	ip_str(gServerIp, d);
+	A_LOG("DHCP ack: %s/%u, router %s, DNS %s, server %s, lease %u s (%u ms)", a, prefix, b, c, d, gLease, dhcp_ms);
+
+	/* ARP for the router, then ping it 3 times, 1 s apart */
+	uint32_t replies = 0, rmin = 0xFFFFFFFFu, rmax = 0, rsum = 0;
+	if (gRouterIp != 0) {
+		for (uint32_t i = 0; i < 3u && !gRouterMacKnown; i++) {
+			uint8_t r[28];
+			bzero(r, sizeof(r));
+			put_be16(r, 1u);
+			put_be16(r + 2, ETH_IPV4);
+			r[4] = 6u;
+			r[5] = 4u;
+			put_be16(r + 6, 1u);
+			memcpy(r + 8, gMac, 6u);
+			wr_be32(r + 14, gMyIp);
+			wr_be32(r + 24, gRouterIp);
+			(void)send_eth(kBcast, ETH_ARP, r, sizeof(r), res, len);
+			(void)wait_for([]() { return gRouterMacKnown; }, 1000u, "an ARP reply", res, len);
+			if (gFwDown) {
+				return false;
+			}
+		}
+		for (uint32_t seq = 1; gRouterMacKnown && seq <= PING_COUNT; seq++) {
+			uint8_t icmp[8u + 32u], pkt[20u + sizeof(icmp)];
+			bzero(icmp, sizeof(icmp));
+			icmp[0] = 8u;                             /* echo request */
+			put_be16(icmp + 4, kPingId);
+			put_be16(icmp + 6, seq);
+			for (uint32_t i = 8; i < sizeof(icmp); i++) {
+				icmp[i] = (uint8_t)('a' + (i - 8u) % 23u);
+			}
+			put_be16(icmp + 2, ip_sum(icmp, sizeof(icmp)));
+			bzero(pkt, 20u);
+			pkt[0] = 0x45u;
+			put_be16(pkt + 2, sizeof(pkt));
+			put_be16(pkt + 4, gSeq);
+			pkt[8] = 64u;
+			pkt[9] = 1u;
+			wr_be32(pkt + 12, gMyIp);
+			wr_be32(pkt + 16, gRouterIp);
+			put_be16(pkt + 10, ip_sum(pkt, 20u));
+			memcpy(pkt + 20, icmp, sizeof(icmp));
+			gPingSentAt[seq - 1u] = ms_since_power_on();
+			(void)send_eth(gRouterMac, ETH_IPV4, pkt, sizeof(pkt), res, len);
+			for (uint32_t t = 0; t < 1000u; t++) {
+				pump();
+				if (t % 10u == 0 && fw_down("a ping reply", res, len)) {
+					return false;
+				}
+				IOSleep(1);
+			}
+		}
+		for (uint32_t i = 0; i < PING_COUNT; i++) {
+			if (gPingSeqSeen[i]) {
+				replies++;
+				rsum += gPingRtt[i];
+				rmin = gPingRtt[i] < rmin ? gPingRtt[i] : rmin;
+				rmax = gPingRtt[i] > rmax ? gPingRtt[i] : rmax;
+			}
+		}
+	}
+	char ping[96];
+	if (!gRouterMacKnown) {
+		snprintf(ping, sizeof(ping), "no ARP reply from the router %s", b);
+	} else if (replies == 0) {
+		snprintf(ping, sizeof(ping), "ping %s: 0 of %u replies", b, PING_COUNT);
+	} else {
+		snprintf(ping, sizeof(ping), "ping %s: %u of %u replies, %u/%u/%u ms", b, replies, PING_COUNT, rmin,
+		    rsum / replies, rmax);
+	}
+	snprintf(res, len, "STEP 7 PASS: data through WPA2 with %s: DHCP lease %s/%u (router %s, DNS %s, %u s) in %u ms; "
+	    "%s; %u ARP requests for us answered", name, a, prefix, b, c, gLease, dhcp_ms, ping, gArpAnswered);
+	return true;
+}
+
 /* Leave politely: deauthenticate (reason 3), vdev down, peer delete, vdev stop - whatever was set up. */
 static void
 leave(void)
@@ -4725,6 +5096,7 @@ leave(void)
 	    gMgmtOther, gDataOther, gEapolRx, gEapolDropped);
 	gMgmtHook = NULL;
 	gDataHook = NULL;
+	gIpHook = NULL;
 	gDrainHook = NULL;
 }
 
@@ -4847,6 +5219,10 @@ op2_ath10k_step2b(const struct op2_ath10k_bus *bus, char *result, size_t len)
 		if (ok && bus->wpa2) {
 			A_LOG("%s", result);
 			ok = run6(result, len);
+		}
+		if (ok && bus->data) {
+			A_LOG("%s", result);
+			ok = run7(result, len);
 		}
 		leave();
 	}

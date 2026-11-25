@@ -23,6 +23,7 @@
  *   7  as 6, then step 5 (OP2Ath10k.cpp): join the network named in the gitignored firmware/qca6174/wifi-network.txt
  *      (authentication, association), then leave it
  *   8  as 7, then step 6 (OP2Ath10k.cpp): the WPA2-PSK 4-way handshake, keys into the chip, 5 s connected, leave
+ *   9  as 8, then step 7 (OP2Ath10k.cpp): data through the keys: DHCP with the network, ARP and ping its router, leave
  *
  * Runs in its own kernel thread 120 s after the framebuffer starts (RPM is up by then, the UI is running),
  * and repeats a one-line summary every 60 s so it survives in the ramoops ring.
@@ -226,6 +227,11 @@ dump_all(const char *when)
 	dump_pin("wake", PIN_WAKE);
 	dump_pin("bootstrap", PIN_BOOTSTRAP);
 	dump_pin("wlan_en", PIN_WLAN_EN);
+	/* OnePlus switch_antenna (live.dts; drivers/input/misc/switch_antenna.c drives all four low at probe): read only */
+	dump_pin("antenna1", 120);
+	dump_pin("antenna2", 121);
+	dump_pin("antenna3", 122);
+	dump_pin("antenna4", 124);
 	dump_pmic("bt_vreg", PMGPIO9_BASE);
 	dump_pmic("L12", PMLDO(12));
 	dump_pmic("L28", PMLDO(28));
@@ -631,7 +637,7 @@ step2b(void)
 {
 	char line[320];
 	struct op2_ath10k_bus bus = { gBar0, gConf, gDbi, gPowerOnAbs, cold_reset_for_2b, gMode >= 4, gMode >= 5,
-		gMode >= 6, gMode >= 7, gMode >= 8 };
+		gMode >= 6, gMode >= 7, gMode >= 8, gMode >= 9 };
 	(void)op2_ath10k_step2b(&bus, line, sizeof(line));
 	summary(line);
 }
@@ -823,7 +829,8 @@ wifi_thread(__unused void *param, __unused wait_result_t wr_)
 		    "bring-up + step 2b (DMA, BMI)" : gMode == 4 ? "bring-up + 2b + step 2c (firmware boot)" :
 		    gMode == 5 ? "bring-up + 2b + 2c + step 3 (WMI, HTT)" : gMode == 6 ?
 		    "bring-up + 2b + 2c + 3 + step 4 (listen-only scan)" : gMode == 7 ? "bring-up + 2b + 2c + 3 + 4 + step 5 (join)" :
-		    "bring-up + 2b + 2c + 3 + 4 + 5 + step 6 (WPA2)");
+		    gMode == 8 ? "bring-up + 2b + 2c + 3 + 4 + 5 + step 6 (WPA2)" :
+		    "bring-up + 2b + 2c + 3 + 4 + 5 + 6 + step 7 (DHCP, ping)");
 		dump_all("before");
 		if (gMode >= 2) {
 			bringup();

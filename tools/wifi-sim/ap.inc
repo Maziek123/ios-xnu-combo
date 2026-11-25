@@ -10,6 +10,9 @@
  *     announced by an in-order indication
  * 30: as 22, but as on the phone: tx pause events come with message 3 (station add BA stop/wake, ignored; MCC
  *     stop/wake for vdev 0) and the firmware never confirms message 4
+ * 31: wifi=9: as 22, then data through the keys: DHCP (offer 172.20.10.2/28, router and DNS .1), our ARP for the
+ *     router answered, the hotspot ARPs for us (we must answer), 3 pings answered
+ * 32: wifi=9, the DHCP server stays silent: STEP 7 FAIL after 4 discovers
  * 28: the hotspot never beacons where we listen but answers our probe request in the second directed round: WPA2 as 22 */
 #include <openssl/hmac.h>
 #include <openssl/evp.h>
@@ -17,6 +20,7 @@
 
 static const uint8_t kApMac[6] = { 0x02, 0x1a, 0x11, 0xf0, 0x00, 0x01 };
 static const uint8_t kStaMac[6] = { 0x00, 0x03, 0x7f, 0x12, 0x34, 0x56 };
+static const uint8_t kBcast_sim[6] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
 static const uint8_t kGtk[16] = { 0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6a, 0x6b, 0x6c, 0x6d, 0x6e, 0x6f };
 static uint8_t ap_pmk[32], ap_ptk[48], ap_anonce[32], ap_snonce[32];
 static uint64_t ap_replay;
@@ -26,7 +30,7 @@ static uint32_t ap_ps_off, ap_vdev_starts, ap_peer_creates, ap_peer_assocs, ap_v
 static bool ap_pa_ok, ap_order_ok = true;
 static uint32_t ap_state;   /* 0 idle, 1 authenticated, 2 associated, 3 msg3 sent, 4 done */
 
-static bool ap_scenario(void) { return scenario >= 22 && scenario <= 30; }
+static bool ap_scenario(void) { return scenario >= 22 && scenario <= 32; }
 
 static std::vector<uint8_t>
 ap_rsn(void)
@@ -147,6 +151,129 @@ ap_mgmt_to_sta(uint8_t fc0, const std::vector<uint8_t> &body, bool via_ring)
 	outq[2].push_back(htc(2, p));
 }
 
+/* ---- the hotspot's IP side (scenarios 31, 32): DHCP server, ARP, ping ---- */
+static const uint32_t kApIp = 0xac140a01u, kStaIp = 0xac140a02u;   /* 172.20.10.1, 172.20.10.2 */
+static uint32_t ap_discovers, ap_requests, ap_arp_from_sta, ap_arp_reply_from_sta, ap_pings, ap_bad_csum;
+
+static uint16_t
+ap_csum(const uint8_t *p, size_t n)
+{
+	uint32_t s = 0;
+	for (size_t i = 0; i < n; i += 2) s += (uint32_t)(p[i] << 8) | (i + 1 < n ? p[i + 1] : 0);
+	while (s >> 16) s = (s & 0xffff) + (s >> 16);
+	return (uint16_t)~s;
+}
+
+static void be32put(std::vector<uint8_t> &v, uint32_t x) { for (int i = 3; i >= 0; i--) v.push_back((uint8_t)(x >> (8 * i))); }
+static void be16put(std::vector<uint8_t> &v, uint32_t x) { v.push_back((uint8_t)(x >> 8)); v.push_back((uint8_t)x); }
+
+/* to the station: native wifi from DS (the chip has decrypted it; Protected left set), LLC/SNAP, as an offloaded
+ * in-order buffer like the phone's firmware delivers them */
+static void
+ap_to_sta(const uint8_t da[6], uint16_t ethertype, const std::vector<uint8_t> &payload)
+{
+	std::vector<uint8_t> f = { 0x08, 0x42, 0, 0 };
+	f.insert(f.end(), da, da + 6);
+	f.insert(f.end(), kApMac, kApMac + 6);
+	f.insert(f.end(), kApMac, kApMac + 6);
+	f.insert(f.end(), { 0, 0, 0xaa, 0xaa, 0x03, 0, 0, 0 });
+	be16put(f, ethertype);
+	f.insert(f.end(), payload.begin(), payload.end());
+	queue_ring_frame(f, 1u << 31, true, 50, 0xFC);
+}
+
+static std::vector<uint8_t>
+ap_ipv4(uint8_t proto, uint32_t src, uint32_t dst, const std::vector<uint8_t> &l4)
+{
+	std::vector<uint8_t> p = { 0x45, 0 };
+	be16put(p, (uint32_t)(20 + l4.size()));
+	p.insert(p.end(), { 0, 1, 0, 0, 64, proto, 0, 0 });
+	be32put(p, src);
+	be32put(p, dst);
+	uint16_t c = ap_csum(p.data(), 20);
+	p[10] = (uint8_t)(c >> 8); p[11] = (uint8_t)c;
+	p.insert(p.end(), l4.begin(), l4.end());
+	return p;
+}
+
+static void
+ap_dhcp_reply(const uint8_t *req, uint8_t type)
+{
+	std::vector<uint8_t> b(240, 0);
+	b[0] = 2; b[1] = 1; b[2] = 6;
+	memcpy(&b[4], req + 4, 4);          /* xid */
+	b[10] = 0x80;
+	b[16] = 0xac; b[17] = 0x14; b[18] = 0x0a; b[19] = 0x02;   /* yiaddr 172.20.10.2 */
+	memcpy(&b[28], req + 28, 16);       /* chaddr */
+	b[236] = 0x63; b[237] = 0x82; b[238] = 0x53; b[239] = 0x63;
+	b.insert(b.end(), { 53, 1, type, 54, 4, 0xac, 0x14, 0x0a, 0x01, 1, 4, 0xff, 0xff, 0xff, 0xf0, 3, 4, 0xac, 0x14, 0x0a, 0x01,
+		6, 4, 0xac, 0x14, 0x0a, 0x01, 51, 4, 0, 1, 0x51, 0x80, 255 });   /* lease 86400 s */
+	std::vector<uint8_t> u;
+	be16put(u, 67); be16put(u, 68); be16put(u, (uint32_t)(8 + b.size())); be16put(u, 0);
+	u.insert(u.end(), b.begin(), b.end());
+	ap_to_sta(kBcast_sim, 0x0800, ap_ipv4(17, kApIp, 0xffffffffu, u));
+}
+
+/* an IP-side payload from the station (dst: the 802.11 DA) */
+static void
+ap_ip(const uint8_t *dst, uint32_t ethertype, const uint8_t *p, uint32_t n)
+{
+	if (ethertype == 0x0806) {                         /* ARP */
+		assert(n == 28 && p[0] == 0 && p[1] == 1 && p[2] == 8 && p[3] == 0 && p[4] == 6 && p[5] == 4 && memcmp(p + 8, kStaMac, 6) == 0);
+		if (p[7] == 1) {                               /* who has 172.20.10.1 */
+			assert(memcmp(dst, kBcast_sim, 6) == 0 && ((uint32_t)p[24] << 24 | p[25] << 16 | p[26] << 8 | p[27]) == kApIp);
+			ap_arp_from_sta++;
+			std::vector<uint8_t> r = { 0, 1, 8, 0, 6, 4, 0, 2 };
+			r.insert(r.end(), kApMac, kApMac + 6); be32put(r, kApIp);
+			r.insert(r.end(), kStaMac, kStaMac + 6); be32put(r, kStaIp);
+			ap_to_sta(kStaMac, 0x0806, r);
+		} else {                                       /* the station's answer to our ARP request */
+			assert(p[7] == 2 && memcmp(dst, kApMac, 6) == 0 && memcmp(p + 18, kApMac, 6) == 0);
+			ap_arp_reply_from_sta++;
+		}
+		return;
+	}
+	assert(ethertype == 0x0800 && n >= 28 && p[0] == 0x45);
+	if (ap_csum(p, 20) != 0) ap_bad_csum++;
+	if (p[9] == 17) {                                  /* DHCP */
+		assert(p[20] == 0 && p[21] == 68 && p[22] == 0 && p[23] == 67 && memcmp(dst, kBcast_sim, 6) == 0);
+		const uint8_t *b = p + 28;
+		assert(n >= 28 + 240 && b[0] == 1 && memcmp(b + 28, kStaMac, 6) == 0 && b[236] == 0x63 && b[240] == 53 && b[241] == 1);
+		uint8_t type = b[242];
+		if (type == 1) {
+			ap_discovers++;
+			if (scenario != 32) ap_dhcp_reply(b, 2);
+		} else if (type == 3) {
+			ap_requests++;
+			/* requested address 172.20.10.2 and our server id in options 50 and 54 */
+			bool r50 = false, s54 = false;
+			for (size_t o = 240; o + 2 <= n - 28 && b[o] != 255; o += 2 + b[o + 1]) {
+				if (b[o] == 50) r50 = memcmp(b + o + 2, "\xac\x14\x0a\x02", 4) == 0;
+				if (b[o] == 54) s54 = memcmp(b + o + 2, "\xac\x14\x0a\x01", 4) == 0;
+			}
+			assert(r50 && s54);
+			ap_dhcp_reply(b, 5);
+			/* and ask who 172.20.10.2 is: the station must answer */
+			std::vector<uint8_t> q = { 0, 1, 8, 0, 6, 4, 0, 1 };
+			q.insert(q.end(), kApMac, kApMac + 6); be32put(q, kApIp);
+			q.insert(q.end(), 6, 0); be32put(q, kStaIp);
+			ap_to_sta(kBcast_sim, 0x0806, q);
+		}
+		return;
+	}
+	if (p[9] == 1) {                                   /* ICMP echo to 172.20.10.1 */
+		assert(memcmp(dst, kApMac, 6) == 0 && p[20] == 8 && ap_csum(p + 20, n - 20) == 0);
+		ap_pings++;
+		std::vector<uint8_t> icmp(p + 20, p + n);
+		icmp[0] = 0; icmp[2] = 0; icmp[3] = 0;
+		uint16_t c = ap_csum(icmp.data(), icmp.size());
+		icmp[2] = (uint8_t)(c >> 8); icmp[3] = (uint8_t)c;
+		ap_to_sta(kStaMac, 0x0800, ap_ipv4(1, kApIp, kStaIp, icmp));
+		return;
+	}
+	assert(!"unexpected IP packet from the station");
+}
+
 /* a frame the station sent (HTT TX_FRM) */
 static void
 ap_frame(const uint8_t *f, uint32_t n, bool mgmt)
@@ -188,10 +315,16 @@ ap_frame(const uint8_t *f, uint32_t n, bool mgmt)
 		}
 		return;
 	}
-	/* data: native wifi, to DS, LLC/SNAP, EAPOL-Key */
-	assert(f[0] == 0x08 && f[1] == 0x01 && memcmp(f + 16, kApMac, 6) == 0 && n >= 32 + 99);
+	/* data: native wifi, to DS, LLC/SNAP; EAPOL-Key in the clear, anything else encrypted (Protected) after the keys */
+	static const uint8_t snap[6] = { 0xaa, 0xaa, 0x03, 0, 0, 0 };
+	assert(f[0] == 0x08 && (f[1] & 0x01) && n >= 32 && memcmp(f + 24, snap, 6) == 0);
+	if (f[30] != 0x88 || f[31] != 0x8e) {
+		assert(ap_authorized == 1 && (f[1] & 0x40));   /* only once the port is open, and marked for the chip's CCMP */
+		ap_ip(f + 16, (uint32_t)(f[30] << 8 | f[31]), f + 32, n - 32);
+		return;
+	}
 	static const uint8_t llc[8] = { 0xaa, 0xaa, 0x03, 0, 0, 0, 0x88, 0x8e };
-	assert(memcmp(f + 24, llc, 8) == 0);
+	assert(f[1] == 0x01 && memcmp(f + 16, kApMac, 6) == 0 && n >= 32 + 99 && memcmp(f + 24, llc, 8) == 0);
 	const uint8_t *e = f + 32;
 	size_t el = n - 32;
 	assert(e[1] == 3 && e[4] == 2 && (size_t)((e[2] << 8) | e[3]) + 4 == el && e[0] == 2);
@@ -269,10 +402,12 @@ ap_tx_frm(const uint8_t *p, uint32_t plen)
 		assert(tid == 17);
 		f = resolve(frags, len);
 	} else {
-		assert(type == 1 && tid == 16 && (flags0 & 4));
+		assert(type == 1 && tid == 16);
 		uint32_t fl[4]; memcpy(fl, resolve(frags, 16), 16);
 		assert(fl[1] == len && fl[2] == 0 && fl[3] == 0);
 		f = resolve(fl[0], len);
+		bool eapol = len >= 32 && f[30] == 0x88 && f[31] == 0x8e;
+		assert(eapol ? (flags0 & 4) != 0 : (flags0 & 4) == 0);   /* EAPOL in the clear, the rest encrypted by the chip */
 	}
 	uint32_t pre = ((len < 46 ? len : 46) + 3) & ~3u;
 	assert(plen == 16 + pre && memcmp(p + 16, f, len < pre ? len : pre) == 0);

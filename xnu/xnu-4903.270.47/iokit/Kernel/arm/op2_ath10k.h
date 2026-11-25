@@ -21,6 +21,7 @@ struct op2_ath10k_bus {
 	bool scan;                 /* wifi=6: after a step 3 pass, step 4 (a scan that only listens) */
 	bool join;                 /* wifi=7: after a step 4 pass, step 5 (join the configured network) */
 	bool wpa2;                 /* wifi=8: after a step 5 pass, step 6 (WPA2-PSK 4-way handshake, keys, 5 s) */
+	bool data;                 /* wifi=9: after a step 6 pass, step 7 (DHCP through the keys, ARP, ping the router) */
 };
 
 /* Runs step 2b (and 2c, 3); writes the last step's one-line result ("STEP 2b PASS: ...", "STEP 3 FAIL: ...")

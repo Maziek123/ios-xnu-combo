@@ -57,12 +57,12 @@ The kernel code is `iokit/Kernel/arm/OP2Wifi.cpp` (power, PCIe, chip registers) 
 engines, boot loader, firmware download, the firmware's HTC/WMI/HTT services, scanning, joining and WPA2, ported
 from Linux's ath10k; the 4-way handshake follows wpa_supplicant). It is off by default; the boot-arg `wifi` in the `CMDLINE=`
 line of `tools/build-daily.sh` sets how far it goes. **Each `wifi=N` runs every step of the lower numbers first, in
-order, and stops at the first one that fails**: `wifi=8` runs the probe, steps 1 to 5 and then 6; `wifi=7` stops after
+order, and stops at the first one that fails**: `wifi=9` runs the probe, steps 1 to 6 and then 7; `wifi=7` stops after
 step 5. Without the boot-arg (or `wifi=0`) nothing touches the Wi-Fi hardware. It runs in its own kernel thread 120 s
 after boot, logs a verdict line (`RESULT:`) for each step it passes and the one it stops at, and repeats the last one
 every 60 s so it survives in ramoops: `grep -a 'OP2 WIFI' op2-last-boot.log`.
 Each change is checked first in a host simulation of the chip (and, for steps 5 and 6, of an access point):
-[`tools/wifi-sim`](tools/wifi-sim/README.md).
+[`tools/wifi-sim`](tools/wifi-sim/README.md) (33 scenarios).
 
 | Step | `wifi=` (runs the rows above it too) | Result |
 |---|---|---|
@@ -76,8 +76,9 @@ Each change is checked first in a host simulation of the chip (and, for steps 5 
 | **4** listen-only scan | 6 | **Passes on the phone**: about 5 networks and 20 beacons per 5.6 s scan since the receive fix of progress row 19 (the radio's reported noise floor, about -119 dBm on 2.4 GHz, is still lower than expected). Before it: ath10k's HTT rx ring, ath10k's start-up settings (chain mask for the board's one RF chain, ANI), the board's regulatory domain, a channel list with every channel passive (2.4 GHz 1-13, 5 GHz 36-165), a station interface with the chip's MAC. The log lists the networks heard (name, channel, signal, security) and each channel's noise floor and load. The chip does not transmit. |
 | **5** join | 7 | **Passes on the phone** (progress rows 17 and 19). Finds the network named in `wifi-network.txt` ([below](#wi-fi-firmware-files)): in step 4's scan, else by asking for it by name (probe requests on 2.4 GHz channels 1-11, up to 4 rounds), else in one more listen-only scan. Checks it offers WPA2-PSK with AES (CCMP), starts the chip on its channel, creates the peer, then open authentication and association as a plain 802.11a/b/g station (frames go out through HTT: this firmware has no WMI management transmit). With `wifi=7` the run ends here: the phone leaves the network again (deauthentication, vdev down, peer delete, vdev stop). |
 | **6** WPA2 | 8 | **Passes on the phone** (progress row 20): connected to an iPhone hotspot with WPA2, both keys confirmed by the firmware, the port open, 5 s connected without a deauthentication. Runs step 5 first, then the 4-way handshake (keys from the network name and password, message 3's MIC checked, the group key decrypted; message 4 is not waited for, as wpa_supplicant does), both keys into the chip, the port opened, 5 s connected counting data frames from the network, then it leaves as `wifi=7` does. The crypto (SHA-1, HMAC, the 802.11 PRF, AES key unwrap) is in the driver and checks itself against published test vectors first. |
+| **7** data | 9 | Written, not yet run on the phone: after step 6, the first data through the keys. DHCP with the network (discover and request sent encrypted by the chip; the offer and ack are the first encrypted frames from the network, decrypted by the chip), then ARP for the router it names and 3 pings to it; ARP requests for our address are answered. The result line has the lease (address, router, DNS) and the ping times. Then it leaves as `wifi=7` does. Not yet a network interface for iOS. |
 
-Next (`wifi=9`): staying connected, data through the installed keys (DHCP with the hotspot first), and a network interface for iOS so Safari can use it; later power save, beacon loss and roaming, then Bluetooth.
+Next: staying connected and a network interface for iOS so Safari can use the connection (on top of step 7); later power save, beacon loss and roaming, then Bluetooth.
 
 #### Progress so far (2026-11-23 to 11-25)
 
@@ -103,6 +104,7 @@ Next (`wifi=9`): staying connected, data through the installed keys (DHCP with t
 | 18 | Step 5 asks for the network by name: probe requests on 2.4 GHz channels 1-11 (12-13 stay listen-only), up to 4 quick rounds, then one more listen-only scan of every channel (`9b1c327`, run in row 19) | Not needed in that run: the hotspot was in step 4's scan | Stays for when the first scan misses the network. An access point answers a probe request with a probe response addressed to us and retries it until we acknowledge it: several chances instead of one. Checked in simulation (a hotspot that only answers probes, in the second round). |
 | 19 | Steps 5 and 6 with in-order rx indications handled, probing by name (`9b1c327`) | Step 5 **PASS** (hotspot in the first scan, 4 beacons; 20 beacons in all now that a stuck buffer no longer blocks the rest). Step 6: message 1 read, message 2 acknowledged, **message 3's MIC checked** (the password and the key derivation are right), message 4 sent - the iPhone showed a connected device - but the firmware never confirmed message 4 and the driver gave up before installing the keys. Two WMI TX_PAUSE events came with message 3 | wpa_supplicant installs the keys right after sending message 4; so does the driver now. |
 | 20 | Step 6 without waiting for message 4's confirmation (2 s at most), a repeated message 3 answered while connected, TX_PAUSE decoded (vdev pauses hold our sends as ath10k stops its queues; the others are only logged) (`45fc46f`) | **STEP 6 PASS**: hotspot in the first scan, joined in 48 ms, messages 1-3, message 4 sent (again never confirmed; an MCC tx pause stop/wake came with message 3), both keys installed and confirmed (also WMI install-key-complete events), port open, 5 s connected, no deauthentication, left cleanly. 0 data frames from the network in those 5 s | The phone is a WPA2 client of the hotspot. A hotspot sends a new client almost nothing until it asks for something (an address over DHCP), so the encrypted data path is not proven yet: that is the first thing for `wifi=9`. |
+| 21 | Step 7, `wifi=9`: DHCP, ARP and ping through the keys; the OnePlus antenna-switch pins (GPIO 120, 121, 122, 124) logged with the other pins, read only | Not run yet | Checked in simulation: the hotspot model's DHCP server, ARP and ping (its IP checksums checked independently), every frame after the keys marked Protected and handed to the chip for encryption; and a silent DHCP server. |
 
 #### Testing a step
 

@@ -44,8 +44,8 @@ use printf/IOLog for anything you need to see.
 - Wi-Fi (2026-11-25): QCA6174 on PCIe, ath10k ported in iokit/Kernel/arm/OP2Wifi.cpp + OP2Ath10k.cpp, boot-arg wifi=N
   (each N runs all lower steps; README "Wi-Fi bring-up"). wifi=8 joins a WPA2 hotspot named in the gitignored
   firmware/qca6174/wifi-network.txt (tools/gen-wifi-fw.py -> op2_wifi_net.h: name + PMK only) and runs the 4-way
-  handshake (STEP 6 PASS on the phone); no network interface for iOS yet. Firmware blobs + generated headers stay
-  out of git. Before a phone round: bash tools/wifi-sim/run.sh (simulated chip + OpenSSL access point, 31 scenarios)
+  handshake (STEP 6 PASS on the phone); wifi=9 adds DHCP/ARP/ping through the keys; no network interface for iOS yet. Firmware blobs + generated headers stay
+  out of git. Before a phone round: bash tools/wifi-sim/run.sh (simulated chip + OpenSSL access point, 33 scenarios)
   and tools/wifi-sim/kcheck.sh (XNU warning flags).
 - Safari (2026-11-17): loads/draws normal sites (google, wikipedia) after kernel NECP ADD_FLOW, entitlement
   privileges (kern_priv), AppleM2ScalerCSCDriver stub; WebContent runs on the CPU (OP2Metal: one op2mtl context

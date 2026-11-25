@@ -4,7 +4,7 @@ Checks for the QCA6174 Wi-Fi driver (`iokit/Kernel/arm/OP2Ath10k.cpp`) without t
 compiled for Linux with AddressSanitizer and UBSan, against a simulated chip. The chip model answers the boot loader,
 checks the firmware download byte for byte, runs the HTC/WMI/HTT exchanges, delivers scan results, and from
 scenario 22 on adds an access point whose side of the WPA2 handshake is done with OpenSSL (an implementation
-independent of the driver's own). 31 scenarios, each described at the top of `harness.cpp` and `ap.inc`: normal runs
+independent of the driver's own) and, for step 7, a DHCP server, ARP and ping. 33 scenarios, each described at the top of `harness.cpp` and `ap.inc`: normal runs
 and the failures seen on the phone (silent boot ROM, firmware crashes, missing events, a hotspot that only answers
 probes, offloaded receive buffers, a stuck buffer, unconfirmed transmits, a wrong password).
 
