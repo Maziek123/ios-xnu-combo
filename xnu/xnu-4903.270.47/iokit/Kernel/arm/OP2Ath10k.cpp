@@ -2312,6 +2312,245 @@ vdev_delete(uint32_t id)
 	return wmi_cmd_words(WMI_TLV_VDEV_DELETE_CMDID, w, 2u);
 }
 
+/* HTT rx ring (htt_rx.c ath10k_htt_rx_alloc + ath10k_htt_rx_ring_fill_n, htt_tx.c ath10k_htt_send_rx_ring_cfg_32 +
+ * ath10k_htt_h2t_aggr_cfg_msg). ath10k hands the firmware this ring before anything else runs; the firmware
+ * receives nothing without it. Ring entries are the 32-bit addresses of 2 KB buffers; alloc_idx (host memory the
+ * firmware reads) is how far the host has posted. Each buffer starts with struct htt_rx_desc_v1 (QCA6174 uses
+ * qca988x_rx_desc_ops): attention at 4, msdu_start at 24, ppdu_start at 84, rx_hdr_status at 236, payload at 300. */
+#define HTT_H2T_MSG_TYPE_RX_RING_CFG      2u
+#define HTT_H2T_MSG_TYPE_AGGR_CFG         5u
+#define HTT_T2H_MSG_TYPE_RX_IND           1u
+#define HTT_RX_RING_SIZE                  256u      /* entries, a power of two */
+#define HTT_RX_FILL                       127u      /* buffers posted: ath10k's size / 2 - 1 */
+#define HTT_RX_BUF_SIZE                   2048u
+#define HTT_RX_RING_OFF                   (HTT_RX_FILL * HTT_RX_BUF_SIZE)
+#define HTT_RX_IDX_OFF                    (HTT_RX_RING_OFF + 4u * HTT_RX_RING_SIZE)
+#define HTT_RX_BLOCK                      0x40000u  /* 256 KB: 127 buffers, the ring, alloc_idx */
+#define RXD_ATTENTION                     4u
+#define RXD_MSDU_START                    24u
+#define RXD_RSSI_COMB                     100u      /* ppdu_start.rssi_comb: dB over the noise floor */
+#define RXD_HDR_STATUS                    236u
+#define RXD_HDR_STATUS_LEN                64u
+#define RXD_PAYLOAD                       300u
+#define RX_ATTN_MGMT                      (1u << 8)
+#define RX_ATTN_CTRL                      (1u << 9)
+#define RX_ATTN_FCS_ERR                   (1u << 30)
+#define RX_ATTN_MSDU_DONE                 (1u << 31)
+#define WMI_TLV_CHAN_INFO_EVENTID         0x4002u
+#define WMI_TLV_TAG_CHAN_INFO_EVENT       38u
+#define WMI_CHAN_INFO_FLAG_COMPLETE       1u
+
+/* struct htt_rx_ring_rx_desc_offsets for htt_rx_desc_v1, in 4-byte words: mac80211 header, msdu payload,
+ * ppdu start/end, mpdu start/end, msdu start/end, attention, frag info */
+static void add_frame(const uint8_t *f, uint32_t flen, uint32_t chan, int32_t dbm, bool from_ring);
+
+static_assert(HTT_RX_IDX_OFF + 4u <= HTT_RX_BLOCK, "the HTT rx block holds the buffers, the ring and alloc_idx");
+
+static const uint16_t kRxDescOffsets[10] = { 59, 75, 21, 31, 3, 20, 6, 10, 1, 2 };
+
+static uint8_t *gRxPool;
+static uint32_t gRxPoolPhys, gRxAlloc, gRxRead;
+static uint8_t gRxRingBuf[HTT_RX_RING_SIZE];   /* which buffer each ring entry holds */
+static uint32_t gRingFrames, gRingMgmt, gRingCtrl, gRingFcs, gRingBeacons, gHttRxInd, gHttOther;
+static uint32_t gScanMhz, gChanInfos, gChanHeard, gChanBusy, gChanInfoLines;
+static int32_t gNfMin = 1000, gNfMax = -1000;
+static uint32_t gCiMhz, gCiRxClear, gCiCycles, gCiRxFrame;   /* the last "start of dwell" chan info */
+
+static inline void
+put16(uint8_t *p, uint32_t v)
+{
+	p[0] = (uint8_t)v;
+	p[1] = (uint8_t)(v >> 8);
+}
+
+static inline void
+put32(uint8_t *p, uint32_t v)
+{
+	put16(p, v);
+	put16(p + 2, v >> 16);
+}
+
+static inline uint32_t
+mhz_to_chan(uint32_t mhz)
+{
+	return mhz >= 5000u ? (mhz - 5000u) / 5u : mhz >= 2407u ? (mhz - 2407u) / 5u : 0u;
+}
+
+static bool
+htt_rx_setup(char *res, size_t len)
+{
+	if (gRxPool == NULL) {
+		IOPhysicalAddress phys = 0;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+		void *cached = IOMallocContiguous(HTT_RX_BLOCK, 4096, &phys);
+#pragma clang diagnostic pop
+		if (cached == NULL || phys == 0 || (uint64_t)phys + HTT_RX_BLOCK > 0x100000000ULL ||
+		    !clear_of_window(phys, HTT_RX_BLOCK)) {
+			snprintf(res, len, "STEP 4 FAIL: no usable %u KB for the HTT rx ring below 4 GB (phys %llx)",
+			    HTT_RX_BLOCK / 1024u, (unsigned long long)phys);
+			return false;
+		}
+		cache_flush(cached, HTT_RX_BLOCK);   /* the cacheable alias is never touched again */
+		gRxPool = (uint8_t *)ml_io_map_wcomb((vm_offset_t)phys, HTT_RX_BLOCK);
+		if (gRxPool == NULL) {
+			snprintf(res, len, "STEP 4 FAIL: no non-cacheable mapping for the HTT rx ring at %08x", (uint32_t)phys);
+			return false;
+		}
+		gRxPoolPhys = (uint32_t)phys;
+	}
+	/* ath10k_htt_rx_ring_refill: buffers with cleared descriptors, then alloc_idx */
+	bzero(gRxPool, HTT_RX_BLOCK);
+	for (uint32_t i = 0; i < HTT_RX_FILL; i++) {
+		put32(gRxPool + HTT_RX_RING_OFF + 4u * i, gRxPoolPhys + i * HTT_RX_BUF_SIZE);
+		gRxRingBuf[i] = (uint8_t)i;
+	}
+	gRxRead = 0;
+	gRxAlloc = HTT_RX_FILL;
+	put32(gRxPool + HTT_RX_IDX_OFF, gRxAlloc);
+	dma_fence();
+
+	/* RX_RING_CFG: htt_cmd_hdr (1), htt_rx_ring_setup_hdr (num_rings 1, rsvd 2), htt_rx_ring_setup_ring32 (36) */
+	uint8_t m[40];
+	bzero(m, sizeof(m));
+	m[0] = HTT_H2T_MSG_TYPE_RX_RING_CFG;
+	m[1] = 1u;
+	put32(m + 4, gRxPoolPhys + HTT_RX_IDX_OFF);    /* fw_idx_shadow_reg_paddr = alloc_idx */
+	put32(m + 8, gRxPoolPhys + HTT_RX_RING_OFF);   /* rx_ring_base_paddr */
+	put16(m + 12, HTT_RX_RING_SIZE);
+	put16(m + 14, HTT_RX_BUF_SIZE);
+	put16(m + 16, 0xFFFFu);                         /* every HTT_RX_RING_FLAGS_* ath10k sets */
+	put16(m + 18, gRxAlloc);                        /* fw_idx_init_val */
+	for (uint32_t i = 0; i < 10u; i++) {
+		put16(m + 20 + 2u * i, kRxDescOffsets[i]);
+	}
+	if (!htc_send(gEpHtt, &gCe4, OFF_HTT_TX, HTT_TX_MAX, m, sizeof(m), false)) {
+		snprintf(res, len, "%s", "STEP 4 FAIL: HTT rx ring config could not be sent");
+		return false;
+	}
+	/* ATH10K_HTT_MAX_NUM_AMPDU_DEFAULT 64, ATH10K_HTT_MAX_NUM_AMSDU_DEFAULT 3 */
+	uint8_t a[3] = { HTT_H2T_MSG_TYPE_AGGR_CFG, 64u, 3u };
+	if (!htc_send(gEpHtt, &gCe4, OFF_HTT_TX, HTT_TX_MAX, a, sizeof(a), false)) {
+		snprintf(res, len, "%s", "STEP 4 FAIL: HTT aggregation config could not be sent");
+		return false;
+	}
+	A_LOG("HTT rx ring: %u entries at %08x, %u buffers of %u bytes posted, alloc_idx at %08x; aggregation 64/3",
+	    HTT_RX_RING_SIZE, gRxPoolPhys + HTT_RX_RING_OFF, HTT_RX_FILL, HTT_RX_BUF_SIZE, gRxPoolPhys + HTT_RX_IDX_OFF);
+	return true;
+}
+
+/* Buffers the chip has finished (MSDU_DONE), in ring order: counted, beacons parsed, then posted again. */
+static void
+rx_ring_poll(void)
+{
+	if (gRxPool == NULL) {
+		return;
+	}
+	for (uint32_t k = 0; k < HTT_RX_FILL && gRxRead != gRxAlloc; k++) {
+		uint32_t b = gRxRingBuf[gRxRead];
+		uint8_t *d = gRxPool + b * HTT_RX_BUF_SIZE;
+		uint32_t attn = le32(d + RXD_ATTENTION);
+		if ((attn & RX_ATTN_MSDU_DONE) == 0) {
+			break;
+		}
+		gRingFrames++;
+		uint32_t mlen = le32(d + RXD_MSDU_START) & 0x3FFFu;
+		const uint8_t *h = d + RXD_HDR_STATUS, *pl = d + RXD_PAYLOAD;
+		if (gRingFrames <= 4u) {
+			A_LOG("rx ring frame %u (buffer %u): attention %08x msdu length %u rssi %u | header %02x %02x %02x %02x "
+			    "%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x | payload %02x %02x %02x %02x", gRingFrames,
+			    b, attn, mlen, d[RXD_RSSI_COMB], h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[8], h[9], h[10],
+			    h[11], h[12], h[13], h[14], h[15], pl[0], pl[1], pl[2], pl[3]);
+		}
+		if (attn & RX_ATTN_FCS_ERR) {
+			gRingFcs++;
+		} else if (attn & RX_ATTN_CTRL) {
+			gRingCtrl++;
+		} else if (attn & RX_ATTN_MGMT) {
+			gRingMgmt++;
+			int32_t dbm = (int32_t)d[RXD_RSSI_COMB] + ATH10K_DEFAULT_NOISE_FLOOR;
+			uint32_t chan = mhz_to_chan(gScanMhz);
+			/* the whole frame in the payload (raw), else the first 64 bytes in rx_hdr_status */
+			if (mlen >= 36u && mlen <= HTT_RX_BUF_SIZE - RXD_PAYLOAD && (pl[0] == 0x80u || pl[0] == 0x50u)) {
+				add_frame(pl, mlen, chan, dbm, true);
+			} else if (h[0] == 0x80u || h[0] == 0x50u) {
+				add_frame(h, RXD_HDR_STATUS_LEN, chan, dbm, true);
+			}
+		}
+		bzero(d, RXD_PAYLOAD + 64u);   /* the descriptor (attention included) and the start of the payload */
+		put32(gRxPool + HTT_RX_RING_OFF + 4u * gRxAlloc, gRxPoolPhys + b * HTT_RX_BUF_SIZE);
+		gRxRingBuf[gRxAlloc] = (uint8_t)b;
+		gRxAlloc = (gRxAlloc + 1u) & (HTT_RX_RING_SIZE - 1u);
+		gRxRead = (gRxRead + 1u) & (HTT_RX_RING_SIZE - 1u);
+		dma_fence();
+		put32(gRxPool + HTT_RX_IDX_OFF, gRxAlloc);
+		dma_fence();
+	}
+}
+
+/* HTT messages during the scan: rx indications (frames in the ring) and anything else, counted */
+static void
+on_htt_msg(void)
+{
+	uint32_t t = msg_id();
+	if (t == HTT_T2H_MSG_TYPE_RX_IND) {
+		if (gHttRxInd++ < 3u) {
+			A_LOG("HTT rx indication, %u bytes: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x", gRxLen,
+			    gRx[0], gRx[1], gRx[2], gRx[3], gRx[4], gRx[5], gRx[6], gRx[7], gRx[8], gRx[9], gRx[10], gRx[11]);
+		}
+		return;
+	}
+	if (gHttOther++ < 4u) {
+		A_LOG("HTT message type %u, %u bytes: %02x %02x %02x %02x %02x %02x %02x %02x", t, gRxLen, gRx[0], gRx[1],
+		    gRx[2], gRx[3], gRx[4], gRx[5], gRx[6], gRx[7]);
+	}
+}
+
+/* struct wmi_tlv_chan_info_event: err_code, freq, cmd_flags, noise_floor, rx_clear_count, cycle_count,
+ * chan_tx_pwr_range, chan_tx_pwr_tp, rx_frame_count, my_bss_rx_cycle_count, ... One at the start of each dwell
+ * and one at its end (COMPLETE); the counters are free-running, so the dwell is the difference. */
+static void
+on_chan_info(void)
+{
+	const uint8_t *e = wmi_find(WMI_TLV_TAG_CHAN_INFO_EVENT, 36u);
+	if (e == NULL) {
+		other_msg();
+		return;
+	}
+	gChanInfos++;
+	uint32_t err = le32(e), mhz = le32(e + 4), flags = le32(e + 8);
+	int32_t nf = (int32_t)le32(e + 12);
+	uint32_t rx_clear = le32(e + 16), cycles = le32(e + 20), rx_frame = le32(e + 32);
+	if ((flags & WMI_CHAN_INFO_FLAG_COMPLETE) == 0) {
+		gCiMhz = mhz;
+		gCiRxClear = rx_clear;
+		gCiCycles = cycles;
+		gCiRxFrame = rx_frame;
+		return;
+	}
+	bool paired = gCiMhz == mhz;
+	uint32_t dc = paired ? cycles - gCiCycles : cycles, dbusy = paired ? rx_clear - gCiRxClear : rx_clear;
+	uint32_t drx = paired ? rx_frame - gCiRxFrame : rx_frame;
+	gCiMhz = 0;
+	if (nf < gNfMin) {
+		gNfMin = nf;
+	}
+	if (nf > gNfMax) {
+		gNfMax = nf;
+	}
+	if (drx != 0) {
+		gChanHeard++;
+	}
+	if (dbusy != 0) {
+		gChanBusy++;
+	}
+	uint32_t pb = dc ? (uint32_t)((uint64_t)dbusy * 100u / dc) : 0u, pr = dc ? (uint32_t)((uint64_t)drx * 100u / dc) : 0u;
+	if (gChanInfoLines++ < SCAN_NCHAN) {
+		A_LOG("channel %3u (%u MHz): noise floor %d dBm, busy %u%%, receiving %u%% of %u cycles%s%s", mhz_to_chan(mhz),
+		    mhz, nf, pb, pr, dc, paired ? "" : " (no start event)", err ? " (error)" : "");
+	}
+}
+
 /* ath10k_wmi_start_scan_init + ath10k_hw_scan without SSIDs (passive) + ath10k_wmi_tlv_op_gen_start_scan */
 static bool
 scan_start(void)
@@ -2381,7 +2620,9 @@ on_scan_event(void)
 	}
 	uint32_t type = le32(e), reason = le32(e + 4), freq = le32(e + 8);
 	if (type == WMI_SCAN_EVENT_FOREIGN_CHANNEL) {
+		rx_ring_poll();   /* frames heard on the previous channel keep its number */
 		gScanForeign++;
+		gScanMhz = freq;
 		return;
 	}
 	if (type == WMI_SCAN_EVENT_FOREIGN_CHANNEL_EXIT || type == WMI_SCAN_EVENT_BSS_CHANNEL) {
@@ -2399,34 +2640,20 @@ on_scan_event(void)
 	}
 }
 
-/* One beacon or probe response (ath10k_wmi_event_mgmt_rx): BSSID, SSID, channel, strongest signal, security */
+/* One beacon or probe response, from WMI MGMT_RX or from the HTT rx ring: BSSID, SSID, channel, strongest signal,
+ * security. f is the 802.11 frame (flen bytes); chan the channel number the firmware or the scan reported. */
 static void
-on_mgmt_rx(void)
+add_frame(const uint8_t *f, uint32_t flen, uint32_t chan, int32_t dbm, bool from_ring)
 {
-	struct tlv_it it = { gRx + 4, gRxLen - 4u };
-	uint32_t tag = 0, tl = 0, flen = 0;
-	const uint8_t *v = NULL, *hdr = NULL, *f = NULL;
-	while (tlv_next(&it, &tag, &tl, &v) == 1) {
-		if (tag == WMI_TLV_TAG_MGMT_RX_HDR && tl >= 24u && hdr == NULL) {
-			hdr = v;
-		} else if (tag == WMI_TLV_TAG_ARRAY_BYTE && f == NULL) {
-			f = v;
-			flen = tl;
-		}
-	}
-	if (hdr == NULL || f == NULL) {
-		gScanDropped++;
-		return;
-	}
-	uint32_t chan = le32(hdr), snr = le32(hdr + 4), buf_len = le32(hdr + 16), status = le32(hdr + 20);
-	if (buf_len < flen) {
-		flen = buf_len;
-	}
-	gScanFrames++;
 	/* 24-byte header, then timestamp (8), beacon interval (2), capabilities (2), elements */
-	if ((status & WMI_RX_STATUS_ERR_CRC) || flen < 36u || (f[0] != 0x80u && f[0] != 0x50u)) {
-		gScanDropped++;
+	if (flen < 36u || (f[0] != 0x80u && f[0] != 0x50u)) {
+		if (!from_ring) {
+			gScanDropped++;
+		}
 		return;
+	}
+	if (from_ring) {
+		gRingBeacons++;
 	}
 	const uint8_t *bssid = f + 16;
 	uint32_t cap = le16(f + 34);
@@ -2451,7 +2678,6 @@ on_mgmt_rx(void)
 		}
 		o += 2u + l;
 	}
-	int32_t dbm = (int32_t)snr + ATH10K_DEFAULT_NOISE_FLOOR;
 	struct bss *b = NULL;
 	for (uint32_t i = 0; i < gNumBss; i++) {
 		if (memcmp(gBss[i].bssid, bssid, 6u) == 0) {
@@ -2489,6 +2715,37 @@ on_mgmt_rx(void)
 	}
 }
 
+/* ath10k_wmi_event_mgmt_rx */
+static void
+on_mgmt_rx(void)
+{
+	struct tlv_it it = { gRx + 4, gRxLen - 4u };
+	uint32_t tag = 0, tl = 0, flen = 0;
+	const uint8_t *v = NULL, *hdr = NULL, *f = NULL;
+	while (tlv_next(&it, &tag, &tl, &v) == 1) {
+		if (tag == WMI_TLV_TAG_MGMT_RX_HDR && tl >= 24u && hdr == NULL) {
+			hdr = v;
+		} else if (tag == WMI_TLV_TAG_ARRAY_BYTE && f == NULL) {
+			f = v;
+			flen = tl;
+		}
+	}
+	gScanFrames++;
+	if (hdr == NULL || f == NULL) {
+		gScanDropped++;
+		return;
+	}
+	uint32_t chan = le32(hdr), snr = le32(hdr + 4), buf_len = le32(hdr + 16), status = le32(hdr + 20);
+	if (buf_len < flen) {
+		flen = buf_len;
+	}
+	if (status & WMI_RX_STATUS_ERR_CRC) {
+		gScanDropped++;
+		return;
+	}
+	add_frame(f, flen, chan, (int32_t)snr + ATH10K_DEFAULT_NOISE_FLOOR, false);
+}
+
 static bool
 run4(char *res, size_t len)
 {
@@ -2497,16 +2754,20 @@ run4(char *res, size_t len)
 	gScanStarted = gScanDone = false;
 	uint32_t t0 = ms_since_power_on();
 
-	/* ath10k_regd_update (regdomain, channel list), ath10k_core_reset_rx_filter (QCA6174 hw3.2:
-	 * hw_filter_reset_required: a station vdev created and deleted, then a WMI barrier), ath10k_add_interface */
+	/* ath10k_core_start: ath10k_core_reset_rx_filter (QCA6174 hw3.2 hw_filter_reset_required: a station vdev
+	 * created and deleted, then a WMI barrier), ath10k_htt_rx_ring_refill, ath10k_htt_setup (rx ring config,
+	 * aggregation config); then ath10k_regd_update (regdomain, channel list), ath10k_add_interface, ath10k_hw_scan */
 	const char *echo = "not tried";
-	bool ok = scan_set_regdomain() && scan_chan_list() && vdev_create(0u) && vdev_delete(0u);
+	bool ok = vdev_create(0u) && vdev_delete(0u);
 	if (ok) {
 		echo = wmi_echo(1000u);
-		ok = vdev_create(0u) && scan_start();
 	}
-	A_LOG("regdomain %x, %u channels (all passive), station interface with the chip's MAC, barrier echo %s; scan %s",
-	    gEepromRd & 0xFFFFu, SCAN_NCHAN, echo, ok ? "requested" : "NOT requested");
+	if (ok && !htt_rx_setup(res, len)) {
+		return false;
+	}
+	ok = ok && scan_set_regdomain() && scan_chan_list() && vdev_create(0u) && scan_start();
+	A_LOG("rx filter reset (barrier echo %s), regdomain %x, %u channels (all passive), station interface with the "
+	    "chip's MAC; scan %s", echo, gEepromRd & 0xFFFFu, SCAN_NCHAN, ok ? "requested" : "NOT requested");
 	if (!ok) {
 		snprintf(res, len, "%s", "STEP 4 FAIL: a scan setup command could not be sent (see the lines above)");
 		return false;
@@ -2524,19 +2785,29 @@ run4(char *res, size_t len)
 				on_mgmt_rx();
 			} else if (gRxEid == gEpWmi && id == WMI_TLV_SCAN_EVENTID) {
 				on_scan_event();
+			} else if (gRxEid == gEpWmi && id == WMI_TLV_CHAN_INFO_EVENTID) {
+				on_chan_info();
+			} else if (gRxEid == gEpHtt) {
+				on_htt_msg();
 			} else {
 				other_msg();
 			}
 		}
+		rx_ring_poll();
 		if (t % 10u == 0 && fw_down("the scan", res, len)) {
 			dump_dbglog();
 			return false;
 		}
 		IOSleep(1);
 	}
+	rx_ring_poll();
 	uint32_t took = ms_since_power_on() - t0;
-	A_LOG("scan: %s after %u ms, %u channel visits, %u frames (%u not beacons or damaged), %u networks", gScanDone ?
-	    scan_event_name(gScanEvent) : "NOT finished", took, gScanForeign, gScanFrames, gScanDropped, gNumBss);
+	A_LOG("scan: %s after %u ms, %u channel visits, %u frames over WMI (%u not beacons or damaged), %u networks",
+	    gScanDone ? scan_event_name(gScanEvent) : "NOT finished", took, gScanForeign, gScanFrames, gScanDropped, gNumBss);
+	A_LOG("rx ring: %u frames (%u management, %u control, %u bad FCS, %u beacons parsed), %u HTT rx indications, %u "
+	    "other HTT messages", gRingFrames, gRingMgmt, gRingCtrl, gRingFcs, gRingBeacons, gHttRxInd, gHttOther);
+	A_LOG("radio: %u channel reports (%u channels), noise floor %d..%d dBm, busy on %u channels, receiving on %u",
+	    gChanInfos, gChanInfoLines, gChanInfoLines ? gNfMin : 0, gChanInfoLines ? gNfMax : 0, gChanBusy, gChanHeard);
 
 	/* strongest first */
 	for (uint32_t i = 1; i < gNumBss; i++) {
@@ -2564,14 +2835,17 @@ run4(char *res, size_t len)
 		return false;
 	}
 	if (gNumBss == 0) {
-		snprintf(res, len, "STEP 4 FAIL: scan %s after %u ms but no beacons arrived (%u frames, %u channel visits)",
-		    gScanDone ? "completed" : "unfinished", took, gScanFrames, gScanForeign);
+		snprintf(res, len, "STEP 4 FAIL: scan %s after %u ms but no beacons (WMI %u frames, rx ring %u frames, %u HTT rx "
+		    "indications; noise floor %d..%d dBm, receiving on %u of %u channels)", gScanDone ? "completed" : "unfinished",
+		    took, gScanFrames, gRingFrames, gHttRxInd, gChanInfoLines ? gNfMin : 0, gChanInfoLines ? gNfMax : 0, gChanHeard,
+		    gChanInfoLines);
 		return false;
 	}
 	const struct bss *top = &gBss[0];
 	snprintf(res, len, "STEP 4 PASS: listen-only scan found %u networks in %u ms (%u beacons, %u channels); strongest: "
-	    "%s, ch %u, %d dBm, %s", gNumBss, took, gScanFrames - gScanDropped, gScanForeign,
-	    top->ssid_len ? top->ssid : "(hidden)", top->chan, top->dbm, top->sec);
+	    "%s, ch %u, %d dBm, %s (beacons: %u over WMI, %u from the rx ring)", gNumBss, took, gScanFrames - gScanDropped +
+	    gRingBeacons, gScanForeign,
+	    top->ssid_len ? top->ssid : "(hidden)", top->chan, top->dbm, top->sec, gScanFrames - gScanDropped, gRingBeacons);
 	return true;
 }
 
