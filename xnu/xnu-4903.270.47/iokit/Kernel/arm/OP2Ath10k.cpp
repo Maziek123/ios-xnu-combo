@@ -3088,6 +3088,8 @@ extern "C" void read_random(void *buffer, unsigned int numBytes);
 #define WMI_TLV_VDEV_STOPPED_EVENTID      0x5002u
 #define WMI_TLV_PEER_STA_KICKOUT_EVENTID  0x6001u
 #define WMI_TLV_ROAM_EVENTID              0xb001u
+#define WMI_TLV_TX_PAUSE_EVENTID          0x4005u
+#define WMI_TLV_TAG_TX_PAUSE_EVENT        230u
 #define WMI_TLV_TAG_VDEV_START_REQUEST_CMD 88u
 #define WMI_TLV_TAG_VDEV_UP_CMD           92u
 #define WMI_TLV_TAG_VDEV_STOP_CMD         93u
@@ -3158,6 +3160,7 @@ static uint32_t gVdevStartStatus, gPeerId;
 static bool gKickout, gRoam;
 static uint32_t gRoamReason;
 static uint32_t gTxWant, gTxStatus, gTxSeq;
+static uint32_t gTxPausedIds, gTxPauses;   /* vdev 0 paused by these WMI pause ids (bit per id), as ath10k honours */
 static bool gTxDone;
 static uint32_t gSecInd, gTxCompl, gPeerMaps;
 static uint16_t gSeq;
@@ -3593,6 +3596,32 @@ pump(void)
 		case WMI_TLV_VDEV_START_RESP_EVENTID: on_vdev_start_resp(); break;
 		case WMI_TLV_VDEV_STOPPED_EVENTID: gVdevStopped = true; break;
 		case WMI_TLV_PEER_STA_KICKOUT_EVENTID: gKickout = true; break;
+		case WMI_TLV_TX_PAUSE_EVENTID: {
+			/* wmi-tlv.c ath10k_wmi_tlv_event_tx_pause: pause id, action (0 stop, 1 wake), vdev map, peer, tid map;
+			 * ath10k stops the vdev's queues for MCC, P2P NoA, P2P GO PS, AP PS and IBSS PS, logs the others */
+			const uint8_t *e = wmi_find(WMI_TLV_TAG_TX_PAUSE_EVENT, 20u);
+			if (e == NULL) {
+				other_msg();
+				break;
+			}
+			uint32_t pid = le32(e), action = le32(e + 4), vmap = le32(e + 8);
+			bool vdev_kind = pid == 1u || pid == 4u || pid == 5u || pid == 7u || pid == 8u;
+			if (vdev_kind && (vmap & 1u) && pid < 32u) {
+				if (action == 0) {
+					gTxPausedIds |= 1u << pid;
+				} else {
+					gTxPausedIds &= ~(1u << pid);
+				}
+			}
+			if (gTxPauses++ < 8u) {
+				A_LOG("firmware tx pause: id %u (%s), %s, vdev map %x, peer %u, tid map %x%s", pid, pid == 1u ? "MCC" :
+				    pid == 2u ? "AP peer PS" : pid == 3u ? "AP peer U-APSD" : pid == 4u ? "P2P NoA" : pid == 5u ? "P2P GO PS" :
+				    pid == 6u ? "station add BA" : pid == 7u ? "AP PS" : pid == 8u ? "IBSS PS" : pid == 21u ? "host" : "other",
+				    action == 0 ? "stop" : action == 1u ? "wake" : "?", vmap, le32(e + 12), le32(e + 16),
+				    vdev_kind ? "" : " (not a vdev pause: ignored, as ath10k does)");
+			}
+			break;
+		}
 		case WMI_TLV_ROAM_EVENTID: {
 			const uint8_t *e = wmi_find(WMI_TLV_TAG_ROAM_EVENT, 8u);
 			gRoam = true;
@@ -3705,15 +3734,23 @@ ce_send2(struct ce_pipe *p, uint32_t a0, uint32_t n0, uint32_t a1, uint32_t n1)
 static const char *
 tx_status_name(uint32_t s)
 {
-	return s == 0 ? "acknowledged" : s == 1 ? "discarded" : s == 2 ? "not acknowledged" : "unknown status";
+	return s == 0 ? "acknowledged" : s == 1 ? "discarded" : s == 2 ? "not acknowledged" : s == 3 ?
+	    "sent, but the firmware never confirmed it (2 s)" : "unknown status";
 }
 
 /* NULL once the firmware reports the frame done (*status: 0 acknowledged, 1 discarded, 2 no ack) */
 static const char *
-htt_tx(const uint8_t *frame, uint32_t flen, bool mgmt, bool no_encrypt, uint32_t *status, char *res, size_t len)
+htt_tx(const uint8_t *frame, uint32_t flen, bool mgmt, bool no_encrypt, uint32_t *status, char *res, size_t len,
+    bool must_complete = true)
 {
 	if (flen > TX_FRAME_MAX || flen < 24u) {
 		return "frame size";
+	}
+	if (gTxPausedIds != 0 && !wait_for([]() { return gTxPausedIds == 0; }, 2000u, "a tx wake", res, len)) {
+		if (gFwDown) {
+			return "the firmware stopped";
+		}
+		A_LOG("tx still paused after 2 s (pause ids %x); sending anyway", gTxPausedIds);
 	}
 	uint8_t *f = gDma + OFF_TX_FRAME, *t = gDma + OFF_TX_BUF;
 	uint32_t fpa = gDmaPhys + OFF_TX_FRAME, tpa = gDmaPhys + OFF_TX_BUF;
@@ -3765,7 +3802,14 @@ htt_tx(const uint8_t *frame, uint32_t flen, bool mgmt, bool no_encrypt, uint32_t
 		return "copy engine 4 did not take the frame";
 	}
 	if (!wait_for([]() { return gTxDone; }, 2000u, "a transmit completion", res, len)) {
-		return gFwDown ? "the firmware stopped" : "no transmit completion within 2 s";
+		if (gFwDown) {
+			return "the firmware stopped";
+		}
+		if (must_complete) {
+			return "no transmit completion within 2 s";
+		}
+		*status = 3u;   /* handed to the firmware, never confirmed */
+		return NULL;
 	}
 	*status = gTxStatus;
 	return NULL;
@@ -4398,7 +4442,7 @@ ek_mic_ok(const struct ekey *k, const uint8_t kck[16])
 /* messages 2 and 4: our EAPOL-Key frame in a native wifi data frame to the access point, unencrypted */
 static const char *
 send_ek(uint32_t ver, uint32_t ki, const uint8_t replay[8], const uint8_t *nonce, const uint8_t *kd, uint32_t kdlen,
-    const uint8_t kck[16], uint32_t *st, char *res, size_t len)
+    const uint8_t kck[16], uint32_t *st, char *res, size_t len, bool must_complete = true)
 {
 	uint8_t f[24u + 8u + EK_HDR + 32u];
 	bzero(f, sizeof(f));
@@ -4430,7 +4474,7 @@ send_ek(uint32_t ver, uint32_t ki, const uint8_t replay[8], const uint8_t *nonce
 	hmac_sha1(kck, 16u, parts, lens, 1u, mic);
 	memcpy(e + EK_MIC, mic, 16u);
 	bzero(mic, sizeof(mic));
-	return htt_tx(f, 32u + n, false, true, st, res, len);
+	return htt_tx(f, 32u + n, false, true, st, res, len, must_complete);
 }
 
 static bool
@@ -4555,7 +4599,10 @@ run6(char *res, size_t len)
 			return wpa_fail(res, len, "message 3 carries no CCMP group key");
 		}
 		memcpy(replay, k.e + EK_REPLAY, 8u);
-		const char *e = send_ek(ver, 2u | KI_PAIRWISE | KI_MIC | KI_SECURE, replay, NULL, NULL, 0u, ptk, &st, res, len);
+		/* message 4; its completion is not waited for beyond 2 s: wpa_supplicant installs the keys right after
+		 * sending it, and this firmware may not confirm it (it paused tx around message 3 on the phone) */
+		const char *e = send_ek(ver, 2u | KI_PAIRWISE | KI_MIC | KI_SECURE, replay, NULL, NULL, 0u, ptk, &st, res, len,
+		    false);
 		if (e != NULL) {
 			bzero(ptk, sizeof(ptk));
 			bzero(gtk, sizeof(gtk));
@@ -4586,6 +4633,8 @@ run6(char *res, size_t len)
 	/* ath10k_set_key: pairwise key (index 0), group key (its index), each confirmed by an HTT security indication;
 	 * then the port opens (peer param authorize) */
 	uint32_t sec0 = gSecInd;
+	uint8_t kck[16];
+	memcpy(kck, ptk, sizeof(kck));   /* to answer a repeated message 3 (message 4 lost) while connected */
 	bool ok = install_key(0u, WMI_KEY_PAIRWISE, ptk + 32);
 	bzero(ptk, sizeof(ptk));
 	uint32_t sec_want = sec0 + 1u;
@@ -4602,30 +4651,50 @@ run6(char *res, size_t len)
 	}
 	ok = ok && peer_set_param(WMI_TLV_PEER_AUTHORIZE, 1u);
 	if (!ok) {
+		bzero(kck, sizeof(kck));
 		return wpa_fail(res, len, "a key or the authorize command could not be sent");
 	}
 	gAuthorized = true;
 	uint32_t confirmed = gSecInd - sec0;
 	A_LOG("keys installed (firmware confirmed %u of 2), port open; listening 5 s", confirmed);
 
-	/* 5 s connected: data from the network (decrypted by the chip), no deauthentication */
+	/* 5 s connected: data from the network (decrypted by the chip), no deauthentication; a repeated message 3
+	 * means our message 4 was lost: answered again */
+	uint32_t msg3_repeats = 0;
 	for (uint32_t t = 0; t < 5000u && !gDeauth && !gKickout; t++) {
 		pump();
 		if (t % 10u == 0 && fw_down("the connection", res, len)) {
+			bzero(kck, sizeof(kck));
 			return false;
+		}
+		while (gEapolHead != gEapolTail) {
+			uint32_t slot = gEapolTail % EAPOL_QUEUE;
+			struct ekey k;
+			bool parsed = ek_parse(gEapolQ[slot], gEapolQLen[slot], &k);
+			gEapolTail++;
+			if (parsed && (k.ki & KI_ACK) && (k.ki & KI_MIC) && (k.ki & KI_INSTALL) &&
+			    memcmp(k.e + EK_REPLAY, replay, 8u) > 0 && ek_mic_ok(&k, kck)) {
+				msg3_repeats++;
+				memcpy(replay, k.e + EK_REPLAY, 8u);
+				const char *e = send_ek(ver, 2u | KI_PAIRWISE | KI_MIC | KI_SECURE, replay, NULL, NULL, 0u, kck, &st,
+				    res, len, false);
+				A_LOG("message 3 repeated (our message 4 was lost?): message 4 again: %s", e != NULL ? e :
+				    tx_status_name(st));
+			}
 		}
 		IOSleep(1);
 	}
+	bzero(kck, sizeof(kck));
 	if (gDeauth || gKickout) {
 		snprintf(why, sizeof(why), "connected, then %s (reason %u, %s)", gKickout ? "the firmware kicked the access "
 		    "point out" : gDeauthSubtype == 0xC0u ? "deauthenticated" : "disassociated", gDeauthReason,
 		    reason_name(gDeauthReason));
 		return wpa_fail(res, len, why);
 	}
-	snprintf(res, len, "STEP 6 PASS: WPA2 connected to %s: 4-way handshake in %u ms (message 1 seen %u time(s)), "
+	snprintf(res, len, "STEP 6 PASS: WPA2 connected to %s: 4-way handshake in %u ms (message 1 seen %u time(s)%s), "
 	    "pairwise and group key %u installed (firmware confirmed %u of 2), port open; %u data frames from the network "
-	    "in 5 s%s, no deauthentication", name, took, msg1s, gtk_idx, confirmed, gDataAfterKeys, gRoam ?
-	    ", firmware reported beacon loss" : "");
+	    "in 5 s%s, no deauthentication", name, took, msg1s, msg3_repeats ? ", message 3 repeated" : "", gtk_idx,
+	    confirmed, gDataAfterKeys, gRoam ? ", firmware reported beacon loss" : "");
 	return true;
 }
 
