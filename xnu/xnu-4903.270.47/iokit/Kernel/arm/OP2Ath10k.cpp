@@ -2277,11 +2277,12 @@ struct bss {
 	uint8_t rsn[64];        /* the RSN element's body */
 	uint8_t rates[8], xrates[16];
 	bool wmm, ht, have_ies;
+	bool probed;            /* answered one of our probe requests (a probe response addressed to us) */
 };
 static struct bss gBss[SCAN_MAX_BSS];
 static uint32_t gNumBss, gScanFrames, gScanDropped, gScanForeign, gScanEvent, gScanReason;
 static bool gScanStarted, gScanDone;
-static uint32_t gScanCmd[2 + 25u + 1u + SCAN_NCHAN + 1u + 1u + 2u + 1u];
+static uint32_t gScanCmd[2 + 25u + 1u + SCAN_NCHAN + 1u + 9u + 1u + 2u + 1u + 4u];
 static uint32_t gChanCmd[2 + 1u + SCAN_NCHAN * 7u];
 
 static bool
@@ -2337,7 +2338,7 @@ scan_set_regdomain(void)
 /* ath10k_wmi_tlv_op_gen_scan_chan_list: struct wmi_channel { mhz, band_center_freq1, band_center_freq2,
  * mode | flags, min/max/reg power, classid (0.5 dBm), antenna_max, max_tx_power } per channel */
 static bool
-scan_chan_list(void)
+scan_chan_list(bool active24)   /* active24: 2.4 GHz channels 1-11 may send probe requests (step 5) */
 {
 	uint32_t *w = gChanCmd, n = 0;
 	w[n++] = tlv_hdr(WMI_TLV_TAG_SCAN_CHAN_LIST_CMD, 4u);
@@ -2346,11 +2347,12 @@ scan_chan_list(void)
 	for (uint32_t i = 0; i < SCAN_NCHAN; i++) {
 		uint32_t mhz = kScanMhz[i];
 		bool g5 = mhz > 5000u, dfs = (mhz >= 5260u && mhz <= 5320u) || (mhz >= 5500u && mhz <= 5700u);
+		bool passive = !(active24 && mhz <= 2462u);
 		w[n++] = tlv_hdr(WMI_TLV_TAG_CHANNEL, 24u);
 		w[n++] = mhz;
 		w[n++] = mhz;
 		w[n++] = 0u;
-		w[n++] = (g5 ? WMI_MODE_11A : WMI_MODE_11G) | WMI_CHAN_FLAG_PASSIVE | WMI_CHAN_FLAG_ALLOW_HT |
+		w[n++] = (g5 ? WMI_MODE_11A : WMI_MODE_11G) | (passive ? WMI_CHAN_FLAG_PASSIVE : 0u) | WMI_CHAN_FLAG_ALLOW_HT |
 		    (g5 ? WMI_CHAN_FLAG_ALLOW_VHT : 0u) | (dfs ? WMI_CHAN_FLAG_DFS : 0u);
 		w[n++] = (40u << 8) | (40u << 16);   /* max power, reg power: 20 dBm */
 		w[n++] = 40u << 8;                    /* max tx power */
@@ -2414,8 +2416,14 @@ static_assert(HTT_RX_IDX_OFF + 4u <= HTT_RX_BLOCK, "the HTT rx block holds the b
 static const uint16_t kRxDescOffsets[10] = { 59, 75, 21, 31, 3, 20, 6, 10, 1, 2 };
 
 static uint8_t *gRxPool;
-static uint32_t gRxPoolPhys, gRxAlloc, gRxRead;
-static uint8_t gRxRingBuf[HTT_RX_RING_SIZE];   /* which buffer each ring entry holds */
+static uint32_t gRxPoolPhys, gRxAlloc;
+/* Buffers, not ring positions, are tracked: posted (the chip owns it) and in which order (seq). A finished buffer is
+ * found by MSDU_DONE (scan beacons: the firmware indicates nothing) or named by an in-order indication (this
+ * firmware's rx full reorder mode, with an rx descriptor or, offloaded, a short header); either way it is handled
+ * once and posted again at the ring's end. One the chip never finishes cannot hold up the others. */
+static bool gBufPosted[HTT_RX_FILL];
+static uint32_t gBufSeq[HTT_RX_FILL], gPostSeq;
+static uint32_t gInOrdInd, gInOrdFrames, gInOrdOffload, gInOrdBad;
 static uint32_t gRingFrames, gRingMgmt, gRingCtrl, gRingFcs, gRingBeacons, gHttRxInd, gHttOther;
 static uint32_t gScanMhz, gChanInfos, gChanHeard, gChanBusy, gChanInfoLines;
 static int32_t gNfMin = 1000, gNfMax = -1000;
@@ -2468,9 +2476,10 @@ htt_rx_setup(char *res, size_t len)
 	bzero(gRxPool, HTT_RX_BLOCK);
 	for (uint32_t i = 0; i < HTT_RX_FILL; i++) {
 		put32(gRxPool + HTT_RX_RING_OFF + 4u * i, gRxPoolPhys + i * HTT_RX_BUF_SIZE);
-		gRxRingBuf[i] = (uint8_t)i;
+		gBufPosted[i] = true;
+		gBufSeq[i] = i;
 	}
-	gRxRead = 0;
+	gPostSeq = HTT_RX_FILL;
 	gRxAlloc = HTT_RX_FILL;
 	put32(gRxPool + HTT_RX_IDX_OFF, gRxAlloc);
 	dma_fence();
@@ -2504,60 +2513,129 @@ htt_rx_setup(char *res, size_t len)
 	return true;
 }
 
-/* Buffers the chip has finished (MSDU_DONE), in ring order: counted, beacons parsed, then posted again. */
+/* One received frame in buffer b with its rx descriptor: counted, beacons parsed, the rest to the join hooks */
+static void
+rx_frame(uint32_t b, uint32_t mlen)
+{
+	uint8_t *d = gRxPool + b * HTT_RX_BUF_SIZE;
+	uint32_t attn = le32(d + RXD_ATTENTION);
+	gRingFrames++;
+	const uint8_t *h = d + RXD_HDR_STATUS, *pl = d + RXD_PAYLOAD;
+	if (gRingFrames <= 4u) {
+		A_LOG("rx ring frame %u (buffer %u): attention %08x msdu length %u rssi %u | header %02x %02x %02x %02x "
+		    "%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x | payload %02x %02x %02x %02x", gRingFrames,
+		    b, attn, mlen, d[RXD_RSSI_COMB], h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[8], h[9], h[10],
+		    h[11], h[12], h[13], h[14], h[15], pl[0], pl[1], pl[2], pl[3]);
+	}
+	if (attn & RX_ATTN_FCS_ERR) {
+		gRingFcs++;
+	} else if (attn & RX_ATTN_CTRL) {
+		gRingCtrl++;
+	} else if (attn & RX_ATTN_MGMT) {
+		gRingMgmt++;
+		int32_t dbm = (int32_t)d[RXD_RSSI_COMB] + ATH10K_DEFAULT_NOISE_FLOOR;
+		uint32_t chan = mhz_to_chan(gScanMhz);
+		/* the whole frame in the payload (raw), else the first 64 bytes in rx_hdr_status */
+		bool whole = mlen >= 24u && mlen <= HTT_RX_BUF_SIZE - RXD_PAYLOAD;
+		if (whole && mlen >= 36u && (pl[0] == 0x80u || pl[0] == 0x50u)) {
+			add_frame(pl, mlen, chan, dbm, true);
+		} else if (!whole && (h[0] == 0x80u || h[0] == 0x50u)) {
+			add_frame(h, RXD_HDR_STATUS_LEN, chan, dbm, true);
+		} else if (whole && gMgmtHook != NULL) {
+			gMgmtHook(pl, mlen);
+		}
+	} else {
+		gRingData++;
+		if (gDataHook != NULL && mlen >= 24u && mlen <= HTT_RX_BUF_SIZE - RXD_PAYLOAD) {
+			gDataHook(pl, mlen);
+		}
+	}
+}
+
+/* buffer b back to the chip, at the ring's end */
+static void
+rx_repost(uint32_t b)
+{
+	uint8_t *d = gRxPool + b * HTT_RX_BUF_SIZE;
+	bzero(d, RXD_PAYLOAD + 64u);   /* the descriptor (attention included) and the start of the payload */
+	put32(gRxPool + HTT_RX_RING_OFF + 4u * gRxAlloc, gRxPoolPhys + b * HTT_RX_BUF_SIZE);
+	gRxAlloc = (gRxAlloc + 1u) & (HTT_RX_RING_SIZE - 1u);
+	gBufPosted[b] = true;
+	gBufSeq[b] = gPostSeq++;
+	dma_fence();
+	put32(gRxPool + HTT_RX_IDX_OFF, gRxAlloc);
+	dma_fence();
+}
+
+/* Every posted buffer the chip has finished (MSDU_DONE), oldest posting first */
 static void
 rx_ring_poll(void)
 {
 	if (gRxPool == NULL) {
 		return;
 	}
-	for (uint32_t k = 0; k < HTT_RX_FILL && gRxRead != gRxAlloc; k++) {
-		uint32_t b = gRxRingBuf[gRxRead];
-		uint8_t *d = gRxPool + b * HTT_RX_BUF_SIZE;
-		uint32_t attn = le32(d + RXD_ATTENTION);
-		if ((attn & RX_ATTN_MSDU_DONE) == 0) {
-			break;
-		}
-		gRingFrames++;
-		uint32_t mlen = le32(d + RXD_MSDU_START) & 0x3FFFu;
-		const uint8_t *h = d + RXD_HDR_STATUS, *pl = d + RXD_PAYLOAD;
-		if (gRingFrames <= 4u) {
-			A_LOG("rx ring frame %u (buffer %u): attention %08x msdu length %u rssi %u | header %02x %02x %02x %02x "
-			    "%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x | payload %02x %02x %02x %02x", gRingFrames,
-			    b, attn, mlen, d[RXD_RSSI_COMB], h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[8], h[9], h[10],
-			    h[11], h[12], h[13], h[14], h[15], pl[0], pl[1], pl[2], pl[3]);
-		}
-		if (attn & RX_ATTN_FCS_ERR) {
-			gRingFcs++;
-		} else if (attn & RX_ATTN_CTRL) {
-			gRingCtrl++;
-		} else if (attn & RX_ATTN_MGMT) {
-			gRingMgmt++;
-			int32_t dbm = (int32_t)d[RXD_RSSI_COMB] + ATH10K_DEFAULT_NOISE_FLOOR;
-			uint32_t chan = mhz_to_chan(gScanMhz);
-			/* the whole frame in the payload (raw), else the first 64 bytes in rx_hdr_status */
-			bool whole = mlen >= 24u && mlen <= HTT_RX_BUF_SIZE - RXD_PAYLOAD;
-			if (whole && mlen >= 36u && (pl[0] == 0x80u || pl[0] == 0x50u)) {
-				add_frame(pl, mlen, chan, dbm, true);
-			} else if (!whole && (h[0] == 0x80u || h[0] == 0x50u)) {
-				add_frame(h, RXD_HDR_STATUS_LEN, chan, dbm, true);
-			} else if (whole && gMgmtHook != NULL) {
-				gMgmtHook(pl, mlen);
+	uint32_t done[HTT_RX_FILL], nd = 0;
+	for (uint32_t b = 0; b < HTT_RX_FILL; b++) {
+		if (gBufPosted[b] && (le32(gRxPool + b * HTT_RX_BUF_SIZE + RXD_ATTENTION) & RX_ATTN_MSDU_DONE) != 0) {
+			uint32_t j = nd++;
+			for (; j > 0 && gBufSeq[done[j - 1u]] > gBufSeq[b]; j--) {
+				done[j] = done[j - 1u];
 			}
-		} else {
+			done[j] = b;
+		}
+	}
+	if (nd > 0) {
+		dma_fence();   /* the attention word before the rest of the buffer */
+	}
+	for (uint32_t i = 0; i < nd; i++) {
+		uint32_t b = done[i];
+		gBufPosted[b] = false;
+		rx_frame(b, le32(gRxPool + b * HTT_RX_BUF_SIZE + RXD_MSDU_START) & 0x3FFFu);
+		rx_repost(b);
+	}
+}
+
+/* HTT_T2H_MSG_TYPE_RX_IN_ORD_PADDR_IND (htt_rx.c ath10k_htt_rx_in_ord_ind, ath10k_htt_rx_pop_paddr32_list):
+ * info (tid, offload 0x20), peer, vdev, msdu count, then { paddr, length, fw_desc } per buffer. Offloaded frames
+ * have no rx descriptor but struct htt_rx_offload_msdu { len, peer, vdev, tid, fw_desc } and the native wifi
+ * frame right after it (ath10k_htt_rx_h_rx_offload). */
+static void
+rx_inord(void)
+{
+	if (gRxLen < 8u || gRxPool == NULL) {
+		return;
+	}
+	uint32_t info = gRx[1], count = le16(gRx + 6);
+	bool offload = (info & 0x20u) != 0;
+	if (gInOrdInd <= 3u) {
+		A_LOG("HTT in-order rx indication: info %02x (tid %u%s%s), peer %u vdev %u, %u buffers, first %08x (%u bytes)",
+		    info, info & 0x1Fu, offload ? ", offloaded" : "", (info & 0x40u) ? ", fragment" : "", le16(gRx + 2), gRx[4],
+		    count, gRxLen >= 16u ? le32(gRx + 8) : 0u, gRxLen >= 16u ? le16(gRx + 12) : 0u);
+	}
+	for (uint32_t i = 0; i < count && 8u + 8u * i + 8u <= gRxLen; i++) {
+		uint32_t pa = le32(gRx + 8 + 8u * i), len = le16(gRx + 12 + 8u * i);
+		uint32_t off = pa - gRxPoolPhys, b = off / HTT_RX_BUF_SIZE;
+		if (pa < gRxPoolPhys || b >= HTT_RX_FILL || off % HTT_RX_BUF_SIZE != 0 || !gBufPosted[b]) {
+			gInOrdBad++;   /* not one of ours, or already handled when its MSDU_DONE was seen */
+			continue;
+		}
+		const uint8_t *d = gRxPool + b * HTT_RX_BUF_SIZE;
+		dma_fence();
+		gBufPosted[b] = false;
+		gInOrdFrames++;
+		if (offload) {
+			uint32_t olen = le16(d);
+			gInOrdOffload++;
 			gRingData++;
-			if (gDataHook != NULL && mlen >= 24u && mlen <= HTT_RX_BUF_SIZE - RXD_PAYLOAD) {
-				gDataHook(pl, mlen);
+			if (gDataHook != NULL && olen >= 24u && olen <= HTT_RX_BUF_SIZE - 7u) {
+				gDataHook(d + 7, olen);
 			}
+		} else if (le32(d + RXD_ATTENTION) & RX_ATTN_MSDU_DONE) {
+			rx_frame(b, len);
+		} else {
+			gInOrdBad++;
 		}
-		bzero(d, RXD_PAYLOAD + 64u);   /* the descriptor (attention included) and the start of the payload */
-		put32(gRxPool + HTT_RX_RING_OFF + 4u * gRxAlloc, gRxPoolPhys + b * HTT_RX_BUF_SIZE);
-		gRxRingBuf[gRxAlloc] = (uint8_t)b;
-		gRxAlloc = (gRxAlloc + 1u) & (HTT_RX_RING_SIZE - 1u);
-		gRxRead = (gRxRead + 1u) & (HTT_RX_RING_SIZE - 1u);
-		dma_fence();
-		put32(gRxPool + HTT_RX_IDX_OFF, gRxAlloc);
-		dma_fence();
+		rx_repost(b);
 	}
 }
 
@@ -2609,11 +2687,18 @@ on_chan_info(void)
 	}
 }
 
-/* ath10k_wmi_start_scan_init + ath10k_hw_scan without SSIDs (passive) + ath10k_wmi_tlv_op_gen_start_scan */
+/* ath10k_wmi_start_scan_init + ath10k_hw_scan + ath10k_wmi_tlv_op_gen_start_scan. Passive: every channel, no
+ * SSIDs (step 4). Directed (step 5): 2.4 GHz channels 1-13 only, probe requests for the configured network's name
+ * with our rates (channels 12 and 13 stay passive: the channel list keeps them so). */
+#define SCAN_N24 13u
+static const uint8_t kProbeIes[16] = { 1, 8, 0x82, 0x84, 0x8B, 0x96, 0x0C, 0x12, 0x18, 0x24, 50, 4, 0x30, 0x48, 0x60, 0x6C };
+static const uint8_t *gProbeSsid;
+static uint32_t gProbeSsidLen;
+
 static bool
-scan_start(uint32_t round)
+scan_start(uint32_t round, bool directed)
 {
-	uint32_t *w = gScanCmd, n = 0;
+	uint32_t *w = gScanCmd, n = 0, nchan = directed ? SCAN_N24 : SCAN_NCHAN;
 	w[n++] = tlv_hdr(WMI_TLV_TAG_START_SCAN_CMD, 100u);
 	w[n++] = WMI_HOST_SCAN_ID_PREFIX | (2u * round);        /* scan_id (ATH10K_SCAN_ID) */
 	w[n++] = WMI_HOST_SCAN_ID_PREFIX | (2u * round + 1u);   /* scan_req_id */
@@ -2621,7 +2706,7 @@ scan_start(uint32_t round)
 	w[n++] = 1u;                                  /* WMI_SCAN_PRIORITY_LOW */
 	w[n++] = WMI_SCAN_EVENT_STARTED | WMI_SCAN_EVENT_COMPLETED | WMI_SCAN_EVENT_BSS_CHANNEL |
 	    WMI_SCAN_EVENT_FOREIGN_CHANNEL | WMI_SCAN_EVENT_FOREIGN_CHANNEL_EXIT | WMI_SCAN_EVENT_DEQUEUED;
-	w[n++] = 50u;                                 /* dwell active */
+	w[n++] = directed ? 100u : 50u;               /* dwell active: time for the answers and their retries */
 	w[n++] = 150u;                                /* dwell passive */
 	w[n++] = 50u;                                 /* min rest */
 	w[n++] = 500u;                                /* max rest */
@@ -2631,24 +2716,40 @@ scan_start(uint32_t round)
 	w[n++] = 20000u;                              /* max scan time */
 	w[n++] = 5u;                                  /* probe delay */
 	/* the TLV firmware inverts WMI_SCAN_FILTER_PROBE_REQ (ath10k's FIXME) */
-	w[n++] = (WMI_SCAN_CHAN_STAT_EVENT | WMI_SCAN_FLAG_PASSIVE) ^ WMI_SCAN_FILTER_PROBE_REQ;
+	w[n++] = (WMI_SCAN_CHAN_STAT_EVENT | (directed ? 0u : WMI_SCAN_FLAG_PASSIVE)) ^ WMI_SCAN_FILTER_PROBE_REQ;
 	w[n++] = 0u;                                  /* burst duration */
-	w[n++] = SCAN_NCHAN;
+	w[n++] = nchan;
 	w[n++] = 1u;                                  /* num_bssids: the broadcast one */
-	w[n++] = 0u;                                  /* num_ssids */
-	w[n++] = 0u;                                  /* ie_len */
+	w[n++] = directed ? 1u : 0u;                  /* num_ssids */
+	w[n++] = directed ? sizeof(kProbeIes) : 0u;   /* ie_len */
 	w[n++] = 3u;                                  /* num_probes */
 	w[n++] = 0u; w[n++] = 0u;                     /* mac_addr */
 	w[n++] = 0u; w[n++] = 0u;                     /* mac_mask */
-	w[n++] = tlv_hdr(WMI_TLV_TAG_ARRAY_UINT32, SCAN_NCHAN * 4u);
-	for (uint32_t i = 0; i < SCAN_NCHAN; i++) {
+	w[n++] = tlv_hdr(WMI_TLV_TAG_ARRAY_UINT32, nchan * 4u);
+	for (uint32_t i = 0; i < nchan; i++) {
 		w[n++] = kScanMhz[i];
 	}
-	w[n++] = tlv_hdr(WMI_TLV_TAG_ARRAY_FIXED_STRUCT, 0u);   /* SSIDs */
+	if (directed) {
+		w[n++] = tlv_hdr(WMI_TLV_TAG_ARRAY_FIXED_STRUCT, 36u);   /* struct wmi_ssid: length, 32 bytes */
+		uint8_t ssid[36];
+		bzero(ssid, sizeof(ssid));
+		put32(ssid, gProbeSsidLen);
+		memcpy(ssid + 4, gProbeSsid, gProbeSsidLen);
+		memcpy(&w[n], ssid, sizeof(ssid));
+		n += 9u;
+	} else {
+		w[n++] = tlv_hdr(WMI_TLV_TAG_ARRAY_FIXED_STRUCT, 0u);   /* SSIDs */
+	}
 	w[n++] = tlv_hdr(WMI_TLV_TAG_ARRAY_FIXED_STRUCT, 8u);   /* BSSIDs: ff:ff:ff:ff:ff:ff */
 	w[n++] = 0xFFFFFFFFu;
 	w[n++] = 0x0000FFFFu;
-	w[n++] = tlv_hdr(WMI_TLV_TAG_ARRAY_BYTE, 0u);           /* extra IEs */
+	if (directed) {
+		w[n++] = tlv_hdr(WMI_TLV_TAG_ARRAY_BYTE, sizeof(kProbeIes));   /* extra IEs: supported, extended rates */
+		memcpy(&w[n], kProbeIes, sizeof(kProbeIes));
+		n += sizeof(kProbeIes) / 4u;
+	} else {
+		w[n++] = tlv_hdr(WMI_TLV_TAG_ARRAY_BYTE, 0u);
+	}
 	return wmi_cmd_words(WMI_TLV_START_SCAN_CMDID, w, n);
 }
 
@@ -2766,6 +2867,9 @@ add_frame(const uint8_t *f, uint32_t flen, uint32_t chan, int32_t dbm, bool from
 		b->dbm = dbm;
 	}
 	b->frames++;
+	if (f[0] == 0x50u && memcmp(f + 4, gMac, 6u) == 0) {
+		b->probed = true;
+	}
 	if (dbm > b->dbm) {
 		b->dbm = dbm;
 	}
@@ -2868,7 +2972,7 @@ run4(char *res, size_t len)
 		snprintf(res, len, "STEP 4 FAIL: the %s setting could not be sent", bad);
 		return false;
 	}
-	ok = ok && scan_set_regdomain() && scan_chan_list() && vdev_create(0u) && scan_start(0u);
+	ok = ok && scan_set_regdomain() && scan_chan_list(false) && vdev_create(0u) && scan_start(0u, false);
 	A_LOG("rx filter reset (barrier echo %s), start settings (chain mask %x, ANI on, burst %s), regdomain %x, %u "
 	    "channels (all passive), station interface with the chip's MAC; scan %s", echo, chains,
 	    svc_has(WMI_TLV_SERVICE_BURST) ? "off" : "not offered", gEepromRd & 0xFFFFu, SCAN_NCHAN,
@@ -3055,7 +3159,7 @@ static bool gKickout, gRoam;
 static uint32_t gRoamReason;
 static uint32_t gTxWant, gTxStatus, gTxSeq;
 static bool gTxDone;
-static uint32_t gSecInd, gInOrdInd, gTxCompl, gPeerMaps;
+static uint32_t gSecInd, gTxCompl, gPeerMaps;
 static uint16_t gSeq;
 static bool gAuthResp, gAssocResp, gDeauth;
 static uint32_t gAuthStatus, gAssocStatus, gAid, gAssocCap, gDeauthReason, gDeauthSubtype, gMgmtOther;
@@ -3680,10 +3784,8 @@ on_htt_msg(void)
 		}
 		return;
 	case HTT_T2H_MSG_TYPE_RX_IN_ORD_PADDR_IND:
-		if (gInOrdInd++ < 3u && gRxLen >= 16u) {
-			A_LOG("HTT in-order rx indication: peer %u vdev %u, %u buffers, first %08x (%u bytes)", le16(gRx + 2),
-			    gRx[4], le16(gRx + 6), le32(gRx + 8), le16(gRx + 12));
-		}
+		gInOrdInd++;
+		rx_inord();
 		return;
 	case HTT_T2H_MSG_TYPE_PEER_MAP:
 		gPeerMaps++;
@@ -4053,10 +4155,10 @@ find_target(void)
 }
 
 static const char *
-rescan(uint32_t round, char *res, size_t len)
+rescan(uint32_t round, bool directed, char *res, size_t len)
 {
 	gScanStarted = gScanDone = false;
-	if (!scan_start(round)) {
+	if (!scan_start(round, directed)) {
 		return "the scan request could not be sent";
 	}
 	if (!wait_for([]() { return gScanDone; }, 25000u, "a scan", res, len)) {
@@ -4100,25 +4202,49 @@ run5(char *res, size_t len)
 		    "first line, password on the second; see the README), rebuild");
 		return false;
 	}
+	/* Not in the listen-only scan: ask for it by name on 2.4 GHz (an access point answers a probe request with a
+	 * probe response to us, retried until we acknowledge it: more chances than a passing beacon), up to 4 times;
+	 * then one more listen-only scan of every channel (a hotspot on 5 GHz). */
 	struct bss *b = find_target();
-	for (uint32_t round = 1; b == NULL && round <= 2u; round++) {
-		A_LOG("%s not heard yet (%u networks); scanning again (%u of 2)", name, gNumBss, round);
-		const char *why = rescan(round, res, len);
+	uint32_t round = 1, directed = 0;
+	gProbeSsid = kOp2WifiSsid;
+	gProbeSsidLen = kOp2WifiSsidLen;
+	if (b == NULL) {
+		A_LOG("%s not heard in the scan (%u networks); asking for it by name on 2.4 GHz channels 1-11", name, gNumBss);
+		if (!scan_chan_list(true)) {
+			return join_fail(res, len, "the channel list for probing could not be sent");
+		}
+	}
+	for (; b == NULL && directed < 4u; directed++, round++) {
+		uint32_t t1 = ms_since_power_on();
+		const char *why = rescan(round, true, res, len);
+		if (why != NULL) {
+			return gFwDown ? false : join_fail(res, len, why);
+		}
+		b = find_target();
+		A_LOG("probe round %u: %s after %u ms (%u networks known)", directed + 1u, b != NULL ? "found" : "not heard",
+		    ms_since_power_on() - t1, gNumBss);
+	}
+	if (b == NULL) {
+		A_LOG("%s", "one more listen-only scan of every channel (2.4 and 5 GHz)");
+		const char *why = rescan(round, false, res, len);
 		if (why != NULL) {
 			return gFwDown ? false : join_fail(res, len, why);
 		}
 		b = find_target();
 	}
 	if (b == NULL) {
-		return join_fail(res, len, "not heard in 3 scans (is the hotspot screen open on the iPhone?)");
+		return join_fail(res, len, "not heard in 2 listen-only scans, and no answer to probe requests on 2.4 GHz "
+		    "(4 rounds); is the Personal Hotspot screen open on the iPhone?");
 	}
 	gAp = *b;
 	memcpy(gBssid, gAp.bssid, 6u);
 	gJoinOpen = gAp.rsn_len == 0 && (gAp.cap & 0x0010u) == 0;
 	A_LOG("network %s: BSSID %02x:%02x:%02x:%02x:%02x:%02x, channel %u (%u MHz), %d dBm, beacon interval %u, "
-	    "capabilities %04x, %s%s%s", name, gBssid[0], gBssid[1], gBssid[2], gBssid[3], gBssid[4], gBssid[5], gAp.chan,
-	    gAp.mhz, gAp.dbm, gAp.bintval, gAp.cap, gJoinOpen ? "open" : gAp.rsn_len ? "RSN" : "WEP/WPA",
-	    gAp.ht ? ", HT" : "", gAp.wmm ? ", WMM" : "");
+	    "capabilities %04x, %s%s%s; heard %u time(s)%s", name, gBssid[0], gBssid[1], gBssid[2], gBssid[3], gBssid[4],
+	    gBssid[5], gAp.chan, gAp.mhz, gAp.dbm, gAp.bintval, gAp.cap, gJoinOpen ? "open" : gAp.rsn_len ? "RSN" :
+	    "WEP/WPA", gAp.ht ? ", HT" : "", gAp.wmm ? ", WMM" : "", gAp.frames, gAp.probed ?
+	    ", answered our probe requests" : "");
 	if (!gJoinOpen) {
 		if (gAp.rsn_len == 0) {
 			return join_fail(res, len, "it uses WEP or WPA1, which are not supported here");
@@ -4448,7 +4574,8 @@ run6(char *res, size_t len)
 			    msg1s > 1u ? ": the password is probably wrong" : "");
 		} else if (msg1s == 0) {
 			snprintf(why, sizeof(why), "no message 1 within 10 s (%u EAPOL frames, %u data frames from it, %u ring "
-			    "frames, %u in-order indications)", gEapolRx, gDataFromAp, gRingData, gInOrdInd);
+			    "data frames, %u in-order indications: %u buffers, %u offloaded, %u unusable)", gEapolRx, gDataFromAp,
+			    gRingData, gInOrdInd, gInOrdFrames, gInOrdOffload, gInOrdBad);
 		} else {
 			snprintf(why, sizeof(why), "%u message 1(s) and %u message 2(s) but no valid message 3 in 10 s: the "
 			    "password is probably wrong", msg1s, msg2s);
