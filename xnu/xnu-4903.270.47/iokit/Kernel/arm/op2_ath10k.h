@@ -19,6 +19,8 @@ struct op2_ath10k_bus {
 	bool boot_firmware;        /* wifi=4: after a 2b pass, step 2c (firmware download, BMI_DONE, HTC ready) */
 	bool start_services;       /* wifi=5: after a 2c pass, step 3 (HTC services, WMI init + ready, HTT version) */
 	bool scan;                 /* wifi=6: after a step 3 pass, step 4 (a scan that only listens) */
+	bool join;                 /* wifi=7: after a step 4 pass, step 5 (join the configured network) */
+	bool wpa2;                 /* wifi=8: after a step 5 pass, step 6 (WPA2-PSK 4-way handshake, keys, 5 s) */
 };
 
 /* Runs step 2b (and 2c, 3); writes the last step's one-line result ("STEP 2b PASS: ...", "STEP 3 FAIL: ...")

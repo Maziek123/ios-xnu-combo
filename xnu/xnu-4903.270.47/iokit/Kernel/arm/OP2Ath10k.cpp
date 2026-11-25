@@ -1579,10 +1579,17 @@ other_msg(void)
 	}
 }
 
-/* Everything that has arrived, without waiting for anything in particular (at most 64 messages). */
+/* Everything that has arrived, without waiting for anything in particular (at most 64 messages). While joining
+ * (steps 5, 6) the join code's dispatcher handles them instead, so nothing is lost while a command waits. */
+static void (*gDrainHook)(void);
+
 static void
 drain(void)
 {
+	if (gDrainHook != NULL) {
+		gDrainHook();
+		return;
+	}
 	int r;
 	for (int k = 0; k < 64 && (r = htc_rx_one()) != 0; k++) {
 		if (r == 2) {
@@ -1597,14 +1604,14 @@ fw_down(const char *what, char *res, size_t len)
 	uint32_t fwi = brd(Q_FW_INDICATOR);
 	if (fwi == 0xFFFFFFFFu) {
 		gFwDown = true;
-		snprintf(res, len, "STEP 3 FAIL: BAR0 reads all ones while waiting for %s", what);
+		snprintf(res, len, "STEP %s FAIL: BAR0 reads all ones while waiting for %s", gStep, what);
 		return true;
 	}
 	if (fwi & Q_FW_IND_EVENT_PENDING) {
 		gFwDown = true;
 		A_LOG("firmware crashed while we waited for %s (fw indicator %08x)", what, fwi);
 		dump_fw_crash();
-		snprintf(res, len, "STEP 3 FAIL: firmware crashed while we waited for %s (fw indicator %08x)", what, fwi);
+		snprintf(res, len, "STEP %s FAIL: firmware crashed while we waited for %s (fw indicator %08x)", gStep, what, fwi);
 		return true;
 	}
 	return false;
@@ -2258,11 +2265,18 @@ static const uint16_t kScanMhz[] = {
 struct bss {
 	uint8_t bssid[6];
 	uint8_t ssid_len;
-	char ssid[33];
-	uint32_t chan;
+	char ssid[33];          /* printable copy */
+	uint8_t raw_ssid[32];   /* as sent, for matching the configured network */
+	uint32_t chan, mhz;
 	int32_t dbm;            /* strongest seen */
 	uint32_t frames;
 	const char *sec;
+	/* for joining (step 5): from the last beacon or probe response */
+	uint16_t cap, bintval;
+	uint8_t rsn_len, rates_len, xrates_len;
+	uint8_t rsn[64];        /* the RSN element's body */
+	uint8_t rates[8], xrates[16];
+	bool wmm, ht, have_ies;
 };
 static struct bss gBss[SCAN_MAX_BSS];
 static uint32_t gNumBss, gScanFrames, gScanDropped, gScanForeign, gScanEvent, gScanReason;
@@ -2390,6 +2404,10 @@ vdev_delete(uint32_t id)
 /* struct htt_rx_ring_rx_desc_offsets for htt_rx_desc_v1, in 4-byte words: mac80211 header, msdu payload,
  * ppdu start/end, mpdu start/end, msdu start/end, attention, frag info */
 static void add_frame(const uint8_t *f, uint32_t flen, uint32_t chan, int32_t dbm, bool from_ring);
+/* steps 5 and 6: management frames other than beacons (WMI or the ring) and data frames (the ring) */
+static void (*gMgmtHook)(const uint8_t *f, uint32_t len);
+static void (*gDataHook)(const uint8_t *f, uint32_t len);
+static uint32_t gRingData;
 
 static_assert(HTT_RX_IDX_OFF + 4u <= HTT_RX_BLOCK, "the HTT rx block holds the buffers, the ring and alloc_idx");
 
@@ -2518,10 +2536,18 @@ rx_ring_poll(void)
 			int32_t dbm = (int32_t)d[RXD_RSSI_COMB] + ATH10K_DEFAULT_NOISE_FLOOR;
 			uint32_t chan = mhz_to_chan(gScanMhz);
 			/* the whole frame in the payload (raw), else the first 64 bytes in rx_hdr_status */
-			if (mlen >= 36u && mlen <= HTT_RX_BUF_SIZE - RXD_PAYLOAD && (pl[0] == 0x80u || pl[0] == 0x50u)) {
+			bool whole = mlen >= 24u && mlen <= HTT_RX_BUF_SIZE - RXD_PAYLOAD;
+			if (whole && mlen >= 36u && (pl[0] == 0x80u || pl[0] == 0x50u)) {
 				add_frame(pl, mlen, chan, dbm, true);
-			} else if (h[0] == 0x80u || h[0] == 0x50u) {
+			} else if (!whole && (h[0] == 0x80u || h[0] == 0x50u)) {
 				add_frame(h, RXD_HDR_STATUS_LEN, chan, dbm, true);
+			} else if (whole && gMgmtHook != NULL) {
+				gMgmtHook(pl, mlen);
+			}
+		} else {
+			gRingData++;
+			if (gDataHook != NULL && mlen >= 24u && mlen <= HTT_RX_BUF_SIZE - RXD_PAYLOAD) {
+				gDataHook(pl, mlen);
 			}
 		}
 		bzero(d, RXD_PAYLOAD + 64u);   /* the descriptor (attention included) and the start of the payload */
@@ -2535,23 +2561,8 @@ rx_ring_poll(void)
 	}
 }
 
-/* HTT messages during the scan: rx indications (frames in the ring) and anything else, counted */
-static void
-on_htt_msg(void)
-{
-	uint32_t t = msg_id();
-	if (t == HTT_T2H_MSG_TYPE_RX_IND) {
-		if (gHttRxInd++ < 3u) {
-			A_LOG("HTT rx indication, %u bytes: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x", gRxLen,
-			    gRx[0], gRx[1], gRx[2], gRx[3], gRx[4], gRx[5], gRx[6], gRx[7], gRx[8], gRx[9], gRx[10], gRx[11]);
-		}
-		return;
-	}
-	if (gHttOther++ < 4u) {
-		A_LOG("HTT message type %u, %u bytes: %02x %02x %02x %02x %02x %02x %02x %02x", t, gRxLen, gRx[0], gRx[1],
-		    gRx[2], gRx[3], gRx[4], gRx[5], gRx[6], gRx[7]);
-	}
-}
+/* HTT messages (steps 4-6): defined with the join code below */
+static void on_htt_msg(void);
 
 /* struct wmi_tlv_chan_info_event: err_code, freq, cmd_flags, noise_floor, rx_clear_count, cycle_count,
  * chan_tx_pwr_range, chan_tx_pwr_tp, rx_frame_count, my_bss_rx_cycle_count, ... One at the start of each dwell
@@ -2600,12 +2611,12 @@ on_chan_info(void)
 
 /* ath10k_wmi_start_scan_init + ath10k_hw_scan without SSIDs (passive) + ath10k_wmi_tlv_op_gen_start_scan */
 static bool
-scan_start(void)
+scan_start(uint32_t round)
 {
 	uint32_t *w = gScanCmd, n = 0;
 	w[n++] = tlv_hdr(WMI_TLV_TAG_START_SCAN_CMD, 100u);
-	w[n++] = WMI_HOST_SCAN_ID_PREFIX | 0u;        /* scan_id (ATH10K_SCAN_ID) */
-	w[n++] = WMI_HOST_SCAN_ID_PREFIX | 1u;        /* scan_req_id */
+	w[n++] = WMI_HOST_SCAN_ID_PREFIX | (2u * round);        /* scan_id (ATH10K_SCAN_ID) */
+	w[n++] = WMI_HOST_SCAN_ID_PREFIX | (2u * round + 1u);   /* scan_req_id */
 	w[n++] = 0u;                                  /* vdev_id */
 	w[n++] = 1u;                                  /* WMI_SCAN_PRIORITY_LOW */
 	w[n++] = WMI_SCAN_EVENT_STARTED | WMI_SCAN_EVENT_COMPLETED | WMI_SCAN_EVENT_BSS_CHANNEL |
@@ -2704,9 +2715,9 @@ add_frame(const uint8_t *f, uint32_t flen, uint32_t chan, int32_t dbm, bool from
 	}
 	const uint8_t *bssid = f + 16;
 	uint32_t cap = le16(f + 34);
-	bool rsn = false, wpa = false;
-	uint32_t ssid_len = 0, ds = 0;
-	const uint8_t *ssid = NULL;
+	bool rsn = false, wpa = false, wmm = false, ht = false;
+	uint32_t ssid_len = 0, ds = 0, rsn_len = 0, rates_len = 0, xrates_len = 0;
+	const uint8_t *ssid = NULL, *rsn_ie = NULL, *rates = NULL, *xrates = NULL;
 	for (uint32_t o = 36u; o + 2u <= flen;) {
 		uint32_t id = f[o], l = f[o + 1u];
 		if (o + 2u + l > flen) {
@@ -2716,12 +2727,25 @@ add_frame(const uint8_t *f, uint32_t flen, uint32_t chan, int32_t dbm, bool from
 		if (id == 0u && ssid == NULL) {
 			ssid = p;
 			ssid_len = l > 32u ? 32u : l;
+		} else if (id == 1u && rates == NULL) {
+			rates = p;
+			rates_len = l > 8u ? 8u : l;
 		} else if (id == 3u && l >= 1u) {
 			ds = p[0];
-		} else if (id == 48u) {
+		} else if (id == 45u) {
+			ht = true;
+		} else if (id == 48u && rsn_ie == NULL) {
 			rsn = true;
+			rsn_ie = p;
+			rsn_len = l > 64u ? 64u : l;
+		} else if (id == 50u && xrates == NULL) {
+			xrates = p;
+			xrates_len = l > 16u ? 16u : l;
 		} else if (id == 221u && l >= 4u && p[0] == 0x00u && p[1] == 0x50u && p[2] == 0xF2u && p[3] == 1u) {
 			wpa = true;
+		} else if (id == 221u && l >= 5u && p[0] == 0x00u && p[1] == 0x50u && p[2] == 0xF2u && p[3] == 2u &&
+		    p[4] <= 1u) {
+			wmm = true;   /* WMM information or parameter element */
 		}
 		o += 2u + l;
 	}
@@ -2746,13 +2770,35 @@ add_frame(const uint8_t *f, uint32_t flen, uint32_t chan, int32_t dbm, bool from
 		b->dbm = dbm;
 	}
 	b->chan = ds != 0 ? ds : chan;
+	b->mhz = b->chan >= 1u && b->chan <= 13u ? 2407u + 5u * b->chan : b->chan == 14u ? 2484u : 5000u + 5u * b->chan;
 	b->sec = rsn ? "WPA2" : wpa ? "WPA" : (cap & 0x10u) ? "WEP" : "open";
+	if (ssid != NULL && ssid_len > 0 && (!b->have_ies || flen > RXD_HDR_STATUS_LEN)) {
+		/* a whole frame (not the 64-byte header copy) refreshes what joining uses */
+		b->have_ies = flen > RXD_HDR_STATUS_LEN || !b->have_ies;
+		b->cap = (uint16_t)cap;
+		b->bintval = (uint16_t)le16(f + 32);
+		b->rsn_len = (uint8_t)rsn_len;
+		if (rsn_len) {
+			memcpy(b->rsn, rsn_ie, rsn_len);
+		}
+		b->rates_len = (uint8_t)rates_len;
+		if (rates_len) {
+			memcpy(b->rates, rates, rates_len);
+		}
+		b->xrates_len = (uint8_t)xrates_len;
+		if (xrates_len) {
+			memcpy(b->xrates, xrates, xrates_len);
+		}
+		b->wmm = wmm;
+		b->ht = ht;
+	}
 	if (ssid != NULL && ssid_len > 0 && b->ssid_len == 0) {
 		bool hidden = true;
 		for (uint32_t i = 0; i < ssid_len; i++) {
 			hidden = hidden && ssid[i] == 0;
 		}
 		if (!hidden) {
+			memcpy(b->raw_ssid, ssid, ssid_len);
 			for (uint32_t i = 0; i < ssid_len; i++) {
 				b->ssid[i] = (ssid[i] >= 0x20u && ssid[i] < 0x7Fu) ? (char)ssid[i] : '?';
 			}
@@ -2790,6 +2836,10 @@ on_mgmt_rx(void)
 		gScanDropped++;
 		return;
 	}
+	if (flen >= 24u && f[0] != 0x80u && f[0] != 0x50u && gMgmtHook != NULL) {
+		gMgmtHook(f, flen);
+		return;
+	}
 	add_frame(f, flen, chan, (int32_t)snr + ATH10K_DEFAULT_NOISE_FLOOR, false);
 }
 
@@ -2818,7 +2868,7 @@ run4(char *res, size_t len)
 		snprintf(res, len, "STEP 4 FAIL: the %s setting could not be sent", bad);
 		return false;
 	}
-	ok = ok && scan_set_regdomain() && scan_chan_list() && vdev_create(0u) && scan_start();
+	ok = ok && scan_set_regdomain() && scan_chan_list() && vdev_create(0u) && scan_start(0u);
 	A_LOG("rx filter reset (barrier echo %s), start settings (chain mask %x, ANI on, burst %s), regdomain %x, %u "
 	    "channels (all passive), station interface with the chip's MAC; scan %s", echo, chains,
 	    svc_has(WMI_TLV_SERVICE_BURST) ? "off" : "not offered", gEepromRd & 0xFFFFu, SCAN_NCHAN,
@@ -2902,6 +2952,1570 @@ run4(char *res, size_t len)
 	    gRingBeacons, gScanForeign,
 	    top->ssid_len ? top->ssid : "(hidden)", top->chan, top->dbm, top->sec, gScanFrames - gScanDropped, gRingBeacons);
 	return true;
+}
+
+/* ---------------------------------------------------------------------------------------------------- */
+/* steps 5 and 6: join the configured network, then WPA2-PSK (ath10k mac.c ath10k_vdev_start_restart,   */
+/* ath10k_peer_create, ath10k_mac_tx -> htt_tx.c ath10k_htt_tx_32, ath10k_bss_assoc, ath10k_set_key;    */
+/* the frames as mac80211 builds them; the 4-way handshake as wpa_supplicant runs it, IEEE 802.11 12.7) */
+
+#if __has_include("op2_wifi_net.h")
+#include "op2_wifi_net.h"   /* kOp2WifiSsid(Len), kOp2WifiPmk, kOp2WifiOpen: tools/gen-wifi-fw.py, gitignored */
+#else
+static const uint8_t kOp2WifiSsid[1] = { 0 };
+static uint32_t kOp2WifiSsidLen = 0u;   /* not const: no "always false" warnings for the empty name */
+static const uint8_t kOp2WifiPmk[32] = { 0 };
+static const bool kOp2WifiOpen = false;
+#endif
+
+extern "C" void read_random(void *buffer, unsigned int numBytes);
+
+#define WMI_TLV_VDEV_START_REQUEST_CMDID  0x5003u
+#define WMI_TLV_VDEV_UP_CMDID             0x5005u
+#define WMI_TLV_VDEV_STOP_CMDID           0x5006u
+#define WMI_TLV_VDEV_DOWN_CMDID           0x5007u
+#define WMI_TLV_VDEV_INSTALL_KEY_CMDID    0x5009u
+#define WMI_TLV_PEER_CREATE_CMDID         0x6001u
+#define WMI_TLV_PEER_DELETE_CMDID         0x6002u
+#define WMI_TLV_PEER_SET_PARAM_CMDID      0x6004u
+#define WMI_TLV_PEER_ASSOC_CMDID          0x6005u
+#define WMI_TLV_STA_POWERSAVE_MODE_CMDID  0x9001u
+#define WMI_TLV_VDEV_START_RESP_EVENTID   0x5001u
+#define WMI_TLV_VDEV_STOPPED_EVENTID      0x5002u
+#define WMI_TLV_PEER_STA_KICKOUT_EVENTID  0x6001u
+#define WMI_TLV_ROAM_EVENTID              0xb001u
+#define WMI_TLV_TAG_VDEV_START_REQUEST_CMD 88u
+#define WMI_TLV_TAG_VDEV_UP_CMD           92u
+#define WMI_TLV_TAG_VDEV_STOP_CMD         93u
+#define WMI_TLV_TAG_VDEV_DOWN_CMD         94u
+#define WMI_TLV_TAG_VDEV_INSTALL_KEY_CMD  96u
+#define WMI_TLV_TAG_PEER_CREATE_CMD       97u
+#define WMI_TLV_TAG_PEER_DELETE_CMD       98u
+#define WMI_TLV_TAG_PEER_SET_PARAM_CMD    100u
+#define WMI_TLV_TAG_PEER_ASSOC_COMPLETE_CMD 101u
+#define WMI_TLV_TAG_VHT_RATE_SET          102u
+#define WMI_TLV_TAG_STA_POWERSAVE_MODE_CMD 108u
+#define WMI_TLV_TAG_VDEV_START_RESPONSE_EVENT 40u
+#define WMI_TLV_TAG_ROAM_EVENT            48u
+#define WMI_TLV_PEER_AUTH                 0x1u
+#define WMI_TLV_PEER_NEED_PTK_4_WAY       0x4u
+#define WMI_TLV_PEER_AUTHORIZE            3u
+#define WMI_TLV_CIPHER_AES_CCM            4u
+#define WMI_KEY_PAIRWISE                  0u
+#define WMI_KEY_GROUP                     1u
+#define WMI_MODE_11B                      2u
+#define HTT_H2T_MSG_TYPE_TX_FRM           1u
+#define HTT_T2H_MSG_TYPE_PEER_MAP         3u
+#define HTT_T2H_MSG_TYPE_TX_COMPL_IND     7u
+#define HTT_T2H_MSG_TYPE_SEC_IND          0xbu
+#define HTT_T2H_MSG_TYPE_RX_IN_ORD_PADDR_IND 0x12u
+#define HTT_TX_FLAGS0_MAC_HDR_PRESENT     0x01u
+#define HTT_TX_FLAGS0_NO_ENCRYPT          0x04u
+#define HTT_TX_PKT_NATIVE_WIFI            1u
+#define HTT_TX_PKT_MGMT                   3u
+#define HTT_TX_FLAGS1_POSTPONED           (1u << 11)
+#define HTT_TX_EXT_TID_NON_QOS            16u
+#define HTT_TX_EXT_TID_MGMT               17u
+#define HTT_TX_PREFETCH                   46u      /* htt.c: 802.11 + QoS + HT (36), 802.1Q (4), LLC/SNAP (8), DSCP (2) */
+#define CE_DESC_FLAGS_GATHER              1u
+#define OFF_TX_BUF                        0xC000u  /* ath10k_htt_txbuf_32: frags[2] (16), HTC header (8), TX_FRM (16) */
+#define OFF_TX_FRAME                      0xC400u  /* the frame being sent */
+#define TX_FRAME_MAX                      1024u
+#define EAPOL_MAX                         512u
+#define EAPOL_QUEUE                       4u
+#define KI_VERSION_MASK                   0x0007u  /* EAPOL-Key key information */
+#define KI_PAIRWISE                       0x0008u
+#define KI_INSTALL                        0x0040u
+#define KI_ACK                            0x0080u
+#define KI_MIC                            0x0100u
+#define KI_SECURE                         0x0200u
+#define KI_ENC_KEY_DATA                   0x1000u
+#define EK_HDR                            99u      /* 802.1X header (4) + EAPOL-Key fields up to the key data */
+#define EK_REPLAY                         9u
+#define EK_NONCE                          17u
+#define EK_MIC                            81u
+#define EK_KD_LEN                         97u
+
+static_assert(OFF_TX_FRAME + TX_FRAME_MAX <= DMA_SIZE, "the transmit areas are in the DMA block");
+static_assert(OFF_TX_BUF + 64u <= OFF_TX_FRAME, "the HTT transmit descriptor area");
+
+static const uint8_t kLlcEapol[8] = { 0xAA, 0xAA, 0x03, 0x00, 0x00, 0x00, 0x88, 0x8E };
+/* our RSN element: version 1, group CCMP, pairwise CCMP, key management PSK, no capabilities (no PMF) */
+static const uint8_t kOurRsn[22] = { 48, 20, 1, 0, 0x00, 0x0F, 0xAC, 4, 1, 0, 0x00, 0x0F, 0xAC, 4, 1, 0, 0x00, 0x0F, 0xAC,
+	2, 0, 0 };
+
+static struct bss gAp;            /* the network being joined (a copy of its scan entry) */
+static uint8_t gBssid[6];
+static bool gJoinOpen;            /* no RSN: no 4-way handshake */
+static bool gVdevStartResp, gVdevStopped, gVdevStarted, gPeerCreated, gPeerMapped, gVdevUp, gAssociated;
+static uint32_t gVdevStartStatus, gPeerId;
+static bool gKickout, gRoam;
+static uint32_t gRoamReason;
+static uint32_t gTxWant, gTxStatus, gTxSeq;
+static bool gTxDone;
+static uint32_t gSecInd, gInOrdInd, gTxCompl, gPeerMaps;
+static uint16_t gSeq;
+static bool gAuthResp, gAssocResp, gDeauth;
+static uint32_t gAuthStatus, gAssocStatus, gAid, gAssocCap, gDeauthReason, gDeauthSubtype, gMgmtOther;
+static uint8_t gEapolQ[EAPOL_QUEUE][EAPOL_MAX];
+static uint32_t gEapolQLen[EAPOL_QUEUE], gEapolHead, gEapolTail, gEapolRx, gEapolDropped;
+static uint32_t gDataFromAp, gDataAfterKeys, gDataOther;
+static bool gAuthorized;
+
+static inline uint32_t
+be16(const uint8_t *p)
+{
+	return ((uint32_t)p[0] << 8) | p[1];
+}
+
+static inline void
+put_be16(uint8_t *p, uint32_t v)
+{
+	p[0] = (uint8_t)(v >> 8);
+	p[1] = (uint8_t)v;
+}
+
+/* ---- SHA-1 (FIPS 180-4), HMAC-SHA1 (RFC 2104), the 802.11 PRF, AES-128 decryption (FIPS 197) and AES key
+ * unwrap (RFC 3394): all the handshake needs. Checked against known answers before the handshake. ---- */
+
+struct sha1_ctx {
+	uint32_t h[5];
+	uint64_t bytes;
+	uint8_t buf[64];
+	uint32_t used;
+};
+
+static inline uint32_t
+rol32(uint32_t x, uint32_t n)
+{
+	return (x << n) | (x >> (32u - n));
+}
+
+static void
+sha1_block(uint32_t h[5], const uint8_t *p)
+{
+	uint32_t w[80];
+	for (uint32_t i = 0; i < 16u; i++) {
+		w[i] = ((uint32_t)p[4u * i] << 24) | ((uint32_t)p[4u * i + 1u] << 16) | ((uint32_t)p[4u * i + 2u] << 8) |
+		    p[4u * i + 3u];
+	}
+	for (uint32_t i = 16; i < 80u; i++) {
+		w[i] = rol32(w[i - 3u] ^ w[i - 8u] ^ w[i - 14u] ^ w[i - 16u], 1u);
+	}
+	uint32_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4];
+	for (uint32_t i = 0; i < 80u; i++) {
+		uint32_t f, k;
+		if (i < 20u) {
+			f = (b & c) | (~b & d);
+			k = 0x5A827999u;
+		} else if (i < 40u) {
+			f = b ^ c ^ d;
+			k = 0x6ED9EBA1u;
+		} else if (i < 60u) {
+			f = (b & c) | (b & d) | (c & d);
+			k = 0x8F1BBCDCu;
+		} else {
+			f = b ^ c ^ d;
+			k = 0xCA62C1D6u;
+		}
+		uint32_t t = rol32(a, 5u) + f + e + k + w[i];
+		e = d;
+		d = c;
+		c = rol32(b, 30u);
+		b = a;
+		a = t;
+	}
+	h[0] += a;
+	h[1] += b;
+	h[2] += c;
+	h[3] += d;
+	h[4] += e;
+}
+
+static void
+sha1_init(struct sha1_ctx *c)
+{
+	c->h[0] = 0x67452301u;
+	c->h[1] = 0xEFCDAB89u;
+	c->h[2] = 0x98BADCFEu;
+	c->h[3] = 0x10325476u;
+	c->h[4] = 0xC3D2E1F0u;
+	c->bytes = 0;
+	c->used = 0;
+}
+
+static void
+sha1_update(struct sha1_ctx *c, const uint8_t *p, uint32_t n)
+{
+	c->bytes += n;
+	while (n > 0) {
+		uint32_t take = 64u - c->used < n ? 64u - c->used : n;
+		memcpy(c->buf + c->used, p, take);
+		c->used += take;
+		p += take;
+		n -= take;
+		if (c->used == 64u) {
+			sha1_block(c->h, c->buf);
+			c->used = 0;
+		}
+	}
+}
+
+static void
+sha1_final(struct sha1_ctx *c, uint8_t out[20])
+{
+	uint64_t bits = c->bytes * 8u;
+	uint8_t pad = 0x80u, zero = 0, len[8];
+	sha1_update(c, &pad, 1u);
+	while (c->used != 56u) {
+		sha1_update(c, &zero, 1u);
+	}
+	for (uint32_t i = 0; i < 8u; i++) {
+		len[i] = (uint8_t)(bits >> (56u - 8u * i));
+	}
+	sha1_update(c, len, 8u);
+	for (uint32_t i = 0; i < 5u; i++) {
+		out[4u * i] = (uint8_t)(c->h[i] >> 24);
+		out[4u * i + 1u] = (uint8_t)(c->h[i] >> 16);
+		out[4u * i + 2u] = (uint8_t)(c->h[i] >> 8);
+		out[4u * i + 3u] = (uint8_t)c->h[i];
+	}
+}
+
+/* HMAC-SHA1 over the concatenation of up to 4 pieces */
+static void
+hmac_sha1(const uint8_t *key, uint32_t klen, const uint8_t *const *parts, const uint32_t *lens, uint32_t nparts,
+    uint8_t out[20])
+{
+	uint8_t k[64], pad[64], inner[20];
+	bzero(k, sizeof(k));
+	if (klen > 64u) {
+		struct sha1_ctx c;
+		sha1_init(&c);
+		sha1_update(&c, key, klen);
+		sha1_final(&c, k);
+	} else {
+		memcpy(k, key, klen);
+	}
+	struct sha1_ctx c;
+	for (uint32_t i = 0; i < 64u; i++) {
+		pad[i] = k[i] ^ 0x36u;
+	}
+	sha1_init(&c);
+	sha1_update(&c, pad, 64u);
+	for (uint32_t i = 0; i < nparts; i++) {
+		sha1_update(&c, parts[i], lens[i]);
+	}
+	sha1_final(&c, inner);
+	for (uint32_t i = 0; i < 64u; i++) {
+		pad[i] = k[i] ^ 0x5Cu;
+	}
+	sha1_init(&c);
+	sha1_update(&c, pad, 64u);
+	sha1_update(&c, inner, 20u);
+	sha1_final(&c, out);
+	bzero(k, sizeof(k));
+	bzero(pad, sizeof(pad));
+}
+
+/* IEEE 802.11 PRF: HMAC-SHA1(K, label || 0 || data || i) for i = 0, 1, ... */
+static void
+prf_sha1(const uint8_t *key, uint32_t klen, const char *label, const uint8_t *data, uint32_t dlen, uint8_t *out,
+    uint32_t olen)
+{
+	uint8_t zero = 0, i = 0, h[20];
+	for (uint32_t done = 0; done < olen; i++) {
+		const uint8_t *parts[4] = { (const uint8_t *)label, &zero, data, &i };
+		uint32_t ll = 0;
+		while (label[ll] != 0) {
+			ll++;
+		}
+		uint32_t lens[4] = { ll, 1u, dlen, 1u };
+		hmac_sha1(key, klen, parts, lens, 4u, h);
+		uint32_t take = olen - done < 20u ? olen - done : 20u;
+		memcpy(out + done, h, take);
+		done += take;
+	}
+	bzero(h, sizeof(h));
+}
+
+static const uint8_t kAesSbox[256] = {
+	0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
+	0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0, 0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0,
+	0xb7, 0xfd, 0x93, 0x26, 0x36, 0x3f, 0xf7, 0xcc, 0x34, 0xa5, 0xe5, 0xf1, 0x71, 0xd8, 0x31, 0x15,
+	0x04, 0xc7, 0x23, 0xc3, 0x18, 0x96, 0x05, 0x9a, 0x07, 0x12, 0x80, 0xe2, 0xeb, 0x27, 0xb2, 0x75,
+	0x09, 0x83, 0x2c, 0x1a, 0x1b, 0x6e, 0x5a, 0xa0, 0x52, 0x3b, 0xd6, 0xb3, 0x29, 0xe3, 0x2f, 0x84,
+	0x53, 0xd1, 0x00, 0xed, 0x20, 0xfc, 0xb1, 0x5b, 0x6a, 0xcb, 0xbe, 0x39, 0x4a, 0x4c, 0x58, 0xcf,
+	0xd0, 0xef, 0xaa, 0xfb, 0x43, 0x4d, 0x33, 0x85, 0x45, 0xf9, 0x02, 0x7f, 0x50, 0x3c, 0x9f, 0xa8,
+	0x51, 0xa3, 0x40, 0x8f, 0x92, 0x9d, 0x38, 0xf5, 0xbc, 0xb6, 0xda, 0x21, 0x10, 0xff, 0xf3, 0xd2,
+	0xcd, 0x0c, 0x13, 0xec, 0x5f, 0x97, 0x44, 0x17, 0xc4, 0xa7, 0x7e, 0x3d, 0x64, 0x5d, 0x19, 0x73,
+	0x60, 0x81, 0x4f, 0xdc, 0x22, 0x2a, 0x90, 0x88, 0x46, 0xee, 0xb8, 0x14, 0xde, 0x5e, 0x0b, 0xdb,
+	0xe0, 0x32, 0x3a, 0x0a, 0x49, 0x06, 0x24, 0x5c, 0xc2, 0xd3, 0xac, 0x62, 0x91, 0x95, 0xe4, 0x79,
+	0xe7, 0xc8, 0x37, 0x6d, 0x8d, 0xd5, 0x4e, 0xa9, 0x6c, 0x56, 0xf4, 0xea, 0x65, 0x7a, 0xae, 0x08,
+	0xba, 0x78, 0x25, 0x2e, 0x1c, 0xa6, 0xb4, 0xc6, 0xe8, 0xdd, 0x74, 0x1f, 0x4b, 0xbd, 0x8b, 0x8a,
+	0x70, 0x3e, 0xb5, 0x66, 0x48, 0x03, 0xf6, 0x0e, 0x61, 0x35, 0x57, 0xb9, 0x86, 0xc1, 0x1d, 0x9e,
+	0xe1, 0xf8, 0x98, 0x11, 0x69, 0xd9, 0x8e, 0x94, 0x9b, 0x1e, 0x87, 0xe9, 0xce, 0x55, 0x28, 0xdf,
+	0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16,
+};
+
+static inline uint8_t
+gf_xtime(uint8_t x)
+{
+	return (uint8_t)((x << 1) ^ ((x & 0x80u) ? 0x1Bu : 0u));
+}
+
+static uint8_t
+gf_mul(uint8_t a, uint8_t b)
+{
+	uint8_t r = 0;
+	while (b != 0) {
+		if (b & 1u) {
+			r ^= a;
+		}
+		a = gf_xtime(a);
+		b >>= 1;
+	}
+	return r;
+}
+
+/* AES-128 decryption of one block: key expansion, then the inverse cipher */
+static void
+aes128_decrypt(const uint8_t key[16], const uint8_t in[16], uint8_t out[16])
+{
+	uint8_t rk[176], inv[256], s[16];
+	for (uint32_t i = 0; i < 256u; i++) {
+		inv[kAesSbox[i]] = (uint8_t)i;
+	}
+	memcpy(rk, key, 16u);
+	uint8_t rcon = 1;
+	for (uint32_t i = 16; i < 176u; i += 4u) {
+		uint8_t t[4] = { rk[i - 4u], rk[i - 3u], rk[i - 2u], rk[i - 1u] };
+		if (i % 16u == 0) {
+			uint8_t t0 = t[0];
+			t[0] = (uint8_t)(kAesSbox[t[1]] ^ rcon);
+			t[1] = kAesSbox[t[2]];
+			t[2] = kAesSbox[t[3]];
+			t[3] = kAesSbox[t0];
+			rcon = gf_xtime(rcon);
+		}
+		for (uint32_t j = 0; j < 4u; j++) {
+			rk[i + j] = rk[i + j - 16u] ^ t[j];
+		}
+	}
+	for (uint32_t i = 0; i < 16u; i++) {
+		s[i] = in[i] ^ rk[160u + i];
+	}
+	for (int round = 9; round >= 0; round--) {
+		uint8_t t[16];
+		for (uint32_t c = 0; c < 4u; c++) {          /* InvShiftRows, InvSubBytes (column-major state) */
+			for (uint32_t r = 0; r < 4u; r++) {
+				t[4u * ((c + r) % 4u) + r] = inv[s[4u * c + r]];
+			}
+		}
+		for (uint32_t i = 0; i < 16u; i++) {
+			s[i] = t[i] ^ rk[16u * (uint32_t)round + i];
+		}
+		if (round == 0) {
+			break;
+		}
+		for (uint32_t c = 0; c < 4u; c++) {          /* InvMixColumns */
+			uint8_t *a = s + 4u * c, b0 = a[0], b1 = a[1], b2 = a[2], b3 = a[3];
+			a[0] = gf_mul(b0, 14) ^ gf_mul(b1, 11) ^ gf_mul(b2, 13) ^ gf_mul(b3, 9);
+			a[1] = gf_mul(b0, 9) ^ gf_mul(b1, 14) ^ gf_mul(b2, 11) ^ gf_mul(b3, 13);
+			a[2] = gf_mul(b0, 13) ^ gf_mul(b1, 9) ^ gf_mul(b2, 14) ^ gf_mul(b3, 11);
+			a[3] = gf_mul(b0, 11) ^ gf_mul(b1, 13) ^ gf_mul(b2, 9) ^ gf_mul(b3, 14);
+		}
+	}
+	memcpy(out, s, 16u);
+	bzero(rk, sizeof(rk));
+	bzero(s, sizeof(s));
+}
+
+/* RFC 3394 unwrap: in is (n + 1) 64-bit blocks, out gets n; false if the integrity check fails */
+static bool
+aes_unwrap(const uint8_t kek[16], const uint8_t *in, uint32_t inlen, uint8_t *out)
+{
+	if (inlen < 24u || inlen % 8u != 0) {
+		return false;
+	}
+	uint32_t n = inlen / 8u - 1u;
+	uint8_t a[8], b[16];
+	memcpy(a, in, 8u);
+	memcpy(out, in + 8, 8u * n);
+	for (int j = 5; j >= 0; j--) {
+		for (uint32_t i = n; i >= 1u; i--) {
+			uint64_t t = (uint64_t)n * (uint32_t)j + i;
+			for (uint32_t k = 0; k < 8u; k++) {
+				a[7u - k] ^= (uint8_t)(t >> (8u * k));
+			}
+			memcpy(b, a, 8u);
+			memcpy(b + 8, out + 8u * (i - 1u), 8u);
+			aes128_decrypt(kek, b, b);
+			memcpy(a, b, 8u);
+			memcpy(out + 8u * (i - 1u), b + 8, 8u);
+		}
+	}
+	bzero(b, sizeof(b));
+	for (uint32_t k = 0; k < 8u; k++) {
+		if (a[k] != 0xA6u) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static bool
+hex_eq(const uint8_t *p, const char *hex)
+{
+	for (uint32_t i = 0; hex[2u * i] != 0; i++) {
+		uint32_t v = 0;
+		for (uint32_t k = 0; k < 2u; k++) {
+			char c = hex[2u * i + k];
+			v = v * 16u + (uint32_t)(c <= '9' ? c - '0' : c - 'a' + 10);
+		}
+		if (p[i] != v) {
+			return false;
+		}
+	}
+	return true;
+}
+
+/* Known answers: RFC 2202 HMAC-SHA1 case 2, the 802.11i PRF-512 test vector, RFC 3394 4.1 */
+static const char *
+crypto_selftest(void)
+{
+	uint8_t out[64];
+	const uint8_t *parts[1] = { (const uint8_t *)"what do ya want for nothing?" };
+	uint32_t lens[1] = { 28u };
+	hmac_sha1((const uint8_t *)"Jefe", 4u, parts, lens, 1u, out);
+	if (!hex_eq(out, "effcdf6ae5eb2fa2d27416d5f184df9c259a7c79")) {
+		return "HMAC-SHA1";
+	}
+	uint8_t k20[20];
+	for (uint32_t i = 0; i < sizeof(k20); i++) {
+		k20[i] = 0x0Bu;
+	}
+	prf_sha1(k20, 20u, "prefix", (const uint8_t *)"Hi There", 8u, out, 64u);
+	if (!hex_eq(out, "bcd4c650b30b9684951829e0d75f9d54b862175ed9f00606e17d8da35402ffee75df78c3d31e0f889f012120c0862beb"
+	    "67753e7439ae242edb8373698356cf5a")) {
+		return "PRF";
+	}
+	static const uint8_t kek[16] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
+	static const uint8_t wrapped[24] = { 0x1F, 0xA6, 0x8B, 0x0A, 0x81, 0x12, 0xB4, 0x47, 0xAE, 0xF3, 0x4B, 0xD8, 0xFB, 0x5A,
+		0x7B, 0x82, 0x9D, 0x3E, 0x86, 0x23, 0x71, 0xD2, 0xCF, 0xE5 };
+	if (!aes_unwrap(kek, wrapped, 24u, out) || !hex_eq(out, "00112233445566778899aabbccddeeff")) {
+		return "AES key unwrap";
+	}
+	return NULL;
+}
+
+/* ---- WMI command builder ---- */
+
+struct wbuf {
+	uint8_t b[160];
+	uint32_t n;
+};
+
+static void
+wb32(struct wbuf *w, uint32_t v)
+{
+	put32(w->b + w->n, v);
+	w->n += 4u;
+}
+
+static void
+wbmac(struct wbuf *w, const uint8_t *m)   /* struct wmi_mac_addr: 6 bytes and 2 of padding */
+{
+	memcpy(w->b + w->n, m, 6u);
+	w->b[w->n + 6u] = 0;
+	w->b[w->n + 7u] = 0;
+	w->n += 8u;
+}
+
+static void
+wbbytes(struct wbuf *w, const uint8_t *p, uint32_t n)   /* padded to 4 bytes */
+{
+	memcpy(w->b + w->n, p, n);
+	for (uint32_t i = n; i % 4u != 0; i++) {
+		w->b[w->n + i] = 0;
+		n++;
+	}
+	w->n += n;
+}
+
+static bool
+wb_send(uint32_t cmd, const struct wbuf *w)
+{
+	return wmi_cmd(cmd, w->b, w->n);
+}
+
+/* ---- events while joining: everything goes through here (also while a WMI command waits for a credit) ---- */
+
+static void on_htt_msg(void);
+
+static void
+on_vdev_start_resp(void)
+{
+	const uint8_t *e = wmi_find(WMI_TLV_TAG_VDEV_START_RESPONSE_EVENT, 16u);
+	if (e != NULL && le32(e) == 0u) {
+		gVdevStartResp = true;
+		gVdevStartStatus = le32(e + 12);
+	}
+}
+
+static void
+pump(void)
+{
+	int r;
+	for (int k = 0; k < 64 && (r = htc_rx_one()) != 0; k++) {
+		if (r != 2) {
+			continue;
+		}
+		uint32_t id = msg_id();
+		if (gRxEid == gEpHtt) {
+			on_htt_msg();
+			continue;
+		}
+		if (gRxEid != gEpWmi) {
+			other_msg();
+			continue;
+		}
+		switch (id) {
+		case WMI_TLV_MGMT_RX_EVENTID: on_mgmt_rx(); break;
+		case WMI_TLV_SCAN_EVENTID: on_scan_event(); break;
+		case WMI_TLV_CHAN_INFO_EVENTID: on_chan_info(); break;
+		case WMI_TLV_VDEV_START_RESP_EVENTID: on_vdev_start_resp(); break;
+		case WMI_TLV_VDEV_STOPPED_EVENTID: gVdevStopped = true; break;
+		case WMI_TLV_PEER_STA_KICKOUT_EVENTID: gKickout = true; break;
+		case WMI_TLV_ROAM_EVENTID: {
+			const uint8_t *e = wmi_find(WMI_TLV_TAG_ROAM_EVENT, 8u);
+			gRoam = true;
+			gRoamReason = e != NULL ? le32(e + 4) : 0xFFu;
+			break;
+		}
+		default: other_msg(); break;
+		}
+	}
+	rx_ring_poll();
+}
+
+/* pump until cond() holds (true) or ms pass (false; gFwDown and res set if the firmware died) */
+static bool
+wait_for(bool (*cond)(void), uint32_t ms, const char *what, char *res, size_t len)
+{
+	for (uint32_t t = 0; t <= ms; t++) {
+		pump();
+		if (cond()) {
+			return true;
+		}
+		if (t % 10u == 0 && fw_down(what, res, len)) {
+			return false;
+		}
+		IOSleep(1);
+	}
+	return false;
+}
+
+/* frames for us from the network being joined: auth and (re)association responses, deauth, disassoc */
+static void
+join_mgmt(const uint8_t *f, uint32_t n)
+{
+	if (n < 24u || memcmp(f + 10, gBssid, 6u) != 0) {
+		return;
+	}
+	bool to_us = memcmp(f + 4, gMac, 6u) == 0, bcast = f[4] == 0xFFu && f[5] == 0xFFu;
+	uint32_t st = f[0] & 0xF0u;
+	if (st == 0xB0u && to_us && n >= 30u && le16(f + 24) == 0u && le16(f + 26) == 2u) {
+		gAuthResp = true;
+		gAuthStatus = le16(f + 28);
+	} else if ((st == 0x10u || st == 0x30u) && to_us && n >= 30u) {
+		gAssocResp = true;
+		gAssocCap = le16(f + 24);
+		gAssocStatus = le16(f + 26);
+		gAid = le16(f + 28) & 0x3FFFu;
+	} else if ((st == 0xC0u || st == 0xA0u) && (to_us || bcast) && n >= 26u) {
+		gDeauth = true;
+		gDeauthSubtype = st;
+		gDeauthReason = le16(f + 24);
+	} else {
+		gMgmtOther++;
+	}
+}
+
+/* data frames in native wifi format (the 802.11 header without QoS control): EAPOL from the network is queued */
+static void
+join_data(const uint8_t *f, uint32_t n)
+{
+	if ((f[0] & 0x0Cu) != 0x08u) {
+		return;
+	}
+	uint32_t hl = 24u + ((f[1] & 3u) == 3u ? 6u : 0u) + ((f[0] & 0x80u) ? 2u : 0u);
+	if (n < hl + 8u || memcmp(f + 10, gBssid, 6u) != 0) {
+		gDataOther++;
+		return;
+	}
+	const uint8_t *l = f + hl;
+	if (memcmp(l, kLlcEapol, sizeof(kLlcEapol)) == 0) {
+		uint32_t el = n - hl - 8u;
+		gEapolRx++;
+		if (el > EAPOL_MAX || gEapolHead - gEapolTail >= EAPOL_QUEUE) {
+			gEapolDropped++;
+			return;
+		}
+		uint32_t slot = gEapolHead % EAPOL_QUEUE;
+		memcpy(gEapolQ[slot], l + 8, el);
+		gEapolQLen[slot] = el;
+		gEapolHead++;
+		return;
+	}
+	gDataFromAp++;
+	if (gAuthorized) {
+		gDataAfterKeys++;
+	}
+}
+
+/* ---- HTT transmit (ath10k_htt_tx_32): TX_FRM descriptor + the first bytes of the frame as one gathered send
+ * on CE4; the firmware fetches the frame itself (management: the frame's address; data: a fragment list) ---- */
+
+static bool
+ce_send2(struct ce_pipe *p, uint32_t a0, uint32_t n0, uint32_t a1, uint32_t n1)
+{
+	struct ce_ring *r = &p->src;
+	uint32_t mask = r->nentries - 1u;
+	if (((r->sw_index - 1u - r->write_index) & mask) < 2u) {
+		return false;
+	}
+	uint32_t w0 = r->write_index, w1 = (w0 + 1u) & mask;
+	r->desc[w0 * 2u] = a0;
+	r->desc[w0 * 2u + 1u] = (n0 & 0xFFFFu) | (CE_DESC_FLAGS_GATHER << 16);   /* transfer id 0, as ath10k */
+	r->desc[w1 * 2u] = a1;
+	r->desc[w1 * 2u + 1u] = n1 & 0xFFFFu;
+	dma_fence();
+	r->write_index = (w1 + 1u) & mask;
+	bwr(p->base + CE_SR_WR_INDEX, r->write_index);   /* once, after the last piece (ath10k's WORKAROUND) */
+	return true;
+}
+
+static const char *
+tx_status_name(uint32_t s)
+{
+	return s == 0 ? "acknowledged" : s == 1 ? "discarded" : s == 2 ? "not acknowledged" : "unknown status";
+}
+
+/* NULL once the firmware reports the frame done (*status: 0 acknowledged, 1 discarded, 2 no ack) */
+static const char *
+htt_tx(const uint8_t *frame, uint32_t flen, bool mgmt, bool no_encrypt, uint32_t *status, char *res, size_t len)
+{
+	if (flen > TX_FRAME_MAX || flen < 24u) {
+		return "frame size";
+	}
+	uint8_t *f = gDma + OFF_TX_FRAME, *t = gDma + OFF_TX_BUF;
+	uint32_t fpa = gDmaPhys + OFF_TX_FRAME, tpa = gDmaPhys + OFF_TX_BUF;
+	bzero(f, TX_FRAME_MAX);
+	memcpy(f, frame, flen);
+	bzero(t, 64u);
+	uint32_t flags0 = HTT_TX_FLAGS0_MAC_HDR_PRESENT, frags = fpa, tid = HTT_TX_EXT_TID_MGMT;
+	if (mgmt) {
+		flags0 |= HTT_TX_PKT_MGMT << 5;
+	} else {
+		put32(t, fpa);          /* frags[0] = the frame; frags[1] = 0, 0 ends the list */
+		put32(t + 4, flen);
+		flags0 |= HTT_TX_PKT_NATIVE_WIFI << 5;
+		frags = tpa;
+		tid = HTT_TX_EXT_TID_NON_QOS;
+	}
+	if (no_encrypt) {
+		flags0 |= HTT_TX_FLAGS0_NO_ENCRYPT;
+	}
+	uint32_t pre = ((flen < HTT_TX_PREFETCH ? flen : HTT_TX_PREFETCH) + 3u) & ~3u;
+	uint32_t id = gTxSeq++ % 64u;
+	t[16] = gEpHtt;                                   /* HTC header: endpoint, no flags, length */
+	put16(t + 18, 16u + pre);
+	t[24] = HTT_H2T_MSG_TYPE_TX_FRM;
+	t[25] = (uint8_t)flags0;
+	put16(t + 26, (tid << 6) | HTT_TX_FLAGS1_POSTPONED);   /* vdev 0 */
+	put16(t + 28, flen);
+	put16(t + 30, id);
+	put32(t + 32, frags);
+	put16(t + 36, 0xFFFFu);                           /* offchan_tx: HTT_INVALID_PEERID, freq 0 (HTT >= 3.4) */
+	put16(t + 38, 0u);
+	dma_fence();
+	gTxDone = false;
+	gTxWant = id;
+	if (!ce_send2(&gCe4, tpa + 16u, 24u, fpa, pre)) {
+		return "copy engine 4 is full";
+	}
+	uint32_t sent = 0;
+	for (uint32_t ms = 0; ms < 1000u && sent < 2u; ms++) {
+		while (sent < 2u && ce_send_done(&gCe4)) {
+			sent++;
+		}
+		if (sent < 2u) {
+			IOSleep(1);
+		}
+	}
+	bwr(gCe4.base + CE_HOST_IS, 0x1Fu);
+	if (sent < 2u) {
+		return "copy engine 4 did not take the frame";
+	}
+	if (!wait_for([]() { return gTxDone; }, 2000u, "a transmit completion", res, len)) {
+		return gFwDown ? "the firmware stopped" : "no transmit completion within 2 s";
+	}
+	*status = gTxStatus;
+	return NULL;
+}
+
+/* HTT messages: rx indications (counted), peer map, tx completion, security indication (a key is in) */
+static void
+on_htt_msg(void)
+{
+	uint32_t t = msg_id();
+	switch (t) {
+	case HTT_T2H_MSG_TYPE_RX_IND:
+		if (gHttRxInd++ < 3u) {
+			A_LOG("HTT rx indication, %u bytes: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x", gRxLen,
+			    gRx[0], gRx[1], gRx[2], gRx[3], gRx[4], gRx[5], gRx[6], gRx[7], gRx[8], gRx[9], gRx[10], gRx[11]);
+		}
+		return;
+	case HTT_T2H_MSG_TYPE_RX_IN_ORD_PADDR_IND:
+		if (gInOrdInd++ < 3u && gRxLen >= 16u) {
+			A_LOG("HTT in-order rx indication: peer %u vdev %u, %u buffers, first %08x (%u bytes)", le16(gRx + 2),
+			    gRx[4], le16(gRx + 6), le32(gRx + 8), le16(gRx + 12));
+		}
+		return;
+	case HTT_T2H_MSG_TYPE_PEER_MAP:
+		gPeerMaps++;
+		if (gRxLen >= 10u && memcmp(gRx + 4, gBssid, 6u) == 0) {
+			gPeerMapped = true;
+			gPeerId = le16(gRx + 2);
+		}
+		return;
+	case HTT_T2H_MSG_TYPE_TX_COMPL_IND:
+		gTxCompl++;
+		for (uint32_t i = 0; gRxLen >= 4u && i < gRx[2] && 4u + 2u * i + 2u <= gRxLen; i++) {
+			if (le16(gRx + 4 + 2u * i) == gTxWant) {
+				gTxDone = true;
+				gTxStatus = gRx[1] & 7u;
+			}
+		}
+		return;
+	case HTT_T2H_MSG_TYPE_SEC_IND:
+		gSecInd++;
+		return;
+	default:
+		break;
+	}
+	if (gHttOther++ < 4u) {
+		A_LOG("HTT message type %u, %u bytes: %02x %02x %02x %02x %02x %02x %02x %02x", t, gRxLen, gRx[0], gRx[1],
+		    gRx[2], gRx[3], gRx[4], gRx[5], gRx[6], gRx[7]);
+	}
+}
+
+/* ---- frames ---- */
+
+static uint32_t
+mgmt_hdr(uint8_t *f, uint8_t fc0)
+{
+	bzero(f, 24u);
+	f[0] = fc0;
+	memcpy(f + 4, gBssid, 6u);
+	memcpy(f + 10, gMac, 6u);
+	memcpy(f + 16, gBssid, 6u);
+	put16(f + 22, (uint32_t)(gSeq++ & 0xFFFu) << 4);
+	return 24u;
+}
+
+static const char *
+rsn_check(const struct bss *b)
+{
+	const uint8_t *p = b->rsn;
+	uint32_t n = b->rsn_len;
+	if (n < 8u || le16(p) != 1u) {
+		return "its RSN element is not readable";
+	}
+	if (memcmp(p + 2, "\x00\x0F\xAC\x04", 4u) != 0) {
+		return "its group cipher is not CCMP (TKIP is not supported here)";
+	}
+	uint32_t o = 6u, pc = le16(p + o);
+	bool ccmp = false, psk = false, sae = false;
+	for (o += 2u; pc > 0 && o + 4u <= n; pc--, o += 4u) {
+		ccmp = ccmp || memcmp(p + o, "\x00\x0F\xAC\x04", 4u) == 0;
+	}
+	if (o + 2u > n) {
+		return "its RSN element names no key management";
+	}
+	uint32_t ac = le16(p + o);
+	for (o += 2u; ac > 0 && o + 4u <= n; ac--, o += 4u) {
+		psk = psk || memcmp(p + o, "\x00\x0F\xAC\x02", 4u) == 0;
+		sae = sae || memcmp(p + o, "\x00\x0F\xAC\x08", 4u) == 0;
+	}
+	uint32_t caps = o + 2u <= n ? le16(p + o) : 0u;
+	if (!ccmp) {
+		return "it does not offer CCMP (AES) as pairwise cipher";
+	}
+	if (!psk) {
+		return sae ? "it is WPA3-only (SAE); turn on Maximize Compatibility on the iPhone" : "it offers no WPA2-PSK";
+	}
+	if (caps & 0x40u) {
+		return "it requires protected management frames (PMF)";
+	}
+	return NULL;
+}
+
+static const char *
+status_name(uint32_t s)
+{
+	switch (s) {
+	case 0: return "success";
+	case 1: return "unspecified failure";
+	case 10: return "capabilities not supported";
+	case 12: return "denied for another reason";
+	case 13: return "authentication algorithm not supported";
+	case 17: return "access point is full";
+	case 18: return "rates not supported";
+	case 40: return "invalid element";
+	case 41: return "invalid group cipher";
+	case 42: return "invalid pairwise cipher";
+	case 43: return "invalid key management";
+	case 45: return "invalid RSN capabilities";
+	default: return "see IEEE 802.11 status codes";
+	}
+}
+
+static const char *
+reason_name(uint32_t r)
+{
+	switch (r) {
+	case 1: return "unspecified";
+	case 2: return "previous authentication no longer valid";
+	case 3: return "station is leaving";
+	case 4: return "inactivity";
+	case 6: return "class 2 frame from a non-authenticated station";
+	case 7: return "class 3 frame from a non-associated station";
+	case 8: return "station is leaving the BSS";
+	case 14: return "MIC failure";
+	case 15: return "4-way handshake timeout";
+	case 17: return "element in 4-way handshake differs";
+	case 23: return "802.1X authentication failed";
+	default: return "see IEEE 802.11 reason codes";
+	}
+}
+
+static inline bool
+is_cck(uint32_t r)   /* 500 kb/s units */
+{
+	return r == 2u || r == 4u || r == 11u || r == 22u;
+}
+
+static const uint8_t kRates24[8] = { 0x82, 0x84, 0x8B, 0x96, 0x0C, 0x12, 0x18, 0x24 };
+static const uint8_t kXRates24[4] = { 0x30, 0x48, 0x60, 0x6C };
+static const uint8_t kRates5[8] = { 0x8C, 0x12, 0x98, 0x24, 0xB0, 0x48, 0x60, 0x6C };
+
+static void
+ap_rates(const uint8_t **r, uint32_t *rn, const uint8_t **x, uint32_t *xn)
+{
+	bool g5 = gAp.mhz >= 5000u;
+	if (gAp.rates_len > 0) {
+		*r = gAp.rates;
+		*rn = gAp.rates_len;
+		*x = gAp.xrates;
+		*xn = gAp.xrates_len;
+	} else {
+		*r = g5 ? kRates5 : kRates24;
+		*rn = 8u;
+		*x = kXRates24;
+		*xn = g5 ? 0u : 4u;
+	}
+}
+
+/* mac80211 ieee80211_send_assoc without HT, VHT or WMM: a plain 11a/b/g station */
+static uint32_t
+build_assoc(uint8_t *f)
+{
+	uint32_t n = mgmt_hdr(f, 0x00u);
+	uint32_t cap = 0x0001u | (gAp.cap & 0x0010u) | (gAp.cap & 0x0020u) | (gAp.mhz < 5000u ? (gAp.cap & 0x0400u) : 0u);
+	put16(f + n, cap);
+	put16(f + n + 2u, 10u);   /* listen interval */
+	n += 4u;
+	f[n++] = 0;
+	f[n++] = gAp.ssid_len;
+	memcpy(f + n, gAp.raw_ssid, gAp.ssid_len);
+	n += gAp.ssid_len;
+	const uint8_t *r, *x;
+	uint32_t rn, xn;
+	ap_rates(&r, &rn, &x, &xn);
+	f[n++] = 1;
+	f[n++] = (uint8_t)rn;
+	memcpy(f + n, r, rn);
+	n += rn;
+	if (xn > 0) {
+		f[n++] = 50;
+		f[n++] = (uint8_t)xn;
+		memcpy(f + n, x, xn);
+		n += xn;
+	}
+	if (!gJoinOpen) {
+		memcpy(f + n, kOurRsn, sizeof(kOurRsn));
+		n += sizeof(kOurRsn);
+	}
+	return n;
+}
+
+/* ---- WMI commands for joining ---- */
+
+static bool
+vdev_start(void)
+{
+	struct wbuf w;
+	bzero(&w, sizeof(w));
+	bool g5 = gAp.mhz >= 5000u;
+	wb32(&w, tlv_hdr(WMI_TLV_TAG_VDEV_START_REQUEST_CMD, 72u));
+	wb32(&w, 0u);                                 /* vdev */
+	wb32(&w, 0u);                                 /* requestor */
+	wb32(&w, gAp.bintval ? gAp.bintval : 100u);
+	wb32(&w, 1u);                                 /* DTIM period */
+	wb32(&w, 0u);                                 /* flags */
+	w.n += 36u;                                   /* SSID: none for a station (ath10k) */
+	w.n += 16u;                                   /* beacon rate, power, NoA count, disable hw ack */
+	wb32(&w, tlv_hdr(WMI_TLV_TAG_CHANNEL, 24u));
+	wb32(&w, gAp.mhz);
+	wb32(&w, gAp.mhz);
+	wb32(&w, 0u);
+	wb32(&w, g5 ? WMI_MODE_11A : WMI_MODE_11G);
+	wb32(&w, (40u << 8) | (40u << 16));           /* max power, reg power: 20 dBm (0.5 dB units) */
+	wb32(&w, 40u << 8);
+	wb32(&w, tlv_hdr(WMI_TLV_TAG_ARRAY_STRUCT, 0u));   /* no P2P NoA descriptors */
+	return wb_send(WMI_TLV_VDEV_START_REQUEST_CMDID, &w);
+}
+
+static bool
+vdev_simple(uint32_t cmd, uint32_t tag)   /* vdev stop, vdev down: just the vdev id */
+{
+	struct wbuf w;
+	bzero(&w, sizeof(w));
+	wb32(&w, tlv_hdr(tag, 4u));
+	wb32(&w, 0u);
+	return wb_send(cmd, &w);
+}
+
+static bool
+sta_ps_off(void)
+{
+	struct wbuf w;
+	bzero(&w, sizeof(w));
+	wb32(&w, tlv_hdr(WMI_TLV_TAG_STA_POWERSAVE_MODE_CMD, 8u));
+	wb32(&w, 0u);
+	wb32(&w, 0u);                                 /* WMI_STA_PS_MODE_DISABLED */
+	return wb_send(WMI_TLV_STA_POWERSAVE_MODE_CMDID, &w);
+}
+
+static bool
+peer_cmd(uint32_t cmd, uint32_t tag, bool create)
+{
+	struct wbuf w;
+	bzero(&w, sizeof(w));
+	wb32(&w, tlv_hdr(tag, create ? 16u : 12u));
+	wb32(&w, 0u);
+	wbmac(&w, gBssid);
+	if (create) {
+		wb32(&w, 0u);                             /* WMI_PEER_TYPE_DEFAULT */
+	}
+	return wb_send(cmd, &w);
+}
+
+static bool
+peer_set_param(uint32_t param, uint32_t value)
+{
+	struct wbuf w;
+	bzero(&w, sizeof(w));
+	wb32(&w, tlv_hdr(WMI_TLV_TAG_PEER_SET_PARAM_CMD, 20u));
+	wb32(&w, 0u);
+	wbmac(&w, gBssid);
+	wb32(&w, param);
+	wb32(&w, value);
+	return wb_send(WMI_TLV_PEER_SET_PARAM_CMDID, &w);
+}
+
+/* ath10k_peer_assoc_prepare for a legacy (no HT/VHT, no WMM) peer: rates in 500 kb/s units, bit 7 = CCK */
+static bool
+peer_assoc(uint32_t *nrates, uint32_t *phymode)
+{
+	uint8_t rates[16];
+	uint32_t nr = 0;
+	bool ofdm = false;
+	const uint8_t *r, *x;
+	uint32_t rn, xn;
+	ap_rates(&r, &rn, &x, &xn);
+	for (uint32_t i = 0; i < rn + xn && nr < sizeof(rates); i++) {
+		uint32_t v = (i < rn ? r[i] : x[i - rn]) & 0x7Fu;
+		if (v == 0 || v == 127u) {
+			continue;   /* BSS membership selectors */
+		}
+		bool dup = false;
+		for (uint32_t k = 0; k < nr; k++) {
+			dup = dup || (rates[k] & 0x7Fu) == v;
+		}
+		if (!dup) {
+			rates[nr++] = (uint8_t)(v | (is_cck(v) ? 0x80u : 0u));
+			ofdm = ofdm || !is_cck(v);
+		}
+	}
+	*nrates = nr;
+	*phymode = gAp.mhz >= 5000u ? WMI_MODE_11A : ofdm ? WMI_MODE_11G : WMI_MODE_11B;
+	struct wbuf w;
+	bzero(&w, sizeof(w));
+	wb32(&w, tlv_hdr(WMI_TLV_TAG_PEER_ASSOC_COMPLETE_CMD, 76u));
+	wbmac(&w, gBssid);
+	wb32(&w, 0u);                                 /* vdev */
+	wb32(&w, 1u);                                 /* new association */
+	wb32(&w, gAid);
+	wb32(&w, WMI_TLV_PEER_AUTH | (gJoinOpen ? 0u : WMI_TLV_PEER_NEED_PTK_4_WAY));
+	wb32(&w, gAssocCap);
+	wb32(&w, 10u);                                /* listen interval */
+	w.n += 16u;                                   /* ht caps, max mpdu, mpdu density, rate caps: 0 */
+	wb32(&w, 1u);                                 /* nss */
+	wb32(&w, 0u);                                 /* vht caps */
+	wb32(&w, *phymode);
+	w.n += 8u;                                    /* ht_info[2] */
+	wb32(&w, nr);
+	wb32(&w, 0u);                                 /* HT rates */
+	wb32(&w, tlv_hdr(WMI_TLV_TAG_ARRAY_BYTE, (nr + 3u) & ~3u));
+	wbbytes(&w, rates, nr);
+	wb32(&w, tlv_hdr(WMI_TLV_TAG_ARRAY_BYTE, 0u));
+	wb32(&w, tlv_hdr(WMI_TLV_TAG_VHT_RATE_SET, 16u));
+	w.n += 16u;
+	return wb_send(WMI_TLV_PEER_ASSOC_CMDID, &w);
+}
+
+static bool
+vdev_up(void)
+{
+	struct wbuf w;
+	bzero(&w, sizeof(w));
+	wb32(&w, tlv_hdr(WMI_TLV_TAG_VDEV_UP_CMD, 16u));
+	wb32(&w, 0u);
+	wb32(&w, gAid);
+	wbmac(&w, gBssid);
+	return wb_send(WMI_TLV_VDEV_UP_CMDID, &w);
+}
+
+/* ath10k_wmi_tlv_op_gen_vdev_install_key, CCMP, the peer being the access point (for the group key too) */
+static bool
+install_key(uint32_t idx, uint32_t flags, const uint8_t key[16])
+{
+	struct wbuf w;
+	bzero(&w, sizeof(w));
+	wb32(&w, tlv_hdr(WMI_TLV_TAG_VDEV_INSTALL_KEY_CMD, 92u));
+	wb32(&w, 0u);
+	wbmac(&w, gBssid);
+	wb32(&w, idx);
+	wb32(&w, flags);
+	wb32(&w, WMI_TLV_CIPHER_AES_CCM);
+	w.n += 24u + 32u;                             /* rsc, global rsc, tsc counters; WAPI counters */
+	wb32(&w, 16u);
+	wb32(&w, 0u);
+	wb32(&w, 0u);
+	wb32(&w, tlv_hdr(WMI_TLV_TAG_ARRAY_BYTE, 16u));
+	wbbytes(&w, key, 16u);
+	bool ok = wb_send(WMI_TLV_VDEV_INSTALL_KEY_CMDID, &w);
+	bzero(&w, sizeof(w));
+	return ok;
+}
+
+/* ---- step 5: join ---- */
+
+static struct bss *
+find_target(void)
+{
+	struct bss *best = NULL;
+	for (uint32_t i = 0; i < gNumBss; i++) {
+		struct bss *b = &gBss[i];
+		if (b->ssid_len == kOp2WifiSsidLen && b->have_ies && memcmp(b->raw_ssid, kOp2WifiSsid, kOp2WifiSsidLen) == 0 &&
+		    (best == NULL || b->dbm > best->dbm)) {
+			best = b;
+		}
+	}
+	return best;
+}
+
+static const char *
+rescan(uint32_t round, char *res, size_t len)
+{
+	gScanStarted = gScanDone = false;
+	if (!scan_start(round)) {
+		return "the scan request could not be sent";
+	}
+	if (!wait_for([]() { return gScanDone; }, 25000u, "a scan", res, len)) {
+		return gFwDown ? "the firmware stopped" : "the scan did not finish within 25 s";
+	}
+	return NULL;
+}
+
+static void
+ssid_print(char *out, size_t n)   /* the configured name, printable */
+{
+	uint32_t i = 0;
+	for (; i < kOp2WifiSsidLen && i + 1u < n; i++) {
+		uint8_t c = kOp2WifiSsid[i];
+		out[i] = (c >= 0x20u && c < 0x7Fu) ? (char)c : '?';
+	}
+	out[i] = 0;
+}
+
+static bool
+join_fail(char *res, size_t len, const char *what)
+{
+	char name[33];
+	ssid_print(name, sizeof(name));
+	snprintf(res, len, "STEP 5 FAIL: joining %s: %s", name, what);
+	return false;
+}
+
+static bool
+run5(char *res, size_t len)
+{
+	gStep = "5";
+	gDrainHook = pump;
+	gMgmtHook = join_mgmt;
+	gDataHook = join_data;
+	uint32_t t0 = ms_since_power_on();
+	char name[33];
+	ssid_print(name, sizeof(name));
+	if (kOp2WifiSsidLen == 0) {
+		snprintf(res, len, "%s", "STEP 5 FAIL: no network configured (firmware/qca6174/wifi-network.txt: name on the "
+		    "first line, password on the second; see the README), rebuild");
+		return false;
+	}
+	struct bss *b = find_target();
+	for (uint32_t round = 1; b == NULL && round <= 2u; round++) {
+		A_LOG("%s not heard yet (%u networks); scanning again (%u of 2)", name, gNumBss, round);
+		const char *why = rescan(round, res, len);
+		if (why != NULL) {
+			return gFwDown ? false : join_fail(res, len, why);
+		}
+		b = find_target();
+	}
+	if (b == NULL) {
+		return join_fail(res, len, "not heard in 3 scans (is the hotspot screen open on the iPhone?)");
+	}
+	gAp = *b;
+	memcpy(gBssid, gAp.bssid, 6u);
+	gJoinOpen = gAp.rsn_len == 0 && (gAp.cap & 0x0010u) == 0;
+	A_LOG("network %s: BSSID %02x:%02x:%02x:%02x:%02x:%02x, channel %u (%u MHz), %d dBm, beacon interval %u, "
+	    "capabilities %04x, %s%s%s", name, gBssid[0], gBssid[1], gBssid[2], gBssid[3], gBssid[4], gBssid[5], gAp.chan,
+	    gAp.mhz, gAp.dbm, gAp.bintval, gAp.cap, gJoinOpen ? "open" : gAp.rsn_len ? "RSN" : "WEP/WPA",
+	    gAp.ht ? ", HT" : "", gAp.wmm ? ", WMM" : "");
+	if (!gJoinOpen) {
+		if (gAp.rsn_len == 0) {
+			return join_fail(res, len, "it uses WEP or WPA1, which are not supported here");
+		}
+		const char *bad = rsn_check(&gAp);
+		if (bad != NULL) {
+			return join_fail(res, len, bad);
+		}
+		if (kOp2WifiOpen) {
+			return join_fail(res, len, "it needs a password, but none is configured");
+		}
+	}
+
+	/* ath10k: power save off, vdev start on the channel (vdev start response), peer for the access point (HTT
+	 * peer map) */
+	if (!sta_ps_off() || !vdev_start()) {
+		return join_fail(res, len, "the vdev start command could not be sent");
+	}
+	if (!wait_for([]() { return gVdevStartResp; }, 3000u, "the vdev start response", res, len)) {
+		return gFwDown ? false : join_fail(res, len, "no vdev start response within 3 s");
+	}
+	gVdevStarted = true;
+	if (gVdevStartStatus != 0) {
+		char why[64];
+		snprintf(why, sizeof(why), "the firmware refused to start on %u MHz (status %u)", gAp.mhz, gVdevStartStatus);
+		return join_fail(res, len, why);
+	}
+	if (!peer_cmd(WMI_TLV_PEER_CREATE_CMDID, WMI_TLV_TAG_PEER_CREATE_CMD, true)) {
+		return join_fail(res, len, "the peer create command could not be sent");
+	}
+	gPeerCreated = true;
+	if (!wait_for([]() { return gPeerMapped; }, 3000u, "the peer map", res, len)) {
+		return gFwDown ? false : join_fail(res, len, "the firmware did not map the access point's peer within 3 s");
+	}
+	A_LOG("on channel %u, peer %u for the access point", gAp.chan, gPeerId);
+
+	/* open system authentication, then association; three tries each, 500 ms apart */
+	uint8_t f[256];
+	uint32_t st = 0, auth_tries = 0, assoc_tries = 0;
+	const char *txerr = NULL;
+	for (auth_tries = 1; auth_tries <= 3u && !gAuthResp; auth_tries++) {
+		uint32_t n = mgmt_hdr(f, 0xB0u);
+		bzero(f + n, 6u);
+		f[n + 2u] = 1u;   /* algorithm 0 (open), transaction 1, status 0 */
+		txerr = htt_tx(f, n + 6u, true, true, &st, res, len);
+		if (txerr != NULL) {
+			return gFwDown ? false : join_fail(res, len, txerr);
+		}
+		A_LOG("authentication request %u: %s", auth_tries, tx_status_name(st));
+		(void)wait_for([]() { return gAuthResp || gDeauth; }, 500u, "the authentication response", res, len);
+		if (gFwDown) {
+			return false;
+		}
+	}
+	char why[128];
+	if (gDeauth) {
+		snprintf(why, sizeof(why), "it sent %s, reason %u (%s)", gDeauthSubtype == 0xC0u ? "a deauthentication" :
+		    "a disassociation", gDeauthReason, reason_name(gDeauthReason));
+		return join_fail(res, len, why);
+	}
+	if (!gAuthResp) {
+		snprintf(why, sizeof(why), "no authentication response to 3 requests (last one %s)", tx_status_name(st));
+		return join_fail(res, len, why);
+	}
+	if (gAuthStatus != 0) {
+		snprintf(why, sizeof(why), "authentication refused, status %u (%s)", gAuthStatus, status_name(gAuthStatus));
+		return join_fail(res, len, why);
+	}
+	for (assoc_tries = 1; assoc_tries <= 3u && !gAssocResp && !gDeauth; assoc_tries++) {
+		uint32_t n = build_assoc(f);
+		txerr = htt_tx(f, n, true, true, &st, res, len);
+		if (txerr != NULL) {
+			return gFwDown ? false : join_fail(res, len, txerr);
+		}
+		A_LOG("association request %u (%u bytes): %s", assoc_tries, n, tx_status_name(st));
+		(void)wait_for([]() { return gAssocResp || gDeauth; }, 500u, "the association response", res, len);
+		if (gFwDown) {
+			return false;
+		}
+	}
+	if (gDeauth) {
+		snprintf(why, sizeof(why), "it sent %s, reason %u (%s)", gDeauthSubtype == 0xC0u ? "a deauthentication" :
+		    "a disassociation", gDeauthReason, reason_name(gDeauthReason));
+		return join_fail(res, len, why);
+	}
+	if (!gAssocResp) {
+		snprintf(why, sizeof(why), "no association response to 3 requests (last one %s)", tx_status_name(st));
+		return join_fail(res, len, why);
+	}
+	if (gAssocStatus != 0) {
+		snprintf(why, sizeof(why), "association refused, status %u (%s)", gAssocStatus, status_name(gAssocStatus));
+		return join_fail(res, len, why);
+	}
+	gAssociated = true;
+
+	/* ath10k_bss_assoc: peer assoc, then vdev up with the association id */
+	uint32_t nr = 0, mode = 0;
+	if (!peer_assoc(&nr, &mode) || !vdev_up()) {
+		return join_fail(res, len, "the peer assoc or vdev up command could not be sent");
+	}
+	gVdevUp = true;
+	pump();
+	snprintf(res, len, "STEP 5 PASS: associated with %s (BSSID %02x:%02x:%02x:%02x:%02x:%02x, channel %u, %d dBm), "
+	    "AID %u, %s, %u rates (%s); %u ms, authentication after %u request(s), association after %u", name, gBssid[0],
+	    gBssid[1], gBssid[2], gBssid[3], gBssid[4], gBssid[5], gAp.chan, gAp.dbm, gAid, gJoinOpen ? "open network" :
+	    "WPA2-PSK CCMP", nr, mode == WMI_MODE_11A ? "11a" : mode == WMI_MODE_11G ? "11g" : "11b",
+	    ms_since_power_on() - t0, auth_tries - 1u, assoc_tries - 1u);
+	return true;
+}
+
+/* ---- step 6: the 4-way handshake (we are the supplicant), keys into the firmware, port open ---- */
+
+struct ekey {
+	const uint8_t *e;     /* the 802.1X frame */
+	uint32_t n;           /* its length (header + body) */
+	uint32_t ki;          /* key information */
+	uint32_t kdlen;
+};
+
+static bool
+ek_parse(const uint8_t *e, uint32_t n, struct ekey *k)
+{
+	if (n < EK_HDR || e[1] != 3u || e[4] != 2u) {    /* EAPOL-Key, RSN descriptor */
+		return false;
+	}
+	uint32_t body = be16(e + 2);
+	if (4u + body > n || 4u + body < EK_HDR) {
+		return false;
+	}
+	k->e = e;
+	k->n = 4u + body;
+	k->ki = be16(e + 5);
+	k->kdlen = be16(e + EK_KD_LEN);
+	return EK_HDR + k->kdlen <= k->n;
+}
+
+static bool
+ek_mic_ok(const struct ekey *k, const uint8_t kck[16])
+{
+	uint8_t copy[EAPOL_MAX], mic[20];
+	memcpy(copy, k->e, k->n);
+	bzero(copy + EK_MIC, 16u);
+	const uint8_t *parts[1] = { copy };
+	uint32_t lens[1] = { k->n };
+	hmac_sha1(kck, 16u, parts, lens, 1u, mic);
+	bool ok = memcmp(mic, k->e + EK_MIC, 16u) == 0;
+	bzero(mic, sizeof(mic));
+	return ok;
+}
+
+/* messages 2 and 4: our EAPOL-Key frame in a native wifi data frame to the access point, unencrypted */
+static const char *
+send_ek(uint32_t ver, uint32_t ki, const uint8_t replay[8], const uint8_t *nonce, const uint8_t *kd, uint32_t kdlen,
+    const uint8_t kck[16], uint32_t *st, char *res, size_t len)
+{
+	uint8_t f[24u + 8u + EK_HDR + 32u];
+	bzero(f, sizeof(f));
+	f[0] = 0x08u;
+	f[1] = 0x01u;                                   /* data, to DS */
+	memcpy(f + 4, gBssid, 6u);
+	memcpy(f + 10, gMac, 6u);
+	memcpy(f + 16, gBssid, 6u);
+	memcpy(f + 24, kLlcEapol, 8u);
+	uint8_t *e = f + 32;
+	uint32_t n = EK_HDR + kdlen;
+	e[0] = (uint8_t)ver;
+	e[1] = 3u;
+	put_be16(e + 2, n - 4u);
+	e[4] = 2u;
+	put_be16(e + 5, ki);
+	put_be16(e + 7, 0u);                            /* key length 0 (RSN) */
+	memcpy(e + EK_REPLAY, replay, 8u);
+	if (nonce != NULL) {
+		memcpy(e + EK_NONCE, nonce, 32u);
+	}
+	put_be16(e + EK_KD_LEN, kdlen);
+	if (kdlen > 0) {
+		memcpy(e + EK_HDR, kd, kdlen);
+	}
+	uint8_t mic[20];
+	const uint8_t *parts[1] = { e };
+	uint32_t lens[1] = { n };
+	hmac_sha1(kck, 16u, parts, lens, 1u, mic);
+	memcpy(e + EK_MIC, mic, 16u);
+	bzero(mic, sizeof(mic));
+	return htt_tx(f, 32u + n, false, true, st, res, len);
+}
+
+static bool
+wpa_fail(char *res, size_t len, const char *what)
+{
+	char name[33];
+	ssid_print(name, sizeof(name));
+	snprintf(res, len, "STEP 6 FAIL: WPA2 with %s: %s", name, what);
+	return false;
+}
+
+static bool
+run6(char *res, size_t len)
+{
+	gStep = "6";
+	char name[33], why[160];
+	ssid_print(name, sizeof(name));
+	if (gJoinOpen) {
+		snprintf(res, len, "STEP 6 PASS: %s is an open network: no keys to agree on", name);
+		gAuthorized = true;
+		return true;
+	}
+	const char *bad = crypto_selftest();
+	if (bad != NULL) {
+		snprintf(why, sizeof(why), "the %s self-test failed", bad);
+		return wpa_fail(res, len, why);
+	}
+	uint32_t t0 = ms_since_power_on();
+	uint8_t ptk[48], anonce[32], snonce[32], replay[8], gtk[32];
+	uint32_t msg1s = 0, msg2s = 0, gtk_idx = 0, gtk_len = 0, st = 0, ver = 1;
+	bool have_ptk = false, done = false, rsn_differs = false;
+	bzero(ptk, sizeof(ptk));
+	for (uint32_t t = 0; t < 10000u && !done; t++) {
+		pump();
+		if (gDeauth || gKickout) {
+			break;
+		}
+		if (t % 10u == 0 && fw_down("the 4-way handshake", res, len)) {
+			return false;
+		}
+		if (gEapolHead == gEapolTail) {
+			IOSleep(1);
+			continue;
+		}
+		uint32_t slot = gEapolTail % EAPOL_QUEUE;
+		struct ekey k;
+		bool parsed = ek_parse(gEapolQ[slot], gEapolQLen[slot], &k);
+		gEapolTail++;
+		if (!parsed || (k.ki & KI_VERSION_MASK) != 2u || !(k.ki & KI_PAIRWISE) || !(k.ki & KI_ACK)) {
+			A_LOG("EAPOL frame ignored (key information %04x, %u bytes)", parsed ? k.ki : 0u, gEapolQLen[slot]);
+			continue;
+		}
+		if (!(k.ki & KI_MIC)) {
+			/* message 1: ANonce; PTK = PRF-384(PMK, "Pairwise key expansion", min/max addresses, min/max nonces) */
+			msg1s++;
+			ver = k.e[0];
+			memcpy(anonce, k.e + EK_NONCE, 32u);
+			memcpy(replay, k.e + EK_REPLAY, 8u);
+			read_random(snonce, sizeof(snonce));
+			uint64_t now = 0;
+			clock_get_uptime(&now);
+			for (uint32_t i = 0; i < 8u; i++) {
+				snonce[i] ^= (uint8_t)(now >> (8u * i));
+			}
+			uint8_t data[76];
+			bool mac_lo = memcmp(gMac, gBssid, 6u) < 0, nonce_lo = memcmp(snonce, anonce, 32u) < 0;
+			memcpy(data, mac_lo ? gMac : gBssid, 6u);
+			memcpy(data + 6, mac_lo ? gBssid : gMac, 6u);
+			memcpy(data + 12, nonce_lo ? snonce : anonce, 32u);
+			memcpy(data + 44, nonce_lo ? anonce : snonce, 32u);
+			prf_sha1(kOp2WifiPmk, 32u, "Pairwise key expansion", data, sizeof(data), ptk, 48u);
+			have_ptk = true;
+			const char *e = send_ek(ver, 2u | KI_PAIRWISE | KI_MIC, replay, snonce, kOurRsn, sizeof(kOurRsn), ptk, &st,
+			    res, len);
+			if (e != NULL) {
+				bzero(ptk, sizeof(ptk));
+				return gFwDown ? false : wpa_fail(res, len, e);
+			}
+			msg2s++;
+			A_LOG("message 1 of 4 (replay counter %02x%02x, EAPOL version %u) answered with message 2: %s",
+			    replay[6], replay[7], ver, tx_status_name(st));
+			continue;
+		}
+		/* message 3: same ANonce, MIC with our KCK, newer replay counter, the GTK in the encrypted key data */
+		if (!have_ptk || memcmp(k.e + EK_NONCE, anonce, 32u) != 0 || memcmp(k.e + EK_REPLAY, replay, 8u) <= 0) {
+			A_LOG("%s", "message 3 ignored: no message 1 before it, another ANonce or an old replay counter");
+			continue;
+		}
+		if (!ek_mic_ok(&k, ptk)) {
+			A_LOG("%s", "message 3 ignored: its MIC does not match (another password on this side?)");
+			continue;
+		}
+		if ((k.ki & (KI_INSTALL | KI_SECURE | KI_ENC_KEY_DATA)) != (KI_INSTALL | KI_SECURE | KI_ENC_KEY_DATA)) {
+			snprintf(why, sizeof(why), "message 3 has key information %04x (install, secure, encrypted key data "
+			    "expected)", k.ki);
+			bzero(ptk, sizeof(ptk));
+			return wpa_fail(res, len, why);
+		}
+		uint8_t kd[EAPOL_MAX];
+		if (k.kdlen < 24u || !aes_unwrap(ptk + 16, k.e + EK_HDR, k.kdlen, kd)) {
+			bzero(ptk, sizeof(ptk));
+			return wpa_fail(res, len, "message 3's key data does not decrypt (AES key unwrap check failed)");
+		}
+		uint32_t kdn = k.kdlen - 8u;
+		for (uint32_t o = 0; o + 2u <= kdn;) {
+			uint32_t id = kd[o], l = kd[o + 1u];
+			if (o + 2u + l > kdn || (id == 0xDDu && l == 0)) {
+				break;   /* padding */
+			}
+			if (id == 48u) {
+				rsn_differs = l != gAp.rsn_len || memcmp(kd + o + 2, gAp.rsn, l) != 0;
+			} else if (id == 0xDDu && l >= 6u + 16u && memcmp(kd + o + 2, "\x00\x0F\xAC\x01", 4u) == 0) {
+				gtk_idx = kd[o + 6u] & 3u;
+				gtk_len = l - 6u > sizeof(gtk) ? (uint32_t)sizeof(gtk) : l - 6u;
+				memcpy(gtk, kd + o + 8, gtk_len);
+			}
+			o += 2u + l;
+		}
+		bzero(kd, sizeof(kd));
+		if (gtk_len != 16u) {
+			bzero(ptk, sizeof(ptk));
+			return wpa_fail(res, len, "message 3 carries no CCMP group key");
+		}
+		memcpy(replay, k.e + EK_REPLAY, 8u);
+		const char *e = send_ek(ver, 2u | KI_PAIRWISE | KI_MIC | KI_SECURE, replay, NULL, NULL, 0u, ptk, &st, res, len);
+		if (e != NULL) {
+			bzero(ptk, sizeof(ptk));
+			bzero(gtk, sizeof(gtk));
+			return gFwDown ? false : wpa_fail(res, len, e);
+		}
+		A_LOG("message 3 of 4 checked (MIC, group key %u%s); message 4: %s", gtk_idx, rsn_differs ?
+		    ", its RSN element DIFFERS from the beacon's" : "", tx_status_name(st));
+		done = true;
+	}
+	uint32_t took = ms_since_power_on() - t0;
+	if (!done) {
+		bzero(ptk, sizeof(ptk));
+		if (gDeauth) {
+			snprintf(why, sizeof(why), "it sent %s, reason %u (%s) after %u message 1(s)%s", gDeauthSubtype == 0xC0u ?
+			    "a deauthentication" : "a disassociation", gDeauthReason, reason_name(gDeauthReason), msg1s,
+			    msg1s > 1u ? ": the password is probably wrong" : "");
+		} else if (msg1s == 0) {
+			snprintf(why, sizeof(why), "no message 1 within 10 s (%u EAPOL frames, %u data frames from it, %u ring "
+			    "frames, %u in-order indications)", gEapolRx, gDataFromAp, gRingData, gInOrdInd);
+		} else {
+			snprintf(why, sizeof(why), "%u message 1(s) and %u message 2(s) but no valid message 3 in 10 s: the "
+			    "password is probably wrong", msg1s, msg2s);
+		}
+		return wpa_fail(res, len, why);
+	}
+
+	/* ath10k_set_key: pairwise key (index 0), group key (its index), each confirmed by an HTT security indication;
+	 * then the port opens (peer param authorize) */
+	uint32_t sec0 = gSecInd;
+	bool ok = install_key(0u, WMI_KEY_PAIRWISE, ptk + 32);
+	bzero(ptk, sizeof(ptk));
+	uint32_t sec_want = sec0 + 1u;
+	for (uint32_t t = 0; ok && t < 3000u && gSecInd < sec_want; t++) {
+		pump();
+		IOSleep(1);
+	}
+	ok = ok && install_key(gtk_idx, WMI_KEY_GROUP, gtk);
+	bzero(gtk, sizeof(gtk));
+	sec_want = sec0 + 2u;
+	for (uint32_t t = 0; ok && t < 3000u && gSecInd < sec_want; t++) {
+		pump();
+		IOSleep(1);
+	}
+	ok = ok && peer_set_param(WMI_TLV_PEER_AUTHORIZE, 1u);
+	if (!ok) {
+		return wpa_fail(res, len, "a key or the authorize command could not be sent");
+	}
+	gAuthorized = true;
+	uint32_t confirmed = gSecInd - sec0;
+	A_LOG("keys installed (firmware confirmed %u of 2), port open; listening 5 s", confirmed);
+
+	/* 5 s connected: data from the network (decrypted by the chip), no deauthentication */
+	for (uint32_t t = 0; t < 5000u && !gDeauth && !gKickout; t++) {
+		pump();
+		if (t % 10u == 0 && fw_down("the connection", res, len)) {
+			return false;
+		}
+		IOSleep(1);
+	}
+	if (gDeauth || gKickout) {
+		snprintf(why, sizeof(why), "connected, then %s (reason %u, %s)", gKickout ? "the firmware kicked the access "
+		    "point out" : gDeauthSubtype == 0xC0u ? "deauthenticated" : "disassociated", gDeauthReason,
+		    reason_name(gDeauthReason));
+		return wpa_fail(res, len, why);
+	}
+	snprintf(res, len, "STEP 6 PASS: WPA2 connected to %s: 4-way handshake in %u ms (message 1 seen %u time(s)), "
+	    "pairwise and group key %u installed (firmware confirmed %u of 2), port open; %u data frames from the network "
+	    "in 5 s%s, no deauthentication", name, took, msg1s, gtk_idx, confirmed, gDataAfterKeys, gRoam ?
+	    ", firmware reported beacon loss" : "");
+	return true;
+}
+
+/* Leave politely: deauthenticate (reason 3), vdev down, peer delete, vdev stop - whatever was set up. */
+static void
+leave(void)
+{
+	if (gFwDown || !gVdevStarted) {
+		return;
+	}
+	gStep = "end";
+	char res[160];
+	uint32_t st = 0;
+	if (gAssociated && !gDeauth) {
+		uint8_t f[32];
+		uint32_t n = mgmt_hdr(f, 0xC0u);
+		put16(f + n, 3u);
+		const char *e = htt_tx(f, n + 2u, true, false, &st, res, sizeof(res));
+		A_LOG("deauthentication (leaving): %s", e != NULL ? e : tx_status_name(st));
+	}
+	gAuthorized = false;
+	bool ok = (!gVdevUp || vdev_simple(WMI_TLV_VDEV_DOWN_CMDID, WMI_TLV_TAG_VDEV_DOWN_CMD)) &&
+	    (!gPeerCreated || peer_cmd(WMI_TLV_PEER_DELETE_CMDID, WMI_TLV_TAG_PEER_DELETE_CMD, false)) &&
+	    vdev_simple(WMI_TLV_VDEV_STOP_CMDID, WMI_TLV_TAG_VDEV_STOP_CMD);
+	bool stopped = ok && wait_for([]() { return gVdevStopped; }, 2000u, "the vdev stop", res, sizeof(res));
+	A_LOG("left the network: vdev down, peer delete, vdev stop %s; %u management frames and %u data frames from "
+	    "elsewhere ignored, %u EAPOL frames (%u dropped)", !ok ? "NOT sent" : stopped ? "confirmed" : "unconfirmed",
+	    gMgmtOther, gDataOther, gEapolRx, gEapolDropped);
+	gMgmtHook = NULL;
+	gDataHook = NULL;
+	gDrainHook = NULL;
 }
 
 static bool
@@ -3016,6 +4630,15 @@ op2_ath10k_step2b(const struct op2_ath10k_bus *bus, char *result, size_t len)
 	if (ok && bus->scan) {
 		A_LOG("%s", result);   /* the step 3 verdict; the result line becomes step 4's */
 		ok = run4(result, len);
+	}
+	if (ok && bus->join) {
+		A_LOG("%s", result);   /* the step 4 verdict (network list above); the result line becomes step 5's */
+		ok = run5(result, len);
+		if (ok && bus->wpa2) {
+			A_LOG("%s", result);
+			ok = run6(result, len);
+		}
+		leave();
 	}
 	/* The chip cannot DMA any more; the block stays allocated for good. */
 	if (!gChipGone) {

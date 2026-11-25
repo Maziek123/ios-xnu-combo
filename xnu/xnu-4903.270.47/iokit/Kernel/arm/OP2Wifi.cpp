@@ -20,6 +20,9 @@
  *   5  as 4, then step 3 (OP2Ath10k.cpp): HTC services (HTT data, WMI control), WMI service ready, WMI init,
  *      WMI ready with the chip's MAC address, HTT version, a WMI echo
  *   6  as 5, then step 4 (OP2Ath10k.cpp): a scan that only listens; the log lists the networks heard
+ *   7  as 6, then step 5 (OP2Ath10k.cpp): join the network named in the gitignored firmware/qca6174/wifi-network.txt
+ *      (authentication, association), then leave it
+ *   8  as 7, then step 6 (OP2Ath10k.cpp): the WPA2-PSK 4-way handshake, keys into the chip, 5 s connected, leave
  *
  * Runs in its own kernel thread 120 s after the framebuffer starts (RPM is up by then, the UI is running),
  * and repeats a one-line summary every 60 s so it survives in the ramoops ring.
@@ -140,7 +143,7 @@ extern "C" void op2_wifi_start(void);   /* called from op2_threaddump_start (osf
 
 static volatile uint32_t *gGcc, *gTlmm, *gParf, *gPhy, *gDbi, *gConf, *gBar0;
 static uint32_t gMode;
-static char gSummary[200] = "not run";
+static char gSummary[320] = "not run";
 
 #define W_LOG(fmt, ...) IOLog("OP2 WIFI: " fmt "\n", __VA_ARGS__)   /* always >= 1 argument */
 
@@ -514,7 +517,7 @@ q_cold_reset(uint32_t bar_lo, bool bar64, char *why, size_t n)
 static bool
 step2a(void)
 {
-	char line[200];
+	char line[320];
 
 	/* Root port (DBI = its own config space): bus 0 -> secondary 1, subordinate 1; memory window = the
 	 * 7 MB "bars" range; memory decoding on. Bus mastering stays off on both sides. */
@@ -626,9 +629,9 @@ cold_reset_for_2b(char *why, size_t n)
 static void
 step2b(void)
 {
-	char line[200];
+	char line[320];
 	struct op2_ath10k_bus bus = { gBar0, gConf, gDbi, gPowerOnAbs, cold_reset_for_2b, gMode >= 4, gMode >= 5,
-		gMode >= 6 };
+		gMode >= 6, gMode >= 7, gMode >= 8 };
 	(void)op2_ath10k_step2b(&bus, line, sizeof(line));
 	summary(line);
 }
@@ -638,7 +641,7 @@ step2b(void)
 static void
 bringup(void)
 {
-	char line[200];
+	char line[320];
 
 	/* 1. Hold the chip's PCIe interface in reset while everything is powered up. */
 	pin_out(PIN_PERST, 0, false);
@@ -818,7 +821,9 @@ wifi_thread(__unused void *param, __unused wait_result_t wr_)
 	} else {
 		W_LOG("mode %u (%s)", gMode, gMode == 1 ? "read-only probe" : gMode == 2 ? "bring-up" : gMode == 3 ?
 		    "bring-up + step 2b (DMA, BMI)" : gMode == 4 ? "bring-up + 2b + step 2c (firmware boot)" :
-		    gMode == 5 ? "bring-up + 2b + 2c + step 3 (WMI, HTT)" : "bring-up + 2b + 2c + 3 + step 4 (listen-only scan)");
+		    gMode == 5 ? "bring-up + 2b + 2c + step 3 (WMI, HTT)" : gMode == 6 ?
+		    "bring-up + 2b + 2c + 3 + step 4 (listen-only scan)" : gMode == 7 ? "bring-up + 2b + 2c + 3 + 4 + step 5 (join)" :
+		    "bring-up + 2b + 2c + 3 + 4 + 5 + step 6 (WPA2)");
 		dump_all("before");
 		if (gMode >= 2) {
 			bringup();

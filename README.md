@@ -67,8 +67,10 @@ its result every 60 s so the line survives in ramoops: `grep -a 'OP2 WIFI' op2-l
 | **2c** firmware boot | 4 | **Passes on the phone.** Board data (the phone's own `bdwlan30.bin`), the OTP calibration program and the firmware (`WLAN.RM.4.4.1-00309`, 681 KB in six segments through the diagnostic window), then `BMI_DONE`: 11 ms later the firmware sends its HTC ready message (2 send credits of 1792 bytes, 4 endpoints, HTC 2.1). Uses ath10k's `firmware-6.bin`, which stays out of this repository with the board data ([below](#wi-fi-firmware-files)). |
 | **3** firmware services | 5 | The remaining copy engines (CE2-CE5), HTC connect of the firmware's data (HTT) and control (WMI) services, the WMI service-ready event (any host memory the firmware asks for), WMI init with ath10k's resource config, then the WMI ready event, which carries the chip's Wi-Fi MAC address; also the HTT version and a WMI echo. **Passes on the phone** (third run, progress rows 10-12): the copy-engine 5 override ath10k applies to QCA6174 was the missing piece. |
 | **4** listen-only scan | 6 | **Passes on the phone, weakly**: with ath10k's HTT rx ring the chip hears networks (2 in 5.6 s, beacons through the rx ring), but far fewer than are around; third version (ath10k's start-up settings: chain mask, ANI) not yet run. Steps: the board's regulatory domain, a channel list with every channel passive (2.4 GHz 1-13, 5 GHz 36-165), a station interface with the chip's MAC, then a scan; the log lists the networks heard (name, channel, signal, security). The chip does not transmit. |
+| **5** join | 7 | Written, not yet run on the phone: finds the network named in `wifi-network.txt` ([below](#wi-fi-firmware-files)) in the scan (scans up to twice more if it is not there), checks it offers WPA2-PSK with AES (CCMP), starts the chip on its channel, then open authentication and association as a plain 802.11a/b/g station. Frames go out through HTT (the firmware has no WMI management transmit). Leaves the network politely at the end. |
+| **6** WPA2 | 8 | Written, not yet run on the phone: the 4-way handshake (keys from the network name and password, message 3's MIC checked, the group key decrypted), both keys into the chip, the port opened, then 5 s connected counting data frames from the network. The crypto (SHA-1, HMAC, the 802.11 PRF, AES key unwrap) is in the driver and checks itself against published test vectors first. |
 
-After the scan: the data path, connecting (WPA2), a network interface for iOS, then Bluetooth.
+After joining: a network interface for iOS (DHCP through configd), staying connected (power save, beacon loss, roaming), then Bluetooth.
 
 #### Progress so far (2026-11-23 to 11-24)
 
@@ -89,6 +91,7 @@ After the scan: the data path, connecting (WPA2), a network interface for iOS, t
 | 13 | Step 4, `wifi=6`: listen-only scan (`5064ce7`) | **FAIL**: the scan started, visited all 37 channels and completed in 5.6 s, but no beacon arrived (0 frames) | The radio tunes but the firmware delivers nothing: ath10k hands the firmware an HTT rx ring (with its aggregation config) before anything else, and the firmware's receive path needs it. |
 | 14 | Step 4 with the HTT rx ring (127 buffers of 2 KB, ath10k's order: rx filter reset, ring, then regdomain and scan), per-channel radio reports (noise floor, busy and receive time) and beacons taken from the ring as well as from WMI (`bc129f5`) | **PASS, weak**: 2 networks (strongest -40 dBm), 3 beacons and 2 control frames in 5.6 s, all through the rx ring (none over WMI, no HTT rx indications); noise floor -107 to -118 dBm, air busy only around channel 11 | The receive path works now, but the radio hears only a strong nearby access point. The reported noise floor is below what a working receiver measures (about -95 to -105 dBm). ath10k also sets the chain mask to the board's one RF chain (we left the init's 7) and turns ANI on. |
 | 15 | Step 4 with ath10k's start-up settings (PMF QoS, dynamic bandwidth, idle power save, tx/rx chain mask = 1, ARP access category, ANI on) | Not run yet | Checked in simulation (order and values). |
+| 16 | Steps 5 and 6, `wifi=8`: join an iPhone hotspot (WPA2) and run the 4-way handshake | Not run yet | Checked in simulation against an access point model that uses OpenSSL for its side of the handshake: success, the network not heard, association refused, a wrong password (message 2 rejected, deauthentication), a WPA3-only network, join only (`wifi=7`). |
 
 #### Testing a step
 
@@ -116,6 +119,20 @@ Step 2c and later (`wifi=4` and up) need two files in `firmware/qca6174/` of the
 `tools/build-xnu.sh` runs `tools/gen-wifi-fw.py`, which embeds both in the kernel and prints
 `[wifi-fw] embedding firmware WLAN.RM.4.4.1-...`. Without them the kernel still builds, and step 2c reports that no
 firmware is built in.
+
+Steps 5 and 6 (`wifi=7`, `wifi=8`) join a network you name in a third file in the same folder,
+`firmware/qca6174/wifi-network.txt`: the network's name on the first line, exactly as it appears (upper and lower
+case, spaces and apostrophes count), and its password on the second (leave the second line out for an open network):
+
+```
+iPhone
+your-password
+```
+
+The build prints `[wifi-net] network iPhone (WPA2-PSK) ...`. The password is not built in: `gen-wifi-fw.py` turns it into
+the WPA2 key (as `wpa_passphrase` does) and the kernel only gets that key, in a header that is also gitignored. Anyone
+with the boot image can still join that network, so don't share images built with it. For an iPhone hotspot, keep
+**Maximize Compatibility** on (2.4 GHz, WPA2) and the Personal Hotspot screen open while the phone boots.
 
 ---
 
