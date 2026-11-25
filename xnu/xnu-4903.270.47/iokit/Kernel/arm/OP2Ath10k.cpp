@@ -2195,6 +2195,18 @@ run3(char *res, size_t len)
 #define WMI_TLV_START_SCAN_CMDID          0x3001u
 #define WMI_TLV_SCAN_CHAN_LIST_CMDID      0x3003u
 #define WMI_TLV_PDEV_SET_REGDOMAIN_CMDID  0x4001u
+#define WMI_TLV_PDEV_SET_PARAM_CMDID      0x4003u
+#define WMI_TLV_TAG_PDEV_SET_PARAM_CMD    82u
+#define WMI_TLV_PDEV_PARAM_TX_CHAIN_MASK  0x01u
+#define WMI_TLV_PDEV_PARAM_RX_CHAIN_MASK  0x02u
+#define WMI_TLV_PDEV_PARAM_DYNAMIC_BW     0x0au
+#define WMI_TLV_PDEV_PARAM_PMF_QOS        0x22u
+#define WMI_TLV_PDEV_PARAM_ARP_AC_OVERRIDE 0x23u
+#define WMI_TLV_PDEV_PARAM_ANI_ENABLE     0x25u
+#define WMI_TLV_PDEV_PARAM_IDLE_PS_CONFIG 0x2cu
+#define WMI_TLV_PDEV_PARAM_BURST_ENABLE   0x30u
+#define WMI_TLV_SERVICE_BURST             37u
+#define WMI_TLV_SERVICE_ADAPTIVE_OCS      39u
 #define WMI_TLV_VDEV_CREATE_CMDID         0x5001u
 #define WMI_TLV_VDEV_DELETE_CMDID         0x5002u
 #define WMI_TLV_SCAN_EVENTID              0x3001u
@@ -2262,6 +2274,41 @@ static bool
 wmi_cmd_words(uint32_t cmd_id, const uint32_t *w, uint32_t nwords)
 {
 	return wmi_cmd(cmd_id, w, nwords * 4u);
+}
+
+/* ath10k_wmi_tlv_op_gen_pdev_set_param: pdev_id 0, param, value */
+static bool
+pdev_set_param(uint32_t param, uint32_t value)
+{
+	uint32_t w[4] = { tlv_hdr(WMI_TLV_TAG_PDEV_SET_PARAM_CMD, 12u), 0u, param, value };
+	return wmi_cmd_words(WMI_TLV_PDEV_SET_PARAM_CMDID, w, 4u);
+}
+
+static inline bool
+svc_has(uint32_t bit)
+{
+	return bit < 128u && ((gSvc.svc[bit / 32u] >> (bit % 32u)) & 1u) != 0;
+}
+
+/* mac.c ath10k_start after ath10k_core_start, in its order: PMF QoS, dynamic bandwidth, burst off (if the firmware
+ * has the service), idle power-save config, __ath10k_set_antenna with the board's chains ((1 << num_rf_chains) - 1,
+ * wmi.c), ARP access category, ANI on. Not sent, as ath10k does not for this firmware: the probe request OUI (no
+ * random MAC), adaptive OCS (service absent), adaptive CCA and BT coex (feature flags absent). */
+static const char *
+start_params(uint32_t *chains_out)
+{
+	uint32_t n = gSvc.ev[SR_NUM_RF_CHAINS];
+	uint32_t chains = n >= 1u && n <= 4u ? (1u << n) - 1u : 1u;
+	*chains_out = chains;
+	if (!pdev_set_param(WMI_TLV_PDEV_PARAM_PMF_QOS, 1u)) return "PMF QoS";
+	if (!pdev_set_param(WMI_TLV_PDEV_PARAM_DYNAMIC_BW, 1u)) return "dynamic bandwidth";
+	if (svc_has(WMI_TLV_SERVICE_BURST) && !pdev_set_param(WMI_TLV_PDEV_PARAM_BURST_ENABLE, 0u)) return "burst";
+	if (!pdev_set_param(WMI_TLV_PDEV_PARAM_IDLE_PS_CONFIG, 1u)) return "idle power save";
+	if (!pdev_set_param(WMI_TLV_PDEV_PARAM_TX_CHAIN_MASK, chains)) return "tx chain mask";
+	if (!pdev_set_param(WMI_TLV_PDEV_PARAM_RX_CHAIN_MASK, chains)) return "rx chain mask";
+	if (!pdev_set_param(WMI_TLV_PDEV_PARAM_ARP_AC_OVERRIDE, 0u)) return "ARP access category";
+	if (!pdev_set_param(WMI_TLV_PDEV_PARAM_ANI_ENABLE, 1u)) return "ANI";
+	return NULL;
 }
 
 /* ath10k_wmi_tlv_op_gen_pdev_set_rd with the board's EEPROM domain (WORC_WORLD 0x6c on this phone: no CTLs) */
@@ -2765,9 +2812,17 @@ run4(char *res, size_t len)
 	if (ok && !htt_rx_setup(res, len)) {
 		return false;
 	}
+	uint32_t chains = 0;
+	const char *bad = ok ? start_params(&chains) : NULL;
+	if (bad != NULL) {
+		snprintf(res, len, "STEP 4 FAIL: the %s setting could not be sent", bad);
+		return false;
+	}
 	ok = ok && scan_set_regdomain() && scan_chan_list() && vdev_create(0u) && scan_start();
-	A_LOG("rx filter reset (barrier echo %s), regdomain %x, %u channels (all passive), station interface with the "
-	    "chip's MAC; scan %s", echo, gEepromRd & 0xFFFFu, SCAN_NCHAN, ok ? "requested" : "NOT requested");
+	A_LOG("rx filter reset (barrier echo %s), start settings (chain mask %x, ANI on, burst %s), regdomain %x, %u "
+	    "channels (all passive), station interface with the chip's MAC; scan %s", echo, chains,
+	    svc_has(WMI_TLV_SERVICE_BURST) ? "off" : "not offered", gEepromRd & 0xFFFFu, SCAN_NCHAN,
+	    ok ? "requested" : "NOT requested");
 	if (!ok) {
 		snprintf(res, len, "%s", "STEP 4 FAIL: a scan setup command could not be sent (see the lines above)");
 		return false;
