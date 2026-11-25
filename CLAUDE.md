@@ -40,7 +40,12 @@ use printf/IOLog for anything you need to see.
   gethostuuid() blocked configd's IPConfiguration plugin forever, so NO network plugin ever ran). op2shell
   publishes service op2usb (State:/Network/Service/op2usb/IPv4+DNS, router 192.168.7.1, DNS 1.1.1.1/8.8.8.8;
   re-published every 15 s if configd loses it). Mac must NAT: pfctl anchor com.apple/op2nat (docs/SETUP.md 6).
-  Test: /usr/local/bin/op2net example.com. Wi-Fi (QCA6174 on PCIe) has no driver.
+  Test: /usr/local/bin/op2net example.com.
+- Wi-Fi (2026-11-25): QCA6174 on PCIe, ath10k ported in iokit/Kernel/arm/OP2Wifi.cpp + OP2Ath10k.cpp, boot-arg wifi=N
+  (each N runs all lower steps; README "Wi-Fi bring-up"). wifi=8 joins a WPA2 hotspot named in the gitignored
+  firmware/qca6174/wifi-network.txt (tools/gen-wifi-fw.py -> op2_wifi_net.h: name + PMK only) and runs the 4-way
+  handshake; no network interface for iOS yet. Firmware blobs + generated headers stay out of git. Host simulation
+  of the chip + an OpenSSL access point (used to check steps 2b-6) is not in the repo.
 - Safari (2026-11-17): loads/draws normal sites (google, wikipedia) after kernel NECP ADD_FLOW, entitlement
   privileges (kern_priv), AppleM2ScalerCSCDriver stub; WebContent runs on the CPU (OP2Metal: one op2mtl context
   deadlocked its nested passes). JavaScript fixed 2026-11-17: Safari's +[NSUserDefaults _sf_safariDefaults] needs

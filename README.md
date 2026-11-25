@@ -10,7 +10,7 @@ clone it to `xnu/xnu-4903.270.47` inside this checkout.
 
 ---
 
-## Status (2026-11-24)
+## Status (2026-11-25)
 
 | Area | State | Evidence |
 |---|---|---|
@@ -25,8 +25,8 @@ clone it to `xnu/xnu-4903.270.47` inside this checkout.
 | Battery | `OP2Battery` (PMI8994 fuel gauge → `IOPMPowerSource`) is in the kernel; not yet checked against a meter | kernel source |
 | **Internet over USB** | Through the Mac's NAT: configd makes `ue0` primary, DNS + HTTP verified from the phone ([setup](docs/SETUP.md)) | `op2net example.com` → `200 OK` |
 | Safari | Loads sites over HTTPS with JavaScript (JIT on): Google, Wikipedia, YouTube, apple.com (heavy sites still rough) | photos on the phone |
-| **Wi-Fi (QCA6174 on PCIe)** | Bring-up, no networking yet: the chip is powered, the PCIe link is up and **the chip boots its own firmware** (`WLAN.RM.4.4.1`) and it answers commands (WMI ready, MAC address read); a first scan is next ([below](#wi-fi-bring-up-step-by-step)) | `OP2 WIFI: RESULT:` lines (boot-arg `wifi=5`) |
-| Not working yet | Wi-Fi networking and Bluetooth, RTC (clock does not keep time) | [docs/NEXT-PLAN.md](docs/NEXT-PLAN.md) |
+| **Wi-Fi (QCA6174 on PCIe)** | **Joins a WPA2 network** (an iPhone hotspot): the chip boots its own firmware, scans, authenticates and associates; the WPA2 4-way handshake has run to message 4 (the iPhone listed the phone as connected), installing the keys is in the next test. Not usable by iOS yet: there is no network interface ([below](#wi-fi-bring-up-step-by-step)) | `OP2 WIFI: RESULT:` lines (boot-arg `wifi=8`) |
+| Not working yet | Wi-Fi as a network for iOS (no interface yet), Bluetooth, RTC (clock does not keep time) | [docs/NEXT-PLAN.md](docs/NEXT-PLAN.md) |
 | Known issues | brief pale/partial frames while scrolling; logd SIGBUS/SIGSEGV loop, Spotlight extensions SIGABRT loop, occasional SpringBoard SIGSEGV | [CLAUDE.md](CLAUDE.md) |
 
 Between 2026-11-14 and 11-16 another AI agent worked on this tree. Its SpringBoard injection (a 2048 game inside
@@ -54,25 +54,30 @@ Everything here was measured on the phone; the details and logs are in [docs/GPU
 
 The Wi-Fi/Bluetooth chip is a Qualcomm Atheros **QCA6174** (hw3.2) on PCIe root complex 1, not the SoC's WCNSS.
 The kernel code is `iokit/Kernel/arm/OP2Wifi.cpp` (power, PCIe, chip registers) and `OP2Ath10k.cpp` (copy
-engines, boot loader and firmware download, ported from Linux's ath10k). It is off by default; the boot-arg `wifi` in the `CMDLINE=`
-line of `tools/build-daily.sh` sets how far it goes. It runs in its own kernel thread 120 s after boot and repeats
-its result every 60 s so the line survives in ramoops: `grep -a 'OP2 WIFI' op2-last-boot.log`.
+engines, boot loader, firmware download, the firmware's HTC/WMI/HTT services, scanning, joining and WPA2, ported
+from Linux's ath10k; the 4-way handshake follows wpa_supplicant). It is off by default; the boot-arg `wifi` in the `CMDLINE=`
+line of `tools/build-daily.sh` sets how far it goes. **Each `wifi=N` runs every step of the lower numbers first, in
+order, and stops at the first one that fails**: `wifi=8` runs the probe, steps 1 to 5 and then 6; `wifi=7` stops after
+step 5. Without the boot-arg (or `wifi=0`) nothing touches the Wi-Fi hardware. It runs in its own kernel thread 120 s
+after boot, logs a verdict line (`RESULT:`) for each step it passes and the one it stops at, and repeats the last one
+every 60 s so it survives in ramoops: `grep -a 'OP2 WIFI' op2-last-boot.log`.
 
-| Step | `wifi=` | Result |
+| Step | `wifi=` (runs the rows above it too) | Result |
 |---|---|---|
+| off | 0 | The default (no `wifi` boot-arg): the Wi-Fi code does nothing. |
 | probe | 1 | Read-only: logs the chip's pins, PMIC supplies, PCIe clocks and power domain. |
 | **1** power + PCIe link | 2 | **Passes on the phone.** Chip power (bt_vreg, L30, bootstrap, WLAN_EN), the controller's supplies, clocks and TrustZone secure config, the 20 nm PHY and link training: the chip answers as `168c:003e`, class/rev `02800032`, link x1 Gen1. |
-| **2a** chip registers | 2 | **Passes on the phone.** BAR0 (2 MB, on a 2 MB boundary at `0xf8a00000`), SoC wake, chip ID `00342aff` (rev 10 = hw3.2), readable about 80 ms after WLAN_EN; no reset needed. |
+| **2a** chip registers | 2 (with step 1) | **Passes on the phone.** BAR0 (2 MB, on a 2 MB boundary at `0xf8a00000`), SoC wake, chip ID `00342aff` (rev 10 = hw3.2), readable about 80 ms after WLAN_EN; no reset needed. |
 | **2b** DMA + boot loader | 3 | **Passes on the phone.** The copy engines (CE0/CE1 for boot-loader messages, CE7 as a window into the chip's memory), the target-side configuration and the first boot-loader (BMI) command, `GET_TARGET_INFO`: the chip answers version `05030000` (hw3.2) with no reset. |
 | **2c** firmware boot | 4 | **Passes on the phone.** Board data (the phone's own `bdwlan30.bin`), the OTP calibration program and the firmware (`WLAN.RM.4.4.1-00309`, 681 KB in six segments through the diagnostic window), then `BMI_DONE`: 11 ms later the firmware sends its HTC ready message (2 send credits of 1792 bytes, 4 endpoints, HTC 2.1). Uses ath10k's `firmware-6.bin`, which stays out of this repository with the board data ([below](#wi-fi-firmware-files)). |
 | **3** firmware services | 5 | The remaining copy engines (CE2-CE5), HTC connect of the firmware's data (HTT) and control (WMI) services, the WMI service-ready event (any host memory the firmware asks for), WMI init with ath10k's resource config, then the WMI ready event, which carries the chip's Wi-Fi MAC address; also the HTT version and a WMI echo. **Passes on the phone** (third run, progress rows 10-12): the copy-engine 5 override ath10k applies to QCA6174 was the missing piece. |
-| **4** listen-only scan | 6 | **Passes on the phone, weakly**: with ath10k's HTT rx ring the chip hears networks (2 in 5.6 s, beacons through the rx ring), but far fewer than are around; third version (ath10k's start-up settings: chain mask, ANI) not yet run. Steps: the board's regulatory domain, a channel list with every channel passive (2.4 GHz 1-13, 5 GHz 36-165), a station interface with the chip's MAC, then a scan; the log lists the networks heard (name, channel, signal, security). The chip does not transmit. |
-| **5** join | 7 | Written, not yet run on the phone: finds the network named in `wifi-network.txt` ([below](#wi-fi-firmware-files)) in the scan (scans up to twice more if it is not there), checks it offers WPA2-PSK with AES (CCMP), starts the chip on its channel, then open authentication and association as a plain 802.11a/b/g station. Frames go out through HTT (the firmware has no WMI management transmit). Leaves the network politely at the end. |
-| **6** WPA2 | 8 | Written, not yet run on the phone: the 4-way handshake (keys from the network name and password, message 3's MIC checked, the group key decrypted), both keys into the chip, the port opened, then 5 s connected counting data frames from the network. The crypto (SHA-1, HMAC, the 802.11 PRF, AES key unwrap) is in the driver and checks itself against published test vectors first. |
+| **4** listen-only scan | 6 | **Passes on the phone**: about 5 networks and 20 beacons per 5.6 s scan since the receive fix of progress row 19 (the radio's reported noise floor, about -119 dBm on 2.4 GHz, is still lower than expected). Before it: ath10k's HTT rx ring, ath10k's start-up settings (chain mask for the board's one RF chain, ANI), the board's regulatory domain, a channel list with every channel passive (2.4 GHz 1-13, 5 GHz 36-165), a station interface with the chip's MAC. The log lists the networks heard (name, channel, signal, security) and each channel's noise floor and load. The chip does not transmit. |
+| **5** join | 7 | **Passes on the phone** (progress rows 17 and 19). Finds the network named in `wifi-network.txt` ([below](#wi-fi-firmware-files)): in step 4's scan, else by asking for it by name (probe requests on 2.4 GHz channels 1-11, up to 4 rounds), else in one more listen-only scan. Checks it offers WPA2-PSK with AES (CCMP), starts the chip on its channel, creates the peer, then open authentication and association as a plain 802.11a/b/g station (frames go out through HTT: this firmware has no WMI management transmit). With `wifi=7` the run ends here: the phone leaves the network again (deauthentication, vdev down, peer delete, vdev stop). |
+| **6** WPA2 | 8 | **Reached message 4 on the phone** (progress row 19): message 3's MIC checked, so the password and the key derivation are right, and the iPhone listed the phone as connected; installing the keys is the next test (row 20). Runs step 5 first, then the 4-way handshake (keys from the network name and password, the group key decrypted), both keys into the chip, the port opened, 5 s connected counting data frames from the network, then it leaves as `wifi=7` does. The crypto (SHA-1, HMAC, the 802.11 PRF, AES key unwrap) is in the driver and checks itself against published test vectors first. |
 
 After joining: a network interface for iOS (DHCP through configd), staying connected (power save, beacon loss, roaming), then Bluetooth.
 
-#### Progress so far (2026-11-23 to 11-24)
+#### Progress so far (2026-11-23 to 11-25)
 
 | # | What ran (commit) | What the log showed | What it told us |
 |---|---|---|---|
@@ -90,16 +95,18 @@ After joining: a network interface for iOS (DHCP through configd), staying conne
 | 12 | Step 3 with the CE5 override (target table entry 5, service map, no host ring on CE5; HTT on CE1) (`6cbea42`) | **PASS**: WMI ready 13 ms after init (status 0, the chip's MAC address, a Qualcomm one), HTT version 3.87, WMI echo answered, credits come back | The firmware is fully up and takes commands. The PLL switch stays: both host drivers make it. |
 | 13 | Step 4, `wifi=6`: listen-only scan (`5064ce7`) | **FAIL**: the scan started, visited all 37 channels and completed in 5.6 s, but no beacon arrived (0 frames) | The radio tunes but the firmware delivers nothing: ath10k hands the firmware an HTT rx ring (with its aggregation config) before anything else, and the firmware's receive path needs it. |
 | 14 | Step 4 with the HTT rx ring (127 buffers of 2 KB, ath10k's order: rx filter reset, ring, then regdomain and scan), per-channel radio reports (noise floor, busy and receive time) and beacons taken from the ring as well as from WMI (`bc129f5`) | **PASS, weak**: 2 networks (strongest -40 dBm), 3 beacons and 2 control frames in 5.6 s, all through the rx ring (none over WMI, no HTT rx indications); noise floor -107 to -118 dBm, air busy only around channel 11 | The receive path works now, but the radio hears only a strong nearby access point. The reported noise floor is below what a working receiver measures (about -95 to -105 dBm). ath10k also sets the chain mask to the board's one RF chain (we left the init's 7) and turns ANI on. |
-| 15 | Step 4 with ath10k's start-up settings (PMF QoS, dynamic bandwidth, idle power save, tx/rx chain mask = 1, ARP access category, ANI on) | Not run yet | Checked in simulation (order and values). |
+| 15 | Step 4 with ath10k's start-up settings (PMF QoS, dynamic bandwidth, idle power save, tx/rx chain mask = 1, ARP access category, ANI on) (`742fb04`) | PASS: 5 networks instead of 2, the first beacon over WMI; noise floor unchanged (-106 to -119 dBm) | The chain mask was not what made the noise floor look low. Most of the frames the scans missed turned out to be the driver's fault (row 19): it read the receive buffers in ring order, and one buffer the chip never finished blocked all the others. |
 | 16 | Steps 5 and 6, `wifi=8`: join an iPhone hotspot (WPA2) and run the 4-way handshake (`f80b533`) | **FAIL** at the first authentication frame: the hotspot was heard on the second scan (-42 dBm), the chip started on its channel and mapped the peer, the frame went out, but its completion came as HTT type 14 (MGMT_TX_COMPL_IND), which the driver did not read | For management frames sent through HTT this firmware reports completion with its own message (frame id, status 0 ok / 1 no ack / 2 dropped). Read now. |
 | 17 | Step 5 reading MGMT_TX_COMPL_IND (`6191090`) | Run 1: **FAIL**, the hotspot not heard in 3 listen-only scans (4-5 networks each, 1-2 frames per network). Run 2, same image: **STEP 5 PASS**, the first association: hotspot heard on the second scan (-48 dBm), authentication and association requests acknowledged, AID 1. Step 6 **FAIL**: no message 1 within 10 s, although the firmware announced one 131-byte frame (the size of message 1) with an in-order rx indication | Transmit works both ways. Reception still misses most beacons. In rx full reorder mode the firmware names the buffers it filled (some offloaded: a short header instead of the rx descriptor); the driver only looked at buffers in ring order and never at that one. |
-| 18 | Step 5 asks for the network by name: probe requests on 2.4 GHz channels 1-11 (12-13 stay listen-only), up to 4 quick rounds, then one more listen-only scan of every channel | Not run yet | An access point answers a probe request with a probe response addressed to us and retries it until we acknowledge it: several chances instead of one. Checked in simulation (a hotspot that only answers probes, in the second round). |
+| 18 | Step 5 asks for the network by name: probe requests on 2.4 GHz channels 1-11 (12-13 stay listen-only), up to 4 quick rounds, then one more listen-only scan of every channel (`9b1c327`, run in row 19) | Not needed in that run: the hotspot was in step 4's scan | Stays for when the first scan misses the network. An access point answers a probe request with a probe response addressed to us and retries it until we acknowledge it: several chances instead of one. Checked in simulation (a hotspot that only answers probes, in the second round). |
 | 19 | Steps 5 and 6 with in-order rx indications handled, probing by name (`9b1c327`) | Step 5 **PASS** (hotspot in the first scan, 4 beacons; 20 beacons in all now that a stuck buffer no longer blocks the rest). Step 6: message 1 read, message 2 acknowledged, **message 3's MIC checked** (the password and the key derivation are right), message 4 sent - the iPhone showed a connected device - but the firmware never confirmed message 4 and the driver gave up before installing the keys. Two WMI TX_PAUSE events came with message 3 | wpa_supplicant installs the keys right after sending message 4; so does the driver now. |
 | 20 | Step 6 without waiting for message 4's confirmation (2 s at most), a repeated message 3 answered while connected, TX_PAUSE decoded (vdev pauses hold our sends as ath10k stops its queues; the others are only logged) | Not run yet | Checked in simulation: pause events with message 3 and message 4 never confirmed. |
 
 #### Testing a step
 
-1. Set `wifi=N` in the `CMDLINE=` line of `tools/build-daily.sh`, build, and boot as usual.
+1. Set `wifi=N` in the `CMDLINE=` line of `tools/build-daily.sh`, build, and boot as usual. For `wifi=7` and `wifi=8`
+   the network has to be in `firmware/qca6174/wifi-network.txt` (the build prints `[wifi-net] network ...`), and an
+   iPhone hotspot's Personal Hotspot screen should stay open until the test is over.
 2. Wait about 3 minutes after the UI comes up: the Wi-Fi thread starts 120 s after boot.
 3. Shut down from Settings → General → Shut Down, then in TWRP:
 
