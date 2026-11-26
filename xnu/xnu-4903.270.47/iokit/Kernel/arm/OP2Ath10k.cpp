@@ -5267,7 +5267,7 @@ run8(char *res, size_t len, uint32_t stay_ms)
 	    "connected, a status line every 60 s", a, prefix, b, c);
 	/* op2shell publishes wl0 to configd: without it iOS has no route or DNS on wl0. Its boot-time line is long out of
 	 * the ramoops ring by now, so say here (and again whenever it changes) what the kernel's check did. */
-	static char shell[256], shell_was[256];
+	static char shell[640], shell_was[640];
 	bzero(shell, sizeof(shell));
 	op2_shell_status(shell, sizeof(shell));
 	A_LOG("op2shell: %s", shell);

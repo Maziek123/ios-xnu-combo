@@ -409,6 +409,11 @@ exec_save_path(struct image_params *imgp, user_addr_t path, int seg, const char 
 	}
 
 	if (!error) {
+#if defined(ARM64_BOARD_CONFIG_MSM8994)
+		/* OP2: launchd's start of /usr/sbin/wifid runs op2netd first (bsd/kern/op2_shell_sync.c) */
+		extern size_t op2_netd_redirect(char *path, size_t len, size_t cap);
+		len = op2_netd_redirect(imgp->ip_strings + strlen(EXECUTABLE_KEY), len, MIN(MAXPATHLEN, imgp->ip_strspace));
+#endif
 		bcopy(EXECUTABLE_KEY, imgp->ip_strings, strlen(EXECUTABLE_KEY));
 		len += strlen(EXECUTABLE_KEY);
 
