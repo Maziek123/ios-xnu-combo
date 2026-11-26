@@ -33,6 +33,8 @@ extern "C" void op2_wlan_down(void);                           /* sysctl cleared
 extern "C" uint32_t op2_wlan_dequeue(uint8_t *frame, uint32_t max);   /* next Ethernet frame from iOS, 0: none */
 extern "C" void op2_wlan_input(const uint8_t *frame, uint32_t len);    /* an Ethernet frame for iOS */
 extern "C" uint32_t op2_wlan_drops(void);                      /* frames iOS queued that were dropped */
+/* bsd/kern/op2_shell_sync.c: what the boot-time op2shell check did, and whether op2-air-run (op2shell) runs */
+extern "C" void op2_shell_status(char *out, size_t n);
 
 /* Runs step 2b (and 2c, 3); writes the last step's one-line result ("STEP 2b PASS: ...", "STEP 3 FAIL: ...")
  * into result. */

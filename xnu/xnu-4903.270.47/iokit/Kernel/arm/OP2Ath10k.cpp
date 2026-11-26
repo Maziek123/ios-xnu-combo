@@ -5265,6 +5265,13 @@ run8(char *res, size_t len, uint32_t stay_ms)
 	}
 	A_LOG("STEP 8 PASS: wl0 up with %s/%u (router %s, DNS %s): iOS can use it once op2shell publishes it; staying "
 	    "connected, a status line every 60 s", a, prefix, b, c);
+	/* op2shell publishes wl0 to configd: without it iOS has no route or DNS on wl0. Its boot-time line is long out of
+	 * the ramoops ring by now, so say here (and again whenever it changes) what the kernel's check did. */
+	static char shell[256], shell_was[256];
+	bzero(shell, sizeof(shell));
+	op2_shell_status(shell, sizeof(shell));
+	A_LOG("op2shell: %s", shell);
+	memcpy(shell_was, shell, sizeof(shell));
 	uint32_t t0 = ms_since_power_on(), last = t0, next_report = t0 + 60000u, roams = 0, rx_seen = gWlRx;
 	static uint8_t e[ETH_MAX];
 	const char *why = NULL;
@@ -5310,6 +5317,12 @@ run8(char *res, size_t len, uint32_t stay_ms)
 			char st[240];
 			wl_status(st, sizeof(st), (now - t0) / 1000u);
 			A_LOG("%s", st);
+			bzero(shell, sizeof(shell));
+			op2_shell_status(shell, sizeof(shell));
+			if (memcmp(shell, shell_was, sizeof(shell)) != 0) {
+				A_LOG("op2shell: %s", shell);
+				memcpy(shell_was, shell, sizeof(shell));
+			}
 			next_report += 60000u;
 		}
 		if (stay_ms != 0 && now - t0 >= stay_ms) {

@@ -136,7 +136,9 @@ stays on Wi-Fi until the boot's `op2_deadline` (2 h with `tools/build-daily.sh`)
    before launchd starts, the kernel compares it with the phone's `/usr/local/bin/op2-air-run` and overwrites that
    file when they differ (`bsd/kern/op2_shell_sync.c`; boot-arg `op2shell_sync=0` turns it off). The log says which:
    `OP2 SHELL: ... is the kernel's op2shell`, `... differed: wrote ... read back identical`, or why it could not. The
-   build prints `[op2shell] embedding op2shell: N bytes`; without that line the kernel carries none.
+   build prints `[op2shell] embedding op2shell: N bytes`; without that line the kernel carries none. That boot-time
+   line is soon pushed out of the 256 KB ramoops ring, so step 8 repeats it as `OP2 WIFI: 8: op2shell: ...`, with
+   whether `op2-air-run` (op2shell) is running.
    The new `op2shell` reads `net.op2wlan` every 3 s and publishes wl0 to configd ahead of USB. An older one leaves wl0
    without a default route and DNS: wl0 is up and connected, but Safari says the iPhone is not connected to the
    Internet, and the `wl0 up` lines show almost no frames from iOS.
