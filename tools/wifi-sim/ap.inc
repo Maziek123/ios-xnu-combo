@@ -23,6 +23,8 @@
  *     commands (harness.cpp): scan while connected, leave, join with a wrong PMK (message 2's MIC fails, deauth 15:
  *     "failed"), join with the right one (connected again, a new lease and ping), off. Every scan hears the hotspot and
  *     an open "Cafe"; the hotspot starts a fresh session at each vdev stop.
+ * 36: wifi=12, the build's network not around (only "Cafe"): skipped at once (no probing), a periodic rescan while
+ *     idle, then off
  * 28: the hotspot never beacons where we listen but answers our probe request in the second directed round: WPA2 as 22 */
 #include <openssl/hmac.h>
 #include <openssl/evp.h>
@@ -40,7 +42,7 @@ static uint32_t ap_ps_off, ap_vdev_starts, ap_peer_creates, ap_peer_assocs, ap_v
 static bool ap_pa_ok, ap_order_ok = true;
 static uint32_t ap_state;   /* 0 idle, 1 authenticated, 2 associated, 3 msg3 sent, 4 done */
 
-static bool ap_scenario(void) { return scenario >= 22 && scenario <= 35; }
+static bool ap_scenario(void) { return scenario >= 22 && scenario <= 36; }
 static uint32_t ap_sessions, ap_authorized_total;
 
 static std::vector<uint8_t>

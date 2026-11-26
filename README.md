@@ -63,7 +63,7 @@ step was one lower). Without the boot-arg (or `wifi=0`) nothing touches the Wi-F
 after boot, logs a verdict line (`RESULT:`) for each step it passes and the one it stops at, and repeats the last one
 every 60 s so it survives in ramoops: `grep -a 'OP2 WIFI' op2-last-boot.log`.
 Each change is checked first in a host simulation of the chip (and, for steps 5 and 6, of an access point):
-[`tools/wifi-sim`](tools/wifi-sim/README.md) (36 scenarios); op2netd's page: `tools/op2netd-test/run.sh`.
+[`tools/wifi-sim`](tools/wifi-sim/README.md) (37 scenarios); op2netd's page: `tools/op2netd-test/run.sh`.
 
 | Step | `wifi=` (runs the rows above it too) | Result |
 |---|---|---|
@@ -155,7 +155,9 @@ stays on Wi-Fi until the boot's `op2_deadline` (2 h with `tools/build-daily.sh`)
 #### Choosing a network on the phone (`wifi=12`)
 
 1. Boot with `wifi=12` (for example `EXTRA="wifi=12" bash tools/build-daily.sh`). About 2 minutes after boot the
-   driver has scanned; if `wifi-network.txt` names a network it is joined first, as with `wifi=11`.
+   driver has scanned. `wifi-network.txt` is optional: if it names a network and that network was heard in the scan,
+   it is joined first; if not, it is skipped for this boot at once (no probing, and the kernel never tries it again;
+   join it once on the page to have op2netd remember it).
 2. In Safari open **`http://127.0.0.1:8080`**. The page is served by op2netd on the phone itself, so it opens even with
    no network. Share, then Add to Home Screen, gives it an icon.
 3. Tap a network, type its password, then Join. The page refreshes every 5 s: "Joining...", then a check mark with the

@@ -5497,8 +5497,13 @@ mgr_state(const char *what)
 {
 	static char was[200];
 	op2_wlan_set_state(what);
+	/* the 30 s rescans while idle stay out of the log ("scanning", then "idle" again) */
+	bool quiet = strncmp(what, "scanning", sizeof("scanning")) == 0 ||
+	    (strncmp(what, "idle", sizeof("idle")) == 0 && strncmp(was, "scanning", sizeof("scanning")) == 0);
 	if (strncmp(what, was, sizeof(was)) != 0) {
-		A_LOG("manager: %s", what);
+		if (!quiet) {
+			A_LOG("manager: %s", what);
+		}
 		size_t i = 0;
 		for (; i + 1u < sizeof(was) && what[i] != 0; i++) {
 			was[i] = what[i];
@@ -5626,11 +5631,17 @@ run_manager(char *res, size_t len, uint32_t limit_ms)
 	gManager = true;
 	gStep = "mgr";
 	mgr_publish_scan();
-	bool pending = gWantSsidLen > 0;   /* the build's network first */
-	A_LOG("Wi-Fi manager up: %u networks heard; %s", gNumBss, pending ? "joining the build's network first" :
-	    "waiting for op2netd (http://127.0.0.1:8080 on the phone)");
+	/* The build's network (wifi-network.txt) is optional: tried once, and only if step 4's scan heard it; otherwise
+	 * skipped for this boot (no probing, never retried by the kernel). op2netd's saved networks take over. */
+	char name[33];
+	ssid_print(name, sizeof(name));
+	bool pending = gWantSsidLen > 0 && find_target() != NULL;
+	A_LOG("Wi-Fi manager up: %u networks heard; %s%s%s", gNumBss, gWantSsidLen == 0 ? "no network built in" :
+	    pending ? "joining the build's network " : "the build's network ", gWantSsidLen ? name : "",
+	    gWantSsidLen == 0 || pending ? "" : " not heard: skipped for this boot");
+	A_LOG("%s", "op2netd's page: http://127.0.0.1:8080 on the phone");
 	uint32_t t0 = ms_since_power_on(), last_scan = t0;
-	mgr_state(pending ? "idle" : "idle");
+	mgr_state("idle");
 	for (uint32_t it = 0;; it++) {
 		int c = mgr_take();
 		if (c == MGR_JOIN) {

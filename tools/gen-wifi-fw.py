@@ -72,7 +72,7 @@ def network():
         if os.path.exists(NET_OUT):
             os.remove(NET_OUT)
             touch(CPP)
-        print("[wifi-net] no firmware/qca6174/wifi-network.txt: Wi-Fi step 5 (wifi=8) will report it")
+        print("[wifi-net] no firmware/qca6174/wifi-network.txt: no network built in (optional with wifi=12: pick one on the phone)")
         return 0
     with open(path, "rb") as f:
         raw = f.read()

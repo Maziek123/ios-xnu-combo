@@ -387,7 +387,15 @@ extern "C" void op2_wlan_set_scan(const char *text) { st_scan = text; st_scans++
 extern "C" int
 op2_wlan_take_cmd(char *out, uint32_t n)
 {
-	if (scenario != 35 || st_states.empty()) return 0;
+	if (scenario < 35 || st_states.empty()) return 0;
+	if (scenario == 36) {   /* the hotspot is not around: wait for a periodic rescan while idle, then off */
+		if (st_mphase == 0 && st_states.back() == "idle" && st_scans >= 2) {
+			st_mphase++;
+			snprintf(out, n, "off");
+			return 1;
+		}
+		return 0;
+	}
 	const std::string &cur = st_states.back();
 	auto is = [&](const char *p) { return cur.rfind(p, 0) == 0; };
 	std::string c;
@@ -581,7 +589,7 @@ fw_receive(unsigned ce, const uint8_t *m, uint32_t n, uint32_t dflags)
 				scan_flags = v[15];
 				scan_nchan = v[17];
 				assert((v[1] & 0xF000u) == 0xA000u && v[2] == v[1] + 1 && v[18] == 1);
-				assert(scenario == 35 || v[1] == 0xA000u + 2 * (starts - 1));   /* the manager's own rounds */
+				assert(scenario >= 35 || v[1] == 0xA000u + 2 * (starts - 1));   /* the manager's own rounds */
 				bool directed = v[15] == 0x30;
 				if (directed) {   /* step 5: 2.4 GHz channels 1-13, the network's name, our rates; 1-11 active */
 					assert(v[17] == 13 && v[19] == 1 && v[20] == 16 && v[6] == 100 && chanlist_active == 11);
@@ -603,9 +611,9 @@ fw_receive(unsigned ce, const uint8_t *m, uint32_t n, uint32_t dflags)
 						memcpy(&f[4], kStaMac, 6);
 						queue_ring_frame(f, (1u << 31) | (1u << 8), true, 52);
 					}
-					if (scenario == 35 && !directed) {   /* the manager: every scan hears the hotspot and an open cafe */
+					if ((scenario == 35 || scenario == 36) && !directed) {   /* the manager: the hotspot (not in 36), a cafe */
 						static const uint8_t cafe[6] = { 0x02, 0xca, 0xfe, 0, 0, 1 };
-						queue_ring_frame(ap_beacon(), (1u << 31) | (1u << 8), true, 55);
+						if (scenario == 35) queue_ring_frame(ap_beacon(), (1u << 31) | (1u << 8), true, 55);
 						queue_ring_frame(make_beacon(cafe, "Cafe", 11, false, 0x80), (1u << 31) | (1u << 8), true, 30);
 					} else if (starts == 1 && scenario != 23 && scenario != 28) {
 						queue_ring_frame(ap_beacon(), (1u << 31) | (1u << 8), true, 55);
@@ -970,7 +978,7 @@ main(int argc, char **argv)
 	for (uint32_t i = 0; i < 60; i++) st32(0x35000 + 4 * i, 0xc0de0000u + i);
 	struct op2_ath10k_bus bus = { bar, conf, dbi, 0, cold_reset, scenario >= 6, scenario >= 9, scenario >= 18, ap_scenario(),
 		ap_scenario() && scenario != 27, scenario >= 31 && scenario <= 35, scenario >= 33 && scenario <= 35,
-		scenario == 34 ? 61000u : scenario == 35 ? 600000u : 0u, scenario == 35 };
+		scenario == 34 ? 61000u : scenario >= 35 ? 600000u : 0u, scenario >= 35 };
 	PKCS5_PBKDF2_HMAC_SHA1(scenario == 25 ? "another-password" : "simulated-ap", scenario == 25 ? 16 : 12, (const unsigned char *)"iPhone", 6, 4096, 32, ap_pmk);
 	fflush(stdout);
 	char res[320];
@@ -1122,6 +1130,16 @@ main(int argc, char **argv)
 		}
 		break;
 	}
+	case 36:   /* the manager, the build's network not around: skipped at once, no probing, never retried */
+		CHECK(ok && strstr(res, "Wi-Fi manager: turned off by op2netd"));
+		CHECK(logbuf.find("Wi-Fi manager up: 1 networks heard; the build's network iPhone not heard: skipped for this boot") !=
+		    std::string::npos);
+		CHECK(directed_scans == 0 && ap_auths == 0 && ap_vdev_starts == 0 && ap_deauths == 0 && st_mphase == 1);
+		CHECK(st_scans == 2 && st_scan.find(" open 43616665\n") != std::string::npos && st_scan.find("6950686f6e65") == std::string::npos);
+		CHECK(std::find(st_states.begin(), st_states.end(), std::string("scanning")) != st_states.end());
+		CHECK(std::find_if(st_states.begin(), st_states.end(), [](const std::string &x) { return x.rfind("joining", 0) == 0; }) ==
+		    st_states.end());
+		break;
 	case 35: {   /* the Wi-Fi manager */
 		auto saw = [&](const char *p) {
 			for (const std::string &x : st_states) if (x.rfind(p, 0) == 0) return true;
