@@ -2337,6 +2337,21 @@ is_io_service_match_property_table_bin(
 static char op2_iolog_names[128];
 static int op2_iolog_parsed;
 static uint32_t op2_iolog_lines;
+/*
+ * wifid (Apple's Wi-Fi daemon) is always traced, with its own budget of 150 lines, and its lines also go to the kept
+ * log (op2_keep): what it looks for tells what the kernel must offer for the status-bar Wi-Fi icon. Boot-arg
+ * op2wifid=0 turns it off. bsd/kern/sys_generic.c traces its ioctls the same way.
+ */
+static int op2_wifid_on = -1;
+static uint32_t op2_wifid_lines;
+extern "C" void op2_keep(const char *fmt, ...) __printflike(1, 2);
+
+#define OP2_IOK(name, fmt, ...) do { \
+	IOLog("IOK %s: " fmt "\n", name, ##__VA_ARGS__); \
+	if (strncmp(name, "wifid", 6) == 0) { \
+		op2_keep("OP2 WIFID: IOKit " fmt, ##__VA_ARGS__); \
+	} \
+} while (0)
 
 static bool
 op2_iolog(char *name, size_t len)
@@ -2345,12 +2360,18 @@ op2_iolog(char *name, size_t len)
 		if (!PE_parse_boot_argn("op2iolog", op2_iolog_names, sizeof(op2_iolog_names))) {
 			strlcpy(op2_iolog_names, "backboardd,SpringBoard", sizeof(op2_iolog_names));
 		}
+		int v = 1;
+		(void)PE_parse_boot_argn("op2wifid", &v, sizeof(v));
+		op2_wifid_on = v;
 		op2_iolog_parsed = 1;
+	}
+	proc_selfname(name, (int)len);
+	if (op2_wifid_on && strncmp(name, "wifid", 6) == 0) {
+		return OSIncrementAtomic((volatile SInt32 *)&op2_wifid_lines) < 150;
 	}
 	if (op2_iolog_lines >= 400) {
 		return false;
 	}
-	proc_selfname(name, (int)len);
 	size_t n = strlen(name);
 	for (const char *t = op2_iolog_names; *t;) {
 		const char *end = strchr(t, ',');
@@ -2389,7 +2410,7 @@ op2_iolog_dict(const char *name, const char *what, OSObject *dict, const char *r
 	if (text != NULL &&
 	    !op2_str_contains(text, "IOAccelerator") &&
 	    !op2_str_contains(text, "AppleM2Scaler")) {
-		IOLog("IOK %s: %s %.240s -> %s\n", name, what, text, result);
+		OP2_IOK(name, "%s %.240s -> %s", what, text, result);
 	}
 	OSSafeReleaseNULL(ser);
 }
@@ -2655,6 +2676,14 @@ internal_io_service_add_notification(
 		} else {
 			err = kIOReturnUnsupported;
 		}
+#if defined(ARM64_BOARD_CONFIG_MSM8994)
+		{
+			char sname[32];
+			if (op2_iolog(sname, sizeof(sname))) {
+				op2_iolog_dict(sname, notification_type, dict, err == kIOReturnSuccess ? "waiting" : "refused");
+			}
+		}
+#endif
 	} while (false);
 
 	if ((kIOReturnSuccess != err) && userNotify) {
@@ -3083,6 +3112,14 @@ is_io_registry_entry_from_path(
 	}
 
 	entry = IORegistryEntry::fromPath( path );
+#if defined(ARM64_BOARD_CONFIG_MSM8994)
+	{
+		char sname[32];
+		if (op2_iolog(sname, sizeof(sname))) {
+			OP2_IOK(sname, "path %.200s -> %s", path, entry ? entry->getMetaClass()->getClassName() : "none");
+		}
+	}
+#endif
 
 	*registry_entry = entry;
 
@@ -3136,6 +3173,12 @@ is_io_registry_entry_from_path_ool(
 	if ((KERN_SUCCESS == err) && (KERN_SUCCESS == res)) {
 		entry = IORegistryEntry::fromPath(cpath);
 		res = entry ? kIOReturnSuccess : kIOReturnNotFound;
+#if defined(ARM64_BOARD_CONFIG_MSM8994)
+		char sname[32];
+		if (op2_iolog(sname, sizeof(sname))) {
+			OP2_IOK(sname, "path %.200s -> %s", cpath, entry ? entry->getMetaClass()->getClassName() : "none");
+		}
+#endif
 	}
 
 	if (map_data) {
@@ -3882,7 +3925,7 @@ is_io_service_open_extended(
 		{
 			char sname[32];
 			if (op2_iolog(sname, sizeof(sname))) {
-				IOLog("IOK %s: open %s type %u -> 0x%x\n", sname,
+				OP2_IOK(sname, "open %s type %u -> 0x%x",
 				    service->getMetaClass()->getClassName(), connect_type, res);
 			}
 		}

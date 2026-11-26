@@ -769,6 +769,73 @@ rd_uio(struct proc *p, int fdes, uio_t uio, user_ssize_t *retval)
 	return error;
 }
 
+#if defined(ARM64_BOARD_CONFIG_MSM8994)
+#include <libkern/OSAtomic.h>
+#include <pexpert/pexpert.h>
+void op2_keep(const char *fmt, ...) __printflike(1, 2);
+/*
+ * OnePlus 2: Apple's Wi-Fi daemon (wifid) and what it asks the kernel for (the way to the status-bar Wi-Fi icon:
+ * the kernel must answer it as Apple's Wi-Fi driver would). Each distinct ioctl it makes (the file it was made on,
+ * the request, for an interface request its name and the first words after it: an Apple80211 request's type) and
+ * the answer go to the kept log (op2_keep), at most 120; boot-arg op2wifid=0 turns this off. Its IOKit calls are
+ * traced in iokit/Kernel/IOUserClient.cpp.
+ */
+static void
+op2_wifid_ioctl(int ftype, int fam, const char *vname, u_long com, const uint8_t *req, u_int size, int error)
+{
+	static int on = -1;
+	static volatile SInt32 nseen;
+	static struct { u_long com; uint32_t type; int error; } seen[120];
+	if (on < 0) {
+		int v = 1;
+		(void)PE_parse_boot_argn("op2wifid", &v, sizeof(v));
+		on = v;
+	}
+	if (!on || nseen >= 120) {
+		return;
+	}
+	char name[32];
+	proc_selfname(name, sizeof(name));
+	if (strncmp(name, "wifid", 6) != 0) {
+		return;
+	}
+	char grp = (char)IOCGROUP(com), ifn[17] = "", file[48];
+	uint32_t w[3] = { 0, 0, 0 };
+	u_int have = MIN(size, 28u), at = 0;
+	if (grp == 'i' && have >= 16) {   /* an interface request: struct ifreq / apple80211req start with the name */
+		for (int i = 0; i < 16 && req[i] != 0; i++) {
+			ifn[i] = (req[i] >= 0x20 && req[i] < 0x7f) ? (char)req[i] : '?';
+		}
+		at = 16;
+	}
+	for (int i = 0; i < 3 && at + 4u * (u_int)i + 4u <= have; i++) {
+		memcpy(&w[i], req + at + 4 * i, 4);
+	}
+	for (int i = 0; i < nseen && i < 120; i++) {
+		if (seen[i].com == com && seen[i].type == w[0] && seen[i].error == error) {
+			return;
+		}
+	}
+	SInt32 k = OSIncrementAtomic(&nseen);
+	if (k >= 120) {
+		return;
+	}
+	seen[k].com = com;
+	seen[k].type = w[0];
+	seen[k].error = error;
+	if (ftype == DTYPE_SOCKET) {
+		snprintf(file, sizeof(file), "socket (family %d)", fam);
+	} else if (ftype == DTYPE_VNODE) {
+		snprintf(file, sizeof(file), "file %.30s", vname[0] ? vname : "?");
+	} else {
+		snprintf(file, sizeof(file), "fd type %d", ftype);
+	}
+	op2_keep("OP2 WIFID: ioctl on %s: 0x%08lx ('%c' %lu, %u bytes)%s%s words %u %u %u -> error %d", file, com,
+	    (grp >= 0x20 && grp < 0x7f) ? grp : '?', (unsigned long)(com & 0xff), size, ifn[0] ? " interface " : "", ifn,
+	    w[0], w[1], w[2], error);
+}
+#endif
+
 /*
  * Ioctl system call
  *
@@ -789,6 +856,11 @@ ioctl(struct proc *p, struct ioctl_args *uap, __unused int32_t *retval)
 	int error = 0;
 	u_int size = 0;
 	caddr_t datap = NULL, memp = NULL;
+#if defined(ARM64_BOARD_CONFIG_MSM8994)
+	uint8_t op2req[28] = { 0 };   /* wifid's ioctls: op2_wifid_ioctl */
+	int op2ftype = -1, op2fam = -1;
+	char op2vname[32] = "";
+#endif
 	boolean_t is64bit = FALSE;
 	int tmp = 0;
 #define STK_PARAMS      128
@@ -854,6 +926,11 @@ ioctl(struct proc *p, struct ioctl_args *uap, __unused int32_t *retval)
 		}
 	}
 
+#if defined(ARM64_BOARD_CONFIG_MSM8994)
+	if (com & IOC_IN) {
+		bcopy(datap, op2req, MIN(size, (u_int)sizeof(op2req)));
+	}
+#endif
 	proc_fdlock(p);
 	error = fp_lookup(p, fd, &fp, 1);
 	if (error) {
@@ -862,6 +939,18 @@ ioctl(struct proc *p, struct ioctl_args *uap, __unused int32_t *retval)
 	}
 
 	AUDIT_ARG(file, p, fp);
+#if defined(ARM64_BOARD_CONFIG_MSM8994)
+	op2ftype = FILEGLOB_DTYPE(fp->f_fglob);
+	if (op2ftype == DTYPE_SOCKET) {
+		op2fam = SOCK_DOM((struct socket *)fp->f_data);
+	} else if (op2ftype == DTYPE_VNODE) {
+		const char *vn = vnode_getname((vnode_t)fp->f_data);
+		if (vn != NULL) {
+			strlcpy(op2vname, vn, sizeof(op2vname));
+			vnode_putname(vn);
+		}
+	}
+#endif
 
 	if ((fp->f_flag & (FREAD | FWRITE)) == 0) {
 		error = EBADF;
@@ -953,6 +1042,11 @@ out:
 	proc_fdunlock(p);
 
 out_nofp:
+#if defined(ARM64_BOARD_CONFIG_MSM8994)
+	if (op2ftype != -1 || error != 0) {
+		op2_wifid_ioctl(op2ftype, op2fam, op2vname, com, op2req, size, error);
+	}
+#endif
 	if (memp) {
 		kfree(memp, size);
 	}

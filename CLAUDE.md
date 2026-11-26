@@ -65,6 +65,10 @@ delegation refusals (dasd) and code-signing "allowing" page notes not logged at 
   per-network settings in the networks file (auto=0 ip= mask= router= dns=a,b,c dnsauto=0 search=): manual IPv4 rides on
   "join ... static <ip> <mask> <router> <dns>" (8 hex each; step 7 skips DHCP), DNS/search go to configd via
   op2_publish.h's publish_state.dns_list/search (op2shell leaves them empty = old behaviour).
+  Status-bar Wi-Fi icon / Settings Wi-Fi (plan: make Apple's wifid see a Wi-Fi device, never patch SpringBoard): S0 =
+  trace what wifid asks for, kept log lines "OP2 WIFID:" (boot-arg op2wifid=0 off): its IOKit matching, notifications,
+  registry paths and opens (IOUserClient.cpp op2_iolog, own 150-line budget) and each distinct ioctl with interface
+  name + Apple80211 request words (sys_generic.c op2_wifid_ioctl, 120 max).
   The clock now syncs over the network (NTP), which fixes the old TLS-date problem while connected.
   Firmware blobs + generated headers stay out of git. Before a phone round: bash tools/wifi-sim/run.sh (simulated chip + OpenSSL access point, 38 scenarios)
   and tools/wifi-sim/kcheck.sh (XNU warning flags).
