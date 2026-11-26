@@ -32,6 +32,15 @@
  * Runs in its own kernel thread 120 s after the framebuffer starts (RPM is up by then, the UI is running),
  * and repeats a one-line summary every 60 s so it survives in the ramoops ring.
  *
+ * Boot-arg bt (Bluetooth: the same chip over a UART, BLSP2 UART2 at 0xf995e000 = Linux's ttyHS0, pins 45-48;
+ * reset = PM8994 GPIO 19; supplies bt_vreg, S4, L30 as Wi-Fi), run first in the same thread, lines "OP2 BT:":
+ *   0  (default) nothing
+ *   1  read-only probe: the UART pins, the reset line, the supplies, the UART's clocks (its registers only if
+ *      they run: an unclocked UART hangs the bus)
+ *   2  step 1: supplies on, then the reset line low, then high, and watch the chip's side of the UART on the
+ *      pins (as plain inputs): its TX (our RX, pin 46) goes high (idle) and its RTS (our CTS, pin 47) low (ready)
+ *      when it comes out of reset. No UART clock, no data: success is one line. The chip is put back in reset.
+ *
  * Sequence and values from the OnePlus msm8994 kernel (OnePlus2_14_A.12_160226):
  *   drivers/pci/host/pci-msm.c       msm_pcie_enable(), pcie_phy_init() (20nm QMP, 19.2 MHz),
  *                                    msm_pcie_iatu_config(), msm_pcie_vreg_info
@@ -109,9 +118,27 @@ extern "C" void op2_wifi_start(void);   /* called from op2_threaddump_start (osf
 #define PIN_BOOTSTRAP   112
 #define PIN_WLAN_EN     113
 
+/* ---- Bluetooth (live.dts bt_qca6174, uart@f995e000 = blsp2_uart2, gcc-msm8994.c) ---- */
+#define PIN_BT_TX       45        /* blsp2_uart2_active: pins 45-48, function 2 (TX, RX, CTS, RFR) */
+#define PIN_BT_RX       46
+#define PIN_BT_CTS      47
+#define PIN_BT_RFR      48
+#define GCC_BLSP2_AHB_CBCR        0x0944   /* voted: APCS_CLOCK_BRANCH_ENA_VOTE bit 15 */
+#define GCC_APCS_BRANCH_VOTE      0x1484
+#define GCC_BLSP2_UART2_APPS_CBCR 0x0A44
+#define GCC_BLSP2_UART2_CMD_RCGR  0x0A4C   /* CMD, CFG, M, N, D */
+#define W_BTUART_PHYS   0xf995e000ULL       /* UART_DM v1.4 (msm_serial_hs) */
+#define UDM_MR1         0x00
+#define UDM_MR2         0x04
+#define UDM_TXFS        0x4C
+#define UDM_RXFS        0x50
+#define UDM_SR          0xA4
+#define UDM_ISR         0xB4
+
 /* ---- PM8994 (SPMI SID 0) ---- */
 #define PM_SID          0
 #define PMGPIO9_BASE    0xC800    /* bt_vreg: regulator-fixed, gpio = <&pm8994_gpios 9>, active high */
+#define PMGPIO19_BASE   0xD200    /* bt_qca6174 qca,bt-reset-gpio: low = in reset; mode 1, vin-sel 2, invert 0 */
 #define PMLDO(n)        ((uint16_t)(0x4000 + ((n) - 1) * 0x100))
 #define PM_STATUS1      0x08
 #define PM_MODE_CTL     0x40
@@ -147,11 +174,12 @@ extern "C" void op2_wifi_start(void);   /* called from op2_threaddump_start (osf
 #define PHY_PCS_STATUS       0x728    /* bit 6 set = PHY not ready */
 
 static volatile uint32_t *gGcc, *gTlmm, *gParf, *gPhy, *gDbi, *gConf, *gBar0;
-static uint32_t gMode;
+static uint32_t gMode, gBtMode;
 static char gSummary[320] = "not run";
 
 #define W_LOG(fmt, ...) do { IOLog("OP2 WIFI: " fmt "\n", __VA_ARGS__); op2_keep("OP2 WIFI: " fmt, __VA_ARGS__); } while (0)
 #define W_LOG_CONSOLE(fmt, ...) IOLog("OP2 WIFI: " fmt "\n", __VA_ARGS__)   /* console only */
+#define B_LOG(fmt, ...) do { IOLog("OP2 BT: " fmt "\n", __VA_ARGS__); op2_keep("OP2 BT: " fmt, __VA_ARGS__); } while (0)
 
 static inline uint32_t rd(volatile uint32_t *b, uint32_t off) { return b[off / 4]; }
 static inline void wr(volatile uint32_t *b, uint32_t off, uint32_t v)
@@ -649,6 +677,199 @@ step2b(void)
 
 /* ---------------------------------------------------------------------------------------------------- */
 
+/* bt_vreg (PM8994 GPIO 9, the chip's vdd-wlan / vdd-bt-pa) high; NULL, or why not. Shared by Wi-Fi and Bluetooth. */
+static const char *
+bt_vreg_on(bool bt)
+{
+	uint8_t mode = 0, en = 0, out = 0;
+	if (!op2_spmi_read(PM_SID, PMGPIO9_BASE + PM_MODE_CTL, &mode, 1) ||
+	    !op2_spmi_read(PM_SID, PMGPIO9_BASE + PM_EN_CTL, &en, 1) ||
+	    !op2_spmi_read(PM_SID, PMGPIO9_BASE + PM_DIG_OUT_CTL, &out, 1)) {
+		return "FAIL: SPMI read of PM8994 GPIO 9 (bt_vreg); is OP2Battery running?";
+	}
+	if (mode != 0x11 || !(en & 0x80)) {
+		/* qpnp-pin: MODE_CTL = mode 1 (digital out) << 4 | source 0 (constant) << 1 | invert 1 -> high */
+		uint8_t m = 0x11, e = 0x80, o = (uint8_t)((out & 0x30) | ((out & 3) ? (out & 3) : 2));
+		bool ok = op2_spmi_write(PM_SID, PMGPIO9_BASE + PM_DIG_OUT_CTL, &o, 1) &&
+		    op2_spmi_write(PM_SID, PMGPIO9_BASE + PM_MODE_CTL, &m, 1) &&
+		    op2_spmi_write(PM_SID, PMGPIO9_BASE + PM_EN_CTL, &e, 1);
+		if (bt) {
+			B_LOG("bt_vreg (PM GPIO 9): was mode %02x en %02x out %02x, set high: %s", mode, en, out, ok ? "ok" : "FAILED");
+		} else {
+			W_LOG("bt_vreg (PM GPIO 9): was mode %02x en %02x out %02x, set high: %s", mode, en, out, ok ? "ok" : "FAILED");
+		}
+		if (!ok) {
+			return "FAIL: SPMI write to PM8994 GPIO 9 (bt_vreg)";
+		}
+		IOSleep(5);   /* regulator-fixed startup-delay-us = 4000 */
+	} else if (bt) {
+		B_LOG("%s", "bt_vreg (PM GPIO 9) already high");
+	} else {
+		W_LOG("%s", "bt_vreg (PM GPIO 9) already high");
+	}
+	return NULL;
+}
+
+/* ---------------------------------------------------------------------------------------------------- */
+/* Bluetooth (boot-arg bt): see the top of the file                                                      */
+
+static char gBtSummary[240] = "not run";
+
+static void
+bt_summary(const char *s)
+{
+	strlcpy(gBtSummary, s, sizeof(gBtSummary));
+	B_LOG("RESULT: %s", gBtSummary);
+}
+
+static void
+bt_pin(const char *name, uint32_t p)
+{
+	uint32_t cfg = rd(gTlmm, TLMM_CFG(p)), io = rd(gTlmm, TLMM_IO(p));
+	B_LOG("pin %u %-4s cfg=0x%03x (func %u drv %u pull %u oe %u) in=%u out=%u", p, name, cfg,
+	    (cfg >> 2) & 0xf, (cfg >> 6) & 7, cfg & 3, (cfg >> 9) & 1, io & 1, (io >> 1) & 1);
+}
+
+static void
+bt_pmic(const char *name, uint16_t base)
+{
+	uint8_t st = 0, mode = 0, vin = 0, out = 0, en = 0;
+	bool ok = op2_spmi_read(PM_SID, (uint16_t)(base + PM_STATUS1), &st, 1) &&
+	    op2_spmi_read(PM_SID, (uint16_t)(base + PM_MODE_CTL), &mode, 1) &&
+	    op2_spmi_read(PM_SID, (uint16_t)(base + PM_DIG_VIN_CTL), &vin, 1) &&
+	    op2_spmi_read(PM_SID, (uint16_t)(base + PM_DIG_OUT_CTL), &out, 1) &&
+	    op2_spmi_read(PM_SID, (uint16_t)(base + PM_EN_CTL), &en, 1);
+	if (!ok) {
+		B_LOG("pmic %-8s 0x%04x: SPMI read failed", name, base);
+		return;
+	}
+	B_LOG("pmic %-8s 0x%04x: status1 %02x mode %02x vin %02x out %02x en %02x", name, base, st, mode, vin, out, en);
+}
+
+static bool
+bt_uart_clocked(void)
+{
+	return !(rd(gGcc, GCC_BLSP2_AHB_CBCR) & CBCR_OFF) && !(rd(gGcc, GCC_BLSP2_UART2_APPS_CBCR) & CBCR_OFF);
+}
+
+static void
+bt_dump(const char *when)
+{
+	bt_pin("tx", PIN_BT_TX);
+	bt_pin("rx", PIN_BT_RX);
+	bt_pin("cts", PIN_BT_CTS);
+	bt_pin("rfr", PIN_BT_RFR);
+	bt_pmic("bt_reset", PMGPIO19_BASE);
+	bt_pmic("bt_vreg", PMGPIO9_BASE);
+	bt_pmic("L30", PMLDO(30));
+	uint32_t r = GCC_BLSP2_UART2_CMD_RCGR;
+	B_LOG("%s: clocks: blsp2 ahb %08x (vote %s), uart2 apps %08x, rcg cmd %08x cfg %08x m %08x n %08x d %08x", when,
+	    rd(gGcc, GCC_BLSP2_AHB_CBCR), (rd(gGcc, GCC_APCS_BRANCH_VOTE) & (1u << 15)) ? "on" : "off",
+	    rd(gGcc, GCC_BLSP2_UART2_APPS_CBCR), rd(gGcc, r), rd(gGcc, r + 4), rd(gGcc, r + 8), rd(gGcc, r + 12),
+	    rd(gGcc, r + 16));
+	if (!bt_uart_clocked()) {
+		B_LOG("%s: the UART's clocks are off: its registers not read", when);
+		return;
+	}
+	volatile uint32_t *u = (volatile uint32_t *)ml_io_map(W_BTUART_PHYS, 0x1000);
+	if (u == NULL) {
+		B_LOG("%s: ml_io_map of the UART failed", when);
+		return;
+	}
+	B_LOG("%s: uart: mr1 %08x mr2 %08x sr %08x isr %08x txfs %08x rxfs %08x", when, rd(u, UDM_MR1), rd(u, UDM_MR2),
+	    rd(u, UDM_SR), rd(u, UDM_ISR), rd(u, UDM_TXFS), rd(u, UDM_RXFS));
+}
+
+/* PM8994 GPIO 19: Bluetooth reset (low = held in reset). Digital output, vin 2 as the OnePlus kernel sets it. */
+static bool
+bt_reset_line(bool run)
+{
+	uint8_t vin = 0, out = 0;
+	if (!op2_spmi_read(PM_SID, PMGPIO19_BASE + PM_DIG_VIN_CTL, &vin, 1) ||
+	    !op2_spmi_read(PM_SID, PMGPIO19_BASE + PM_DIG_OUT_CTL, &out, 1)) {
+		return false;
+	}
+	uint8_t v = 2, o = (uint8_t)((out & 0x30) | ((out & 3) ? (out & 3) : 2)), m = run ? 0x11 : 0x10, e = 0x80;
+	return (vin == 2 || op2_spmi_write(PM_SID, PMGPIO19_BASE + PM_DIG_VIN_CTL, &v, 1)) &&
+	       (o == out || op2_spmi_write(PM_SID, PMGPIO19_BASE + PM_DIG_OUT_CTL, &o, 1)) &&
+	       op2_spmi_write(PM_SID, PMGPIO19_BASE + PM_MODE_CTL, &m, 1) &&
+	       op2_spmi_write(PM_SID, PMGPIO19_BASE + PM_EN_CTL, &e, 1);
+}
+
+/* a pin as a GPIO input; pull: 1 = down, 3 = up */
+static void
+pin_in(uint32_t p, uint32_t pull)
+{
+	wr(gTlmm, TLMM_CFG(p), (2u << 6) | (pull & 3));
+}
+
+static void
+bt_step1(void)
+{
+	char line[240];
+	/* 1. Supplies (bt_power.c: vdd-io S4 1.8 V always on, vdd-xtal L30 1.8 V, vdd-pa bt_vreg). */
+	if (!ldo_on(30, 1800000, 0)) {
+		bt_summary("FAIL: RPM did not ack L30 (vdd-bt-xtal)");
+		return;
+	}
+	const char *why = bt_vreg_on(true);
+	if (why != NULL) {
+		bt_summary(why);
+		return;
+	}
+	/* 2. Our side of the UART as plain pins: TX idle high, RFR low (the chip may send); RX pulled down and CTS pulled
+	 *    up, so the chip driving its TX high (idle) and its RTS low (ready) shows as a change on each. */
+	pin_out(PIN_BT_TX, 1, true);
+	pin_out(PIN_BT_RFR, 1, false);
+	pin_in(PIN_BT_RX, 1);
+	pin_in(PIN_BT_CTS, 3);
+	/* 3. Reset: low for 50 ms, look at the lines, then high and watch them for 1 s. */
+	if (!bt_reset_line(false)) {
+		bt_summary("FAIL: SPMI access to PM8994 GPIO 19 (Bluetooth reset)");
+		return;
+	}
+	IOSleep(50);
+	uint32_t rx0 = rd(gTlmm, TLMM_IO(PIN_BT_RX)) & 1, cts0 = rd(gTlmm, TLMM_IO(PIN_BT_CTS)) & 1;
+	B_LOG("in reset: rx %u cts %u (expected: rx 0, cts 1, from the pulls)", rx0, cts0);
+	if (!bt_reset_line(true)) {
+		bt_summary("FAIL: SPMI write to PM8994 GPIO 19 (Bluetooth reset)");
+		return;
+	}
+	uint64_t t0;
+	clock_get_uptime(&t0);
+	int rx_ms = -1, cts_ms = -1;
+	uint32_t rx = rx0, cts = cts0, rx_changes = 0;
+	for (int ms = 0; ms < 1000; ms++) {
+		uint32_t r = rd(gTlmm, TLMM_IO(PIN_BT_RX)) & 1, c = rd(gTlmm, TLMM_IO(PIN_BT_CTS)) & 1;
+		if (r != rx) {
+			rx_changes++;
+			rx = r;
+		}
+		if (rx_ms < 0 && r == 1) {
+			rx_ms = ms;
+		}
+		if (cts_ms < 0 && c == 0) {
+			cts_ms = ms;
+		}
+		cts = c;
+		IODelay(1000);
+	}
+	B_LOG("out of reset: rx %u (high after %d ms, %u changes: a byte from the chip shows as changes), cts %u (low after "
+	    "%d ms)", rx, rx_ms, rx_changes, cts, cts_ms);
+	bt_dump("after");
+	/* 4. Back in reset until the next step needs it. */
+	(void)bt_reset_line(false);
+	if (rx_ms >= 0 || cts_ms >= 0) {
+		snprintf(line, sizeof(line), "BT STEP 1 PASS: the chip came out of reset: its TX %s, its RTS %s (pins 46/47 as "
+		    "inputs); held in reset again", rx_ms >= 0 ? "went high (idle)" : "stayed low",
+		    cts_ms >= 0 ? "went low (ready)" : "stayed high");
+	} else {
+		snprintf(line, sizeof(line), "BT STEP 1 FAIL: no sign of the chip on the UART pins in 1 s after reset (rx %u, cts "
+		    "%u): reset line, supplies or pin order?", rx, cts);
+	}
+	bt_summary(line);
+}
+
 static void
 bringup(void)
 {
@@ -664,27 +885,10 @@ bringup(void)
 		summary("FAIL: RPM did not ack L30 (vdd-wlan-xtal)");
 		return;
 	}
-	uint8_t mode = 0, en = 0, out = 0;
-	if (!op2_spmi_read(PM_SID, PMGPIO9_BASE + PM_MODE_CTL, &mode, 1) ||
-	    !op2_spmi_read(PM_SID, PMGPIO9_BASE + PM_EN_CTL, &en, 1) ||
-	    !op2_spmi_read(PM_SID, PMGPIO9_BASE + PM_DIG_OUT_CTL, &out, 1)) {
-		summary("FAIL: SPMI read of PM8994 GPIO 9 (bt_vreg); is OP2Battery running?");
+	const char *why = bt_vreg_on(false);
+	if (why != NULL) {
+		summary(why);
 		return;
-	}
-	if (mode != 0x11 || !(en & 0x80)) {
-		/* qpnp-pin: MODE_CTL = mode 1 (digital out) << 4 | source 0 (constant) << 1 | invert 1 -> high */
-		uint8_t m = 0x11, e = 0x80, o = (uint8_t)((out & 0x30) | ((out & 3) ? (out & 3) : 2));
-		bool ok = op2_spmi_write(PM_SID, PMGPIO9_BASE + PM_DIG_OUT_CTL, &o, 1) &&
-		    op2_spmi_write(PM_SID, PMGPIO9_BASE + PM_MODE_CTL, &m, 1) &&
-		    op2_spmi_write(PM_SID, PMGPIO9_BASE + PM_EN_CTL, &e, 1);
-		W_LOG("bt_vreg (PM GPIO 9): was mode %02x en %02x out %02x, set high: %s", mode, en, out, ok ? "ok" : "FAILED");
-		if (!ok) {
-			summary("FAIL: SPMI write to PM8994 GPIO 9 (bt_vreg)");
-			return;
-		}
-		IOSleep(5);   /* regulator-fixed startup-delay-us = 4000 */
-	} else {
-		W_LOG("%s", "bt_vreg (PM GPIO 9) already high");
 	}
 	IOSleep(2);
 	pin_out(PIN_BOOTSTRAP, 7, true);
@@ -827,7 +1031,18 @@ wifi_thread(__unused void *param, __unused wait_result_t wr_)
 	gPhy = (volatile uint32_t *)ml_io_map(W_PHY_PHYS, 0x1000);
 	gDbi = (volatile uint32_t *)ml_io_map(W_DBI_PHYS, 0x1000);
 	gConf = (volatile uint32_t *)ml_io_map(W_CONF_PHYS, 0x1000);
-	if (!gGcc || !gTlmm || !gParf || !gPhy || !gDbi || !gConf) {
+	if (gGcc && gTlmm && gBtMode >= 1) {
+		B_LOG("mode %u (%s)", gBtMode, gBtMode == 1 ? "read-only probe" : "step 1: out of reset, the UART lines");
+		bt_dump("before");
+		if (gBtMode >= 2) {
+			bt_step1();
+		} else {
+			bt_summary("probe only (bt=1): states above; bt=2 takes the chip out of reset");
+		}
+	}
+	if (gMode == 0) {
+		/* Bluetooth only */
+	} else if (!gGcc || !gTlmm || !gParf || !gPhy || !gDbi || !gConf) {
 		summary("FAIL: ml_io_map");
 	} else {
 		W_LOG("mode %u (%s)", gMode, gMode == 1 ? "read-only probe" : gMode == 2 ? "step 1 (power, link)" :
@@ -846,23 +1061,30 @@ wifi_thread(__unused void *param, __unused wait_result_t wr_)
 	}
 	for (;;) {
 		IOSleep(60000);
-		W_LOG_CONSOLE("RESULT (repeat): %s", gSummary);
+		if (gMode != 0) {
+			W_LOG_CONSOLE("RESULT (repeat): %s", gSummary);
+		}
+		if (gBtMode != 0) {
+			IOLog("OP2 BT: RESULT (repeat): %s\n", gBtSummary);
+		}
 	}
 }
 
 extern "C" void
 op2_wifi_start(void)
 {
-	uint32_t mode = 0;
+	uint32_t mode = 0, bt = 0;
 	PE_parse_boot_argn("wifi", &mode, sizeof(mode));
-	if (mode == 0) {
+	PE_parse_boot_argn("bt", &bt, sizeof(bt));
+	if (mode == 0 && bt == 0) {
 		return;
 	}
 	gMode = mode;
+	gBtMode = bt;
 	thread_t th;
 	if (kernel_thread_start(wifi_thread, NULL, &th) == KERN_SUCCESS) {
 		thread_deallocate(th);
-		IOLog("OP2 WIFI: armed, mode %u, runs 120 s from now\n", mode);
+		IOLog("OP2 WIFI: armed, wifi=%u bt=%u, runs 120 s from now (Bluetooth first)\n", mode, bt);
 	}
 }
 

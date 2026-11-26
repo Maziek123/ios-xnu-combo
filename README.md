@@ -25,8 +25,9 @@ clone it to `xnu/xnu-4903.270.47` inside this checkout.
 | Battery | `OP2Battery` (PMI8994 fuel gauge → `IOPMPowerSource`) is in the kernel; not yet checked against a meter | kernel source |
 | **Internet over USB** | Through the Mac's NAT: configd makes `ue0` primary, DNS + HTTP verified from the phone ([setup](docs/SETUP.md)) | `op2net example.com` → `200 OK` |
 | Safari | Loads sites over HTTPS with JavaScript (JIT on): Google, Wikipedia, YouTube, apple.com (heavy sites still rough) | photos on the phone |
-| **Wi-Fi (QCA6174 on PCIe)** | **iOS uses it: Safari loads google.com over Wi-Fi** (an iPhone hotspot). Scan, join, WPA2, DHCP, then `wl0`, a network interface iOS routes through (about 1 MB in the first minute), all encrypted by the chip. Still slow 802.11g rates, polled, no reconnecting yet ([below](#wi-fi-bring-up-step-by-step)) | `OP2 WIFI: 8: STEP 8 PASS` and `op2netd: wl0 published` (boot-arg `wifi=11`) |
-| Not working yet | Wi-Fi as a network for iOS (no interface yet), Bluetooth, RTC (clock does not keep time) | [docs/NEXT-PLAN.md](docs/NEXT-PLAN.md) |
+| **Wi-Fi (QCA6174 on PCIe)** | **iOS uses it: Safari over Wi-Fi**, networks chosen on the phone (`wifi=12`, a page at `http://127.0.0.1:8080`: join, details, per-network IPv4/DNS settings); fast.com 8 Mbit/s down, 21 up. Scan, join, WPA2, DHCP, then `wl0`, a network interface iOS routes through, all encrypted by the chip. Still 802.11g rates, polled; no status-bar icon yet ([below](#wi-fi-bring-up-step-by-step)) | `OP2 WIFI: 8: STEP 8 PASS` and `op2netd: wl0 published` |
+| Bluetooth (same chip, over a UART) | Step 1 written, not run yet: the chip out of reset, seen on the UART pins (`bt=2`, [below](#bluetooth-bring-up)) | `OP2 BT: RESULT` |
+| Not working yet | Bluetooth beyond step 1, the Wi-Fi icon and Settings' Wi-Fi switch (iOS's own `wifid` sees no Wi-Fi hardware), RTC (clock does not keep time) | [docs/NEXT-PLAN.md](docs/NEXT-PLAN.md) |
 | Known issues | brief pale/partial frames while scrolling; logd SIGBUS/SIGSEGV loop, Spotlight extensions SIGABRT loop, occasional SpringBoard SIGSEGV | [CLAUDE.md](CLAUDE.md) |
 
 Between 2026-11-14 and 11-16 another AI agent worked on this tree. Its SpringBoard injection (a 2048 game inside
@@ -239,6 +240,21 @@ The plan is to have the kernel answer it as that driver would (never patching Sp
 what `wifid` asks the kernel for, in the kept log as `OP2 WIFID:` lines: the IOKit classes and paths it looks up or
 waits for, what it opens, and each distinct ioctl (the interface name, Apple80211's request words, the answer).
 Boot-arg `op2wifid=0` turns it off.
+
+### Bluetooth bring-up
+
+The QCA6174's Bluetooth side is not on PCIe: it talks HCI over a UART, BLSP2 UART2 at `0xf995e000` (Linux's
+`ttyHS0`), pins 45-48 (TX, RX, CTS, RFR, function 2); reset = PM8994 GPIO 19 (low = in reset); supplies as Wi-Fi
+(`bt_vreg`, S4, L30). Boot-arg `bt=N`, run first in the Wi-Fi thread (120 s after boot), lines `OP2 BT:`, also in the
+kept log; works with or without `wifi=`.
+
+| Step | `bt=` | What it does | State |
+|---|---|---|---|
+| probe | 1 | Reads the pins, the reset line, the supplies and the UART's clocks (its registers only if those run) | not run yet |
+| **1** out of reset | 2 | Supplies on; RX and CTS as plain inputs (pulled down / up); reset low 50 ms, then high, watching 1 s for the chip's TX going high (idle) and its RTS going low (ready); back in reset | not run yet |
+
+Next: the UART clocked (BLSP2 UART2 clock source, 115200 baud), HCI reset and the chip's version, then Qualcomm's
+patch and configuration download, then scanning; the phone's own page (op2netd) for pairing, as for Wi-Fi.
 
 ---
 

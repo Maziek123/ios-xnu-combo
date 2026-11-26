@@ -69,6 +69,10 @@ delegation refusals (dasd) and code-signing "allowing" page notes not logged at 
   trace what wifid asks for, kept log lines "OP2 WIFID:" (boot-arg op2wifid=0 off): its IOKit matching, notifications,
   registry paths and opens (IOUserClient.cpp op2_iolog, own 150-line budget) and each distinct ioctl with interface
   name + Apple80211 request words (sys_generic.c op2_wifid_ioctl, 120 max).
+  Bluetooth (2026-11-26, not run yet): OP2Wifi.cpp, boot-arg bt=1 probe / bt=2 step 1 (out of reset, chip seen on the
+  UART pins), run before Wi-Fi in the same thread, "OP2 BT:" lines. UART = BLSP2 UART2 0xf995e000 (ttyHS0), pins 45-48
+  TX/RX/CTS/RFR func 2, GCC blsp2 ahb 0x0944 (vote 0x1484 bit 15), uart2 apps CBCR 0x0a44, RCG 0x0a4c; reset PM8994
+  GPIO 19 (0xd200, mode 0x10 low / 0x11 high, vin 2). Plan: own HCI driver + op2netd page; iOS bluetoothd not used.
   The clock now syncs over the network (NTP), which fixes the old TLS-date problem while connected.
   Firmware blobs + generated headers stay out of git. Before a phone round: bash tools/wifi-sim/run.sh (simulated chip + OpenSSL access point, 38 scenarios)
   and tools/wifi-sim/kcheck.sh (XNU warning flags).
