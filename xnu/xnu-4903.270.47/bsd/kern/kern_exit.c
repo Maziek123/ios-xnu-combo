@@ -952,7 +952,9 @@ exit_with_reason(proc_t p, int rv, int *retval, boolean_t thread_can_terminate, 
 		/* printf, not kprintf: kprintf only reaches ramoops with serial=3,
 		 * which the boot line dropped, so every crash went unlogged.
 		 * Clean exits (sig 0, status 0) stay quiet. */
-		if (!op2_crash_quiet && (WTERMSIG(rv) != 0 || WEXITSTATUS(rv) != 0)) {
+		extern int op2_quiet(void);
+		/* quiet (boot-arg op2quiet, default on): a signal's exit is told once, by PROC_EXIT_CRASH below */
+		if (!op2_crash_quiet && (WTERMSIG(rv) != 0 || WEXITSTATUS(rv) != 0) && !(op2_quiet() && WTERMSIG(rv) != 0)) {
 			printf("PROC_EXIT: pid=%d[%s] rv=0x%x (sig %d, exit %d) reason_ns=%u code=0x%llx\n",
 			        p->p_pid, p->p_comm, rv, WTERMSIG(rv), WEXITSTATUS(rv),
 			        exit_reason ? exit_reason->osr_namespace : 0,
@@ -974,7 +976,9 @@ exit_with_reason(proc_t p, int rv, int *retval, boolean_t thread_can_terminate, 
 #if defined(ARM64_BOARD_CONFIG_MSM8994)
 		if (WTERMSIG(rv) != 0) {
 			extern void op2_log_user_state(const char *prefix, int pid, const char *comm);
-			op2_log_user_state("PROC_EXIT_CRASH", p->p_pid, p->p_comm);
+			char op2_pfx[40];
+			snprintf(op2_pfx, sizeof(op2_pfx), "PROC_EXIT_CRASH (sig %d)", WTERMSIG(rv));
+			op2_log_user_state(op2_pfx, p->p_pid, p->p_comm);
 		}
 		op2_exit_ring_record(p->p_pid, p->p_comm, WTERMSIG(rv),
 		    WEXITSTATUS(rv));

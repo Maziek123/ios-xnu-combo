@@ -18,7 +18,12 @@ claims were wrong ("0 crashes", "verified" milestones driven by a scripted fake 
     logs/last-summary.txt, logs/daily-*.log   # results
     bash tools/rootfs-journal.sh   # rebuild + flash journaled rootfs from out/ios12-userdata-fixA.dmg
 Build errors land in logs/last-build-errors.txt. kprintf does NOT reach ramoops (no serial=3);
-use printf/IOLog for anything you need to see.
+use printf/IOLog for anything you need to see. Kept log (2026-11-26, bsd/dev/op2_keeplog.c): op2_keep(fmt, ...) / sysctl
+kern.op2keep put important lines in the first ramoops record zone below the console (found by its DBGC header),
+safe from console floods; TWRP: /sys/fs/pstore/dmesg-ramoops-0 (pmsg-ramoops-0 fallback). Wi-Fi A_LOG/W_LOG, op2_wlan,
+OP2 SHELL and op2netd lines go there; op2keep=0 off. Boot-arg op2quiet (default ON, sleh.c op2_quiet()): NECP
+delegation refusals (dasd) and code-signing "allowing" page notes not logged at all; crashes one PROC_EXIT_CRASH line,
+3 per name; op2quiet=0 restores all.
 
 ## State (2026-11-17; see docs/SETUP.md for replication, docs/USB-CONSOLE-PLAN.md stages 2-3)
 - Quad-core SMP (cpus=4); thermal thread: TSENS, throttle at 70 C, cutoff 90 C (~768 MHz at low 60s C).

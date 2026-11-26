@@ -369,6 +369,7 @@ op2_wlan_up(uint32_t ip, uint32_t mask, uint32_t router, uint32_t dns)
 
 extern "C" void op2_wlan_down(void) { assert(st.up); st.down = true; }
 extern "C" uint32_t op2_wlan_drops(void) { return 0; }
+extern "C" void op2_keep(const char *fmt, ...) { (void)fmt; }   /* the kept log: the sim has only its console */
 extern "C" void op2_shell_status(char *out, size_t n) { snprintf(out, n, "simulated; op2-air-run running (pid 1)"); }
 
 /* the Wi-Fi manager's sysctls (scenario 35): op2netd's side, scripted */

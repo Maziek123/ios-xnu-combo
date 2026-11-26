@@ -28,7 +28,10 @@ static int rdfile(const char *path, void *buf, size_t *len) {
 	FILE *f = fopen(path, "r"); if (!f) return -1; size_t n = fread(buf, 1, *len, f); fclose(f); *len = n; return 0; }
 int sysctlbyname(const char *name, void *old, size_t *oldlen, void *nw, size_t nwlen) {
 	char path[200]; snprintf(path, sizeof path, OP2NETD_TEST_DIR "/k/%s", name);
-	if (nw) { FILE *f = fopen(OP2NETD_TEST_DIR "/k/cmds", "a"); fprintf(f, "%s\n", (char *)nw); fclose(f); return 0; }
+	if (nw) {   /* the commands op2netd sends; the kept-log lines (kern.op2keep) are dropped */
+		if (strcmp(name, "net.op2wlan_cmd") == 0) { FILE *f = fopen(OP2NETD_TEST_DIR "/k/cmds", "a"); fprintf(f, "%s\n", (char *)nw); fclose(f); }
+		return 0;
+	}
 	return rdfile(path, old, oldlen);
 }
 int main(void) { run(); return 0; }

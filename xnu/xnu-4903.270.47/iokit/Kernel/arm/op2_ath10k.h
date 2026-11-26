@@ -40,6 +40,8 @@ extern "C" void op2_wlan_set_scan(const char *text);           /* sysctl net.op2
 extern "C" int op2_wlan_take_cmd(char *out, uint32_t n);       /* the newest net.op2wlan_cmd, once: 1, else 0 */
 /* bsd/kern/op2_shell_sync.c: what the boot-time op2shell check did, and whether op2-air-run (op2shell) runs */
 extern "C" void op2_shell_status(char *out, size_t n);
+/* bsd/dev/op2_keeplog.c: the line also into the kept log (a ramoops zone of its own, safe from console floods) */
+extern "C" void op2_keep(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
 /* Runs step 2b (and 2c, 3); writes the last step's one-line result ("STEP 2b PASS: ...", "STEP 3 FAIL: ...")
  * into result. */

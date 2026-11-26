@@ -31,6 +31,7 @@
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
@@ -38,13 +39,14 @@
 #define PUBLISHER "op2netd"
 
 static void
-say(const char *s)
+say(const char *s)   /* the console, and the kernel's kept log (kern.op2keep: safe from console floods) */
 {
 	int fd = open("/dev/console", O_WRONLY | O_NOCTTY);
 	if (fd >= 0) {
 		(void)write(fd, s, strlen(s));
 		close(fd);
 	}
+	(void)sysctlbyname("kern.op2keep", NULL, NULL, (void *)(uintptr_t)s, strlen(s) + 1);
 }
 
 #include "../op2shell/op2_publish.h"

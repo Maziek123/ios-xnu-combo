@@ -150,7 +150,8 @@ static volatile uint32_t *gGcc, *gTlmm, *gParf, *gPhy, *gDbi, *gConf, *gBar0;
 static uint32_t gMode;
 static char gSummary[320] = "not run";
 
-#define W_LOG(fmt, ...) IOLog("OP2 WIFI: " fmt "\n", __VA_ARGS__)   /* always >= 1 argument */
+#define W_LOG(fmt, ...) do { IOLog("OP2 WIFI: " fmt "\n", __VA_ARGS__); op2_keep("OP2 WIFI: " fmt, __VA_ARGS__); } while (0)
+#define W_LOG_CONSOLE(fmt, ...) IOLog("OP2 WIFI: " fmt "\n", __VA_ARGS__)   /* console only */
 
 static inline uint32_t rd(volatile uint32_t *b, uint32_t off) { return b[off / 4]; }
 static inline void wr(volatile uint32_t *b, uint32_t off, uint32_t v)
@@ -845,7 +846,7 @@ wifi_thread(__unused void *param, __unused wait_result_t wr_)
 	}
 	for (;;) {
 		IOSleep(60000);
-		W_LOG("RESULT (repeat): %s", gSummary);
+		W_LOG_CONSOLE("RESULT (repeat): %s", gSummary);
 	}
 }
 

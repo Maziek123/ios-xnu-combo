@@ -33,6 +33,8 @@
 #include <pexpert/pexpert.h>
 
 void op2_shell_sync(void);
+void op2_keep(const char *fmt, ...) __printflike(1, 2);   /* bsd/dev/op2_keeplog.c */
+#define KLOG(...) do { printf(__VA_ARGS__); op2_keep(__VA_ARGS__); } while (0)   /* console + the kept log */
 void op2_shell_status(char *out, size_t n);
 size_t op2_netd_redirect(char *path, size_t len, size_t cap);
 
@@ -136,7 +138,7 @@ sync_file(const char *what, const char *path, const unsigned char *blob, uint32_
 close:
 	(void)vnode_close(vp, FREAD | FWRITE, ctx);
 done:
-	printf("OP2 SHELL: %s\n", out);
+	KLOG("OP2 SHELL: %s\n", out);
 	return ok;
 }
 #endif
@@ -157,7 +159,7 @@ op2_shell_sync(void)
 		snprintf(shell_result, sizeof(shell_result), "op2shell_sync=0: /usr/local/bin/op2-air-run left as it is");
 	}
 #else
-	printf("OP2 SHELL: %s\n", shell_result);
+	KLOG("OP2 SHELL: %s\n", shell_result);
 #endif
 #ifdef OP2_NETD_BLOB_LEN
 	en = 1;
@@ -169,7 +171,7 @@ op2_shell_sync(void)
 		snprintf(netd_result, sizeof(netd_result), "op2netd=0: not installed, wifid starts as usual");
 	}
 #else
-	printf("OP2 SHELL: %s\n", netd_result);
+	KLOG("OP2 SHELL: %s\n", netd_result);
 #endif
 }
 
@@ -189,7 +191,7 @@ op2_netd_redirect(char *path, size_t len, size_t cap)
 	}
 	memcpy(path, NETD_TO, sizeof(NETD_TO));
 	if (netd_redirects++ < 4) {
-		printf("OP2 SHELL: %s starts " NETD_FROM ": " NETD_TO " first (it starts the real wifid itself)\n", me);
+		KLOG("OP2 SHELL: %s starts " NETD_FROM ": " NETD_TO " first (it starts the real wifid itself)\n", me);
 	}
 	return sizeof(NETD_TO);
 }

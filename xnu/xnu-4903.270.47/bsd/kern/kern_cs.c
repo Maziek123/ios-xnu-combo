@@ -275,6 +275,16 @@ cs_invalid_page(addr64_t vaddr, boolean_t *cs_killed)
 	csflags = p->p_csflags;
 	proc_unlock(p);
 
+#if defined(ARM64_BOARD_CONFIG_MSM8994)
+	/* boot-arg op2quiet (osfmk/arm64/sleh.c, default on): the "allowing (remove VALID)" notes are not logged at all
+	 * (SpringBoard, Preferences, ... keep making them: 8% of the console ring); denials and kills still are */
+	if (verbose && !cs_debug && !send_kill && retval == 0) {
+		extern int op2_quiet(void);
+		if (op2_quiet()) {
+			verbose = 0;
+		}
+	}
+#endif
 	if (verbose) {
 		printf("CODE SIGNING: cs_invalid_page(0x%llx): "
 		    "p=%d[%s] final status 0x%x, %s page%s\n",

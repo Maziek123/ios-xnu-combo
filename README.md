@@ -127,6 +127,21 @@ grep -a 'OP2 WIFI' op2-last-boot.log | grep -v 'RESULT (repeat)'
 
 The `RESULT:` line is the verdict; the lines before it show where a failing step stopped.
 
+The console ring holds only the last 256 KB, and a frozen screen or GPU timeouts can flood it within a minute. The
+important lines (every Wi-Fi line except the once-a-minute repeats, the Wi-Fi manager, op2netd, the kernel's helper
+checks) also go to a **kept log**: a ramoops zone of its own that nothing else writes under iOS
+(`bsd/dev/op2_keeplog.c`, each line with the time since boot). In TWRP:
+
+```bash
+adb shell ls /sys/fs/pstore                   # dmesg-ramoops-0 (or pmsg-ramoops-0 when there is no record zone)
+adb pull /sys/fs/pstore/dmesg-ramoops-0 ./op2-kept.log
+```
+
+The console ring itself is kept quieter by boot-arg `op2quiet` (on by default, no need to set it; `op2quiet=0` shows everything): in a 2026-11-26 log 61% of the ring was NECP delegation refusals (mostly `dasd`), 8% code-signing page notes and about 17% three lines per crash. Quiet, the first two are not logged at all, and a crash is one line (`PROC_EXIT_CRASH (sig N): pid, name, registers`; 3 per process name instead of 24). FB, Wi-Fi, thermal, touch (`OP2I2C`), AKS and the other `OP2` lines are unchanged.
+
+It holds this boot's lines only (emptied at the first line of each boot). The console says where it went, early in the
+boot: `OP2 KEEP: important lines also go to the ramoops zone at ...`. Boot-arg `op2keep=0` turns it off.
+
 #### Testing step 8 (Wi-Fi for iOS)
 
 `wifi=11` stays connected, so there is no final `RESULT:` line while it runs: look for `STEP 8 PASS: wl0 up with ...`

@@ -32,6 +32,8 @@
 #include <netinet/in.h>
 
 int op2_wlan_attach(const uint8_t mac[6]);
+void op2_keep(const char *fmt, ...) __printflike(1, 2);   /* bsd/dev/op2_keeplog.c */
+#define KLOG(...) do { printf(__VA_ARGS__); op2_keep(__VA_ARGS__); } while (0)   /* console + the kept log */
 int op2_wlan_up(uint32_t ip, uint32_t mask, uint32_t router, uint32_t dns);
 void op2_wlan_down(void);
 uint32_t op2_wlan_dequeue(uint8_t *frame, uint32_t max);
@@ -184,7 +186,7 @@ op2_wlan_attach(const uint8_t mac[6])
 	init.broadcast_len = ETHER_ADDR_LEN;
 	err = ifnet_allocate_extended(&init, &wl_ifp);
 	if (err != 0) {
-		printf("OP2 WIFI: 8: wl0: ifnet_allocate failed (%d)\n", err);
+		KLOG("OP2 WIFI: 8: wl0: ifnet_allocate failed (%d)\n", err);
 		wl_ifp = NULL;
 		return err;
 	}
@@ -195,14 +197,14 @@ op2_wlan_attach(const uint8_t mac[6])
 	ifnet_set_flags(wl_ifp, IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST, 0xffff);
 	err = ifnet_attach(wl_ifp, NULL);
 	if (err != 0) {
-		printf("OP2 WIFI: 8: wl0: ifnet_attach failed (%d)\n", err);
+		KLOG("OP2 WIFI: 8: wl0: ifnet_attach failed (%d)\n", err);
 		wl_ifp = NULL;
 		return err;
 	}
 	ifnet_set_lladdr(wl_ifp, mac, ETHER_ADDR_LEN);
 	err = proto_plumb(PF_INET, wl_ifp);
 	if (err != 0 && err != EEXIST) {
-		printf("OP2 WIFI: 8: wl0: proto_plumb(PF_INET) failed (%d)\n", err);
+		KLOG("OP2 WIFI: 8: wl0: proto_plumb(PF_INET) failed (%d)\n", err);
 		return err;
 	}
 	return 0;
@@ -257,7 +259,7 @@ op2_wlan_up(uint32_t ip, uint32_t mask, uint32_t router, uint32_t dns)
 		sock_close(so);
 	}
 	if (err != 0) {
-		printf("OP2 WIFI: 8: wl0: SIOCAIFADDR failed (%d)\n", err);
+		KLOG("OP2 WIFI: 8: wl0: SIOCAIFADDR failed (%d)\n", err);
 		lck_mtx_lock(wl_lock);
 		wl_running = 0;
 		wl_ip = 0;
@@ -270,7 +272,7 @@ op2_wlan_up(uint32_t ip, uint32_t mask, uint32_t router, uint32_t dns)
 	ip_text(t[2], sizeof(t[2]), router);
 	ip_text(t[3], sizeof(t[3]), dns != 0 ? dns : router);
 	snprintf(wl_lease, sizeof(wl_lease), "wl0 %s %s %s %s", t[0], t[1], t[2], t[3]);
-	printf("OP2 WIFI: 8: wl0 up: net.op2wlan = \"%s\"\n", wl_lease);
+	KLOG("OP2 WIFI: 8: wl0 up: net.op2wlan = \"%s\"\n", wl_lease);
 	return 0;
 }
 
@@ -305,7 +307,7 @@ op2_wlan_down(void)
 		(void)sock_ioctl(so, SIOCDIFADDR, &ifr);
 		sock_close(so);
 	}
-	printf("OP2 WIFI: 8: wl0 down (address removed, net.op2wlan empty)\n");
+	KLOG("OP2 WIFI: 8: wl0 down (address removed, net.op2wlan empty)\n");
 }
 
 uint32_t

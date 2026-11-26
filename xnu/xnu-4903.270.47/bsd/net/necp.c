@@ -6314,10 +6314,24 @@ extern char *proc_name_address(void *p);
 	        has_checked_delegation_entitlement = TRUE; \
 	} \
 	if (!has_delegation_entitlement) { \
+	        if (op2_necp_note()) \
 	        NECPLOG(LOG_ERR, "%s(%d) does not hold the necessary entitlement to delegate network traffic for other processes by %s", \
 	                                          proc_name_address(_p), proc_pid(_p), _d); \
 	        break; \
 	}
+
+#if defined(ARM64_BOARD_CONFIG_MSM8994)
+/* boot-arg op2quiet (osfmk/arm64/sleh.c, default on): not logged at all (dasd asks three times per check, ~200
+ * lines a minute, 61% of the console ring); op2quiet=0 logs each */
+extern int op2_quiet(void);
+static int
+op2_necp_note(void)
+{
+	return !op2_quiet();
+}
+#else
+#define op2_necp_note() 1
+#endif
 
 int
 necp_application_find_policy_match_internal(proc_t proc,

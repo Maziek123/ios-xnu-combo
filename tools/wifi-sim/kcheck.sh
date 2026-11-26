@@ -43,7 +43,7 @@ if [ -f "$XNU/bsd/sys/param.h" ]; then
 	    > "$OUT/gen/op2_shell_blob.h"
 	printf '#define OP2_NETD_BLOB_PATH "%s"\n#define OP2_NETD_BLOB_LEN 1u\n#define OP2_NETD_BLOB_SHA "0"\n' "$OUT/blob.bin" \
 	    > "$OUT/gen/op2_netd_blob.h"
-	for f in bsd/dev/op2_wlan.c bsd/kern/op2_shell_sync.c bsd/kern/op2_shell_sync.c+blob; do
+	for f in bsd/dev/op2_wlan.c bsd/dev/op2_keeplog.c bsd/kern/op2_shell_sync.c bsd/kern/op2_shell_sync.c+blob; do
 		inc=""
 		[ "${f%+blob}" != "$f" ] && inc="-I$OUT/gen"
 		src="${f%+blob}"

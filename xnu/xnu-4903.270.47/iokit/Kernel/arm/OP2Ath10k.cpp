@@ -74,7 +74,9 @@ static const uint8_t kOp2WifiBoard[1] = { 0 };
 extern "C" vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
 
 static const char *gStep = "2b";   /* "2b", "2c" or "3": the step the log lines belong to */
-#define A_LOG(fmt, ...) IOLog("OP2 WIFI: %s: " fmt "\n", gStep, __VA_ARGS__)   /* always >= 1 argument */
+#define A_LOG(fmt, ...) do { IOLog("OP2 WIFI: %s: " fmt "\n", gStep, __VA_ARGS__); \
+	op2_keep("OP2 WIFI: %s: " fmt, gStep, __VA_ARGS__); } while (0)   /* always >= 1 argument; also kept */
+#define A_LOG_CONSOLE(fmt, ...) IOLog("OP2 WIFI: %s: " fmt "\n", gStep, __VA_ARGS__)   /* console only */
 
 #if defined(__arm64__) || defined(__aarch64__)
 #define A_DSB()         __asm__ volatile("dsb sy" ::: "memory")
@@ -5356,7 +5358,11 @@ run8(char *res, size_t len, uint32_t stay_ms)
 		if ((int32_t)(now - next_report) >= 0) {
 			char st[240];
 			wl_status(st, sizeof(st), (now - t0) / 1000u);
-			A_LOG("%s", st);
+			if (((now - t0) / 60000u) % 10u == 1u) {
+				A_LOG("%s", st);           /* the kept log: after 1 minute, then every 10 */
+			} else {
+				A_LOG_CONSOLE("%s", st);
+			}
 			bzero(shell, sizeof(shell));
 			op2_shell_status(shell, sizeof(shell));
 			if (memcmp(shell, shell_was, sizeof(shell)) != 0) {

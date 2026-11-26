@@ -168,8 +168,27 @@ boolean_t op2_crash_valid = FALSE;
  * fails open (prints + records) so new crashers are never silent. */
 #define OP2_PBUD_N 32
 #define OP2_PBUD_LIM 24
+#define OP2_PBUD_LIM_QUIET 3
 static struct { char comm[16]; int n; } op2_pbud[OP2_PBUD_N];
 boolean_t op2_crash_quiet = FALSE;
+
+/* Boot-arg op2quiet (default 1: on; op2quiet=0 shows everything): keeps the console's biggest repeaters out of the
+ * 256 KB ramoops ring, which they otherwise fill in about 5 minutes (2026-11-26 log: 61% NECP delegation refusals,
+ * mostly dasd; 8% code-signing page notes; ~17% three lines per crash). Quiet: NECP refusals and code-signing
+ * "allowing" notes not logged at all; one line per crash (the signal and the registers; 3 per process name instead
+ * of 24). FB, Wi-Fi, thermal, touch (OP2I2C), AKS and the other OP2 lines are untouched. */
+int op2_quiet(void);
+int
+op2_quiet(void)
+{
+	static int v = -1;
+	if (v < 0) {
+		uint32_t q = 1;
+		PE_parse_boot_argn("op2quiet", &q, sizeof(q));
+		v = q != 0;
+	}
+	return v;
+}
 
 boolean_t
 op2_crash_budget(const char *comm)
@@ -182,7 +201,7 @@ op2_crash_budget(const char *comm)
 		if (op2_pbud[i].n != 0 &&
 		    strncmp(op2_pbud[i].comm, comm, sizeof(op2_pbud[i].comm)) == 0) {
 			op2_pbud[i].n++;
-			return op2_pbud[i].n <= OP2_PBUD_LIM;
+			return op2_pbud[i].n <= (op2_quiet() ? OP2_PBUD_LIM_QUIET : OP2_PBUD_LIM);
 		}
 	}
 	if (free >= 0) {
@@ -239,7 +258,8 @@ op2_log_user_state(const char *prefix, int pid, const char *comm)
 		}
 		fp = frame[0];
 	}
-	if (!op2_crash_quiet) {
+	/* quiet: the exit's line (PROC_EXIT_CRASH, with the signal) says it all; this one only repeats it */
+	if (!op2_crash_quiet && !(op2_quiet() && strncmp(prefix, "POSTSIG_FATAL", sizeof("POSTSIG_FATAL")) == 0)) {
 		printf("%s: pid=%d[%s] pc=0x%llx lr=0x%llx sp=0x%llx x0=0x%llx x1=0x%llx x16=0x%llx\n",
 		        prefix, pid, comm,
 		        (unsigned long long)s64->pc, (unsigned long long)s64->lr,
