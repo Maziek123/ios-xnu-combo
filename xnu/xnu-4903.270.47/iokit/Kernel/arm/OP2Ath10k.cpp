@@ -5263,7 +5263,7 @@ run8(char *res, size_t len, uint32_t stay_ms)
 		snprintf(res, len, "STEP 8 FAIL: wl0 could not be given %s/%u (error %d)", a, prefix, err);
 		return false;
 	}
-	A_LOG("STEP 8 PASS: wl0 up with %s/%u (router %s, DNS %s): iOS can use it once op2shell publishes it; staying "
+	A_LOG("STEP 8 PASS: wl0 up with %s/%u (router %s, DNS %s): iOS can use it once op2netd (or op2shell) publishes it; staying "
 	    "connected, a status line every 60 s", a, prefix, b, c);
 	/* op2shell publishes wl0 to configd: without it iOS has no route or DNS on wl0. Its boot-time line is long out of
 	 * the ramoops ring by now, so say here (and again whenever it changes) what the kernel's check did. */

@@ -45,7 +45,7 @@ use printf/IOLog for anything you need to see.
   (each N runs all lower steps; README "Wi-Fi bring-up"). wifi=9 joins a WPA2 hotspot named in the gitignored
   firmware/qca6174/wifi-network.txt (tools/gen-wifi-fw.py -> op2_wifi_net.h: name + PMK only) and runs the 4-way
   handshake (STEP 6 PASS on the phone); wifi=10 adds DHCP/ARP/ping through the keys (STEP 7 PASS). wifi=11 (step 8,
-  2026-11-26, not yet run on the phone): wl0 ifnet in bsd/dev/op2_wlan.c, sysctl net.op2wlan = lease, op2shell
+  2026-11-26, PASS on the phone: Safari loaded google.com over Wi-Fi, ~1 MB in the first minute): wl0 ifnet in bsd/dev/op2_wlan.c, sysctl net.op2wlan = lease, op2shell
   publishes service op2wifi ahead of op2usb; so does op2netd (userland/op2netd, same publish code in
   userland/op2shell/op2_publish.h): build-xnu.sh embeds it (and op2shell if built) in the kernel, bsd/kern/op2_shell_sync.c
   writes /usr/sbin/op2netd before launchd and exec_save_path() runs it in place of launchd's /usr/sbin/wifid (it then

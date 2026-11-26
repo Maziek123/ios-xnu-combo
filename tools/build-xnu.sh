@@ -21,7 +21,7 @@ SHELL_BIN="${REPO_ROOT}/out/shell/build/op2shell"
 if [ "${REPO_ROOT}/userland/op2shell/op2shell.c" -nt "$SHELL_BIN" ] ||
    [ "${REPO_ROOT}/userland/op2shell/op2_publish.h" -nt "$SHELL_BIN" ]; then
 	bash "${REPO_ROOT}/tools/build-op2shell.sh" >/dev/null 2>&1 ||
-		echo "[op2shell] not rebuilt (no dash/toybox/dropbear builds: tools/build-shell-all.sh); previous build if any"
+		echo "[op2shell] not rebuilt (needs the dash, toybox and dropbear builds: docs/SETUP.md 4); optional, op2netd covers the network"
 fi
 NETD_BIN="${REPO_ROOT}/out/op2netd/op2netd"
 mkdir -p "${REPO_ROOT}/out/op2netd"
