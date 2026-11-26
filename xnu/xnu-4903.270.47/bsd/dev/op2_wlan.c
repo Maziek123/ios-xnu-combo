@@ -7,6 +7,10 @@
  * the network. op2_wlan_up gives wl0 the DHCP lease of step 7 and publishes it in the sysctl net.op2wlan
  * ("wl0 <address> <netmask> <router> <dns>", empty while down), from which op2shell makes the configd service
  * (State:/Network/Service/op2wifi) that gives iOS its default route and DNS.
+ *
+ * The Wi-Fi manager (boot-arg wifi=12) adds three more sysctls, for op2netd's page: net.op2wlan_state (read),
+ * net.op2wlan_scan (read: the last scan, one network per line) and net.op2wlan_cmd (root writes "scan",
+ * "join <name in hex> <PMK in hex | ->", "leave" or "off"; the driver's thread takes it with op2_wlan_take_cmd).
  */
 #if defined(ARM64_BOARD_CONFIG_MSM8994)
 
@@ -33,6 +37,9 @@ void op2_wlan_down(void);
 uint32_t op2_wlan_dequeue(uint8_t *frame, uint32_t max);
 void op2_wlan_input(const uint8_t *frame, uint32_t len);
 uint32_t op2_wlan_drops(void);
+void op2_wlan_set_state(const char *text);
+void op2_wlan_set_scan(const char *text);
+int op2_wlan_take_cmd(char *out, uint32_t n);
 
 #define WL_TXQ 64
 
@@ -46,6 +53,62 @@ static uint32_t wl_drops, wl_ip;
 static char wl_lease[96];
 SYSCTL_STRING(_net, OID_AUTO, op2wlan, CTLFLAG_RD | CTLFLAG_LOCKED, wl_lease, 0,
     "Wi-Fi wl0 lease: name address netmask router dns (empty while down)");
+
+static char wl_state[200] = "off";
+SYSCTL_STRING(_net, OID_AUTO, op2wlan_state, CTLFLAG_RD | CTLFLAG_LOCKED, wl_state, 0,
+    "Wi-Fi manager: idle, scanning, joining <name>, connected <name> <address>, failed <name> <why>, off");
+static char wl_scan[4096];
+SYSCTL_STRING(_net, OID_AUTO, op2wlan_scan, CTLFLAG_RD | CTLFLAG_LOCKED, wl_scan, 0,
+    "Wi-Fi manager: last scan, per line: BSSID channel dBm security name-in-hex");
+static char wl_cmd[200];
+static volatile uint32_t wl_cmd_seq, wl_cmd_taken;
+
+static int
+wl_sysctl_cmd(struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+{
+	char buf[sizeof(wl_cmd)];
+	int err;
+
+	buf[0] = '\0';
+	err = sysctl_handle_string(oidp, buf, sizeof(buf), req);
+	if (err != 0 || req->newptr == USER_ADDR_NULL) {
+		return err;
+	}
+	memcpy(wl_cmd, buf, sizeof(wl_cmd));
+	wl_cmd[sizeof(wl_cmd) - 1] = '\0';
+	__sync_synchronize();
+	wl_cmd_seq++;
+	bzero(buf, sizeof(buf));
+	return 0;
+}
+SYSCTL_PROC(_net, OID_AUTO, op2wlan_cmd, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, wl_sysctl_cmd, "A",
+    "Wi-Fi manager command (root): scan, join <name hex> <PMK hex | ->, leave, off");
+
+void
+op2_wlan_set_state(const char *text)
+{
+	strlcpy(wl_state, text, sizeof(wl_state));
+}
+
+void
+op2_wlan_set_scan(const char *text)
+{
+	strlcpy(wl_scan, text, sizeof(wl_scan));
+}
+
+int
+op2_wlan_take_cmd(char *out, uint32_t n)
+{
+	uint32_t seq = wl_cmd_seq;
+	if (seq == wl_cmd_taken || n == 0) {
+		return 0;
+	}
+	wl_cmd_taken = seq;
+	__sync_synchronize();
+	strlcpy(out, wl_cmd, n);
+	bzero(wl_cmd, sizeof(wl_cmd));   /* a PMK in it */
+	return 1;
+}
 
 static errno_t
 wl_if_output(ifnet_t ifp, mbuf_t m)

@@ -339,17 +339,26 @@ st_ping(uint16_t id, uint16_t seq, size_t data)
 extern "C" int
 op2_wlan_attach(const uint8_t mac[6])
 {
-	assert(!st.attached);
+	if (st.attached) {   /* as op2_wlan.c: wl0 is made once, later calls reuse it */
+		assert(scenario == 35 && memcmp(st.mac, mac, 6) == 0);
+		return 0;
+	}
 	st.attached = true;
 	memcpy(st.mac, mac, 6);
 	return 0;
 }
 
+static uint32_t st_ups;
+
 extern "C" int
 op2_wlan_up(uint32_t ip, uint32_t mask, uint32_t router, uint32_t dns)
 {
+	if (scenario == 35 && st.up && st.down) {   /* the manager joined again */
+		st.up = st.down = st.router_known = false;
+	}
 	assert(st.attached && !st.up);
 	st.up = true;
+	st_ups++;
 	st.ip = ip; st.mask = mask; st.router = router; st.dns = dns;
 	std::vector<uint8_t> q = { 0, 1, 8, 0, 6, 4, 0, 1 };   /* who has the router */
 	q.insert(q.end(), kStaMac, kStaMac + 6); be32put(q, ip);
@@ -361,6 +370,52 @@ op2_wlan_up(uint32_t ip, uint32_t mask, uint32_t router, uint32_t dns)
 extern "C" void op2_wlan_down(void) { assert(st.up); st.down = true; }
 extern "C" uint32_t op2_wlan_drops(void) { return 0; }
 extern "C" void op2_shell_status(char *out, size_t n) { snprintf(out, n, "simulated; op2-air-run running (pid 1)"); }
+
+/* the Wi-Fi manager's sysctls (scenario 35): op2netd's side, scripted */
+static std::vector<std::string> &st_states = *new std::vector<std::string>;
+static std::string &st_scan = *new std::string;
+static uint32_t st_scans, st_mphase;
+
+extern "C" void
+op2_wlan_set_state(const char *text)
+{
+	if (st_states.empty() || st_states.back() != text) st_states.push_back(text);
+}
+
+extern "C" void op2_wlan_set_scan(const char *text) { st_scan = text; st_scans++; }
+
+extern "C" int
+op2_wlan_take_cmd(char *out, uint32_t n)
+{
+	if (scenario != 35 || st_states.empty()) return 0;
+	const std::string &cur = st_states.back();
+	auto is = [&](const char *p) { return cur.rfind(p, 0) == 0; };
+	std::string c;
+	static uint32_t scans_then;
+	char pmk[65];
+	switch (st_mphase) {
+	case 0: if (is("connected ") && st_echo_replies >= 1) { c = "scan"; scans_then = st_scans; } break;
+	case 1: if (is("connected ") && st_scans > scans_then) c = "leave"; break;
+	case 2:
+		if (cur == "idle") {
+			for (int i = 0; i < 32; i++) snprintf(pmk + 2 * i, 3, "%02x", ap_pmk[i] ^ (i == 0 ? 1 : 0));
+			c = std::string("join 6950686f6e65 ") + pmk;
+		}
+		break;
+	case 3:
+		if (is("failed ")) {
+			for (int i = 0; i < 32; i++) snprintf(pmk + 2 * i, 3, "%02x", ap_pmk[i]);
+			c = std::string("join 6950686f6e65 ") + pmk;
+		}
+		break;
+	case 4: if (is("connected ") && st_ups == 2 && st_echo_replies >= 2) c = "off"; break;
+	default: break;
+	}
+	if (c.empty()) return 0;
+	st_mphase++;
+	snprintf(out, n, "%s", c.c_str());
+	return 1;
+}
 
 extern "C" uint32_t
 op2_wlan_dequeue(uint8_t *frame, uint32_t max)
@@ -390,9 +445,11 @@ op2_wlan_input(const uint8_t *e, uint32_t n)
 			if (scenario == 33) {
 				for (uint16_t i = 1; i <= 20; i++) st_ping(0x5354, i, 1400);
 			} else {
-				st_ping(0x5354, 1, 56);
-				std::vector<uint8_t> odd(46, 0);                 /* an 802.3 frame (length field): the driver drops it */
-				st_out.push_back(st_eth(st.router_mac, 46, odd));
+				st_ping(0x5354, (uint16_t)st_ups, 56);
+				if (scenario == 34) {
+					std::vector<uint8_t> odd(46, 0);             /* an 802.3 frame (length field): the driver drops it */
+					st_out.push_back(st_eth(st.router_mac, 46, odd));
+				}
 			}
 		} else if (p[7] == 1 && tpa == st.ip) {
 			std::vector<uint8_t> r = { 0, 1, 8, 0, 6, 4, 0, 2 };
@@ -524,7 +581,7 @@ fw_receive(unsigned ce, const uint8_t *m, uint32_t n, uint32_t dflags)
 				scan_flags = v[15];
 				scan_nchan = v[17];
 				assert((v[1] & 0xF000u) == 0xA000u && v[2] == v[1] + 1 && v[18] == 1);
-				assert(v[1] == 0xA000u + 2 * (starts - 1));
+				assert(scenario == 35 || v[1] == 0xA000u + 2 * (starts - 1));   /* the manager's own rounds */
 				bool directed = v[15] == 0x30;
 				if (directed) {   /* step 5: 2.4 GHz channels 1-13, the network's name, our rates; 1-11 active */
 					assert(v[17] == 13 && v[19] == 1 && v[20] == 16 && v[6] == 100 && chanlist_active == 11);
@@ -546,7 +603,11 @@ fw_receive(unsigned ce, const uint8_t *m, uint32_t n, uint32_t dflags)
 						memcpy(&f[4], kStaMac, 6);
 						queue_ring_frame(f, (1u << 31) | (1u << 8), true, 52);
 					}
-					if (starts == 1 && scenario != 23 && scenario != 28) {
+					if (scenario == 35 && !directed) {   /* the manager: every scan hears the hotspot and an open cafe */
+						static const uint8_t cafe[6] = { 0x02, 0xca, 0xfe, 0, 0, 1 };
+						queue_ring_frame(ap_beacon(), (1u << 31) | (1u << 8), true, 55);
+						queue_ring_frame(make_beacon(cafe, "Cafe", 11, false, 0x80), (1u << 31) | (1u << 8), true, 30);
+					} else if (starts == 1 && scenario != 23 && scenario != 28) {
 						queue_ring_frame(ap_beacon(), (1u << 31) | (1u << 8), true, 55);
 						queue_ring_frame(ap_beacon(), (1u << 31) | (1u << 8), true, 57);
 					} else if (starts == 1) {
@@ -908,8 +969,8 @@ main(int argc, char **argv)
 	st32(0x804, 0x00435000u);           /* hi_failure_state */
 	for (uint32_t i = 0; i < 60; i++) st32(0x35000 + 4 * i, 0xc0de0000u + i);
 	struct op2_ath10k_bus bus = { bar, conf, dbi, 0, cold_reset, scenario >= 6, scenario >= 9, scenario >= 18, ap_scenario(),
-		ap_scenario() && scenario != 27, scenario >= 31 && scenario <= 34, scenario == 33 || scenario == 34,
-		scenario == 34 ? 61000u : 0u };
+		ap_scenario() && scenario != 27, scenario >= 31 && scenario <= 35, scenario >= 33 && scenario <= 35,
+		scenario == 34 ? 61000u : scenario == 35 ? 600000u : 0u, scenario == 35 };
 	PKCS5_PBKDF2_HMAC_SHA1(scenario == 25 ? "another-password" : "simulated-ap", scenario == 25 ? 16 : 12, (const unsigned char *)"iPhone", 6, 4096, 32, ap_pmk);
 	fflush(stdout);
 	char res[320];
@@ -1059,6 +1120,32 @@ main(int argc, char **argv)
 		} else {
 			CHECK(nchunks == 0 && chunks.empty());
 		}
+		break;
+	}
+	case 35: {   /* the Wi-Fi manager */
+		auto saw = [&](const char *p) {
+			for (const std::string &x : st_states) if (x.rfind(p, 0) == 0) return true;
+			return false;
+		};
+		CHECK(ok && strstr(res, "Wi-Fi manager: turned off by op2netd"));
+		CHECK(st_mphase == 5 && !st_states.empty() && st_states.back() == "off");
+		CHECK(saw("joining 6950686f6e65") && saw("connected 6950686f6e65 172.20.10.2/28"));
+		CHECK(saw("failed 6950686f6e65 STEP 6 FAIL: WPA2 with iPhone"));
+		CHECK(st_ups == 2 && st_echo_replies == 2 && st.down && st_own == 0 && st_bad == 0);
+		CHECK(st_scan.find("02:1a:11:f0:00:01 6 ") != std::string::npos && st_scan.find(" WPA2 6950686f6e65\n") != std::string::npos);
+		CHECK(st_scan.find(" open 43616665\n") != std::string::npos);   /* Cafe */
+		CHECK(st_scans == 2);   /* after step 4, then the one asked for while connected (phase 1 waited for it) */
+		CHECK(ap_sessions == 3 && ap_authorized_total == 2 && ap_msg2_bad >= 1);
+		CHECK(ap_deauths == 2 && ap_deauth_reason == 3);                    /* leave and off; the failed join was ended by the AP */
+		CHECK(logbuf.find("manager: connected 6950686f6e65 172.20.10.2/28") != std::string::npos);
+		CHECK(logbuf.find("op2netd asked to disconnect") != std::string::npos);
+		CHECK(logbuf.find("op2netd turned Wi-Fi off") != std::string::npos);
+		char tk[33];
+		for (int i = 0; i < 16; i++) snprintf(tk + 2 * i, 3, "%02x", ap_ptk[32 + i]);
+		CHECK(logbuf.find(tk) == std::string::npos);
+		char pk[65];
+		for (int i = 0; i < 32; i++) snprintf(pk + 2 * i, 3, "%02x", ap_pmk[i]);
+		CHECK(logbuf.find(pk) == std::string::npos);                        /* the PMK from the command is not logged */
 		break;
 	}
 	case 22: case 23: case 24: case 25: case 26: case 27: case 28: case 29: case 30: case 31: case 32: case 33: case 34: {

@@ -3073,6 +3073,22 @@ static const uint8_t kOp2WifiPmk[32] = { 0 };
 static const bool kOp2WifiOpen = false;
 #endif
 
+/* The network steps 5 to 8 join: the build's (op2_wifi_net.h) at first, then whatever the Wi-Fi manager (wifi=12,
+ * op2netd's page) asks for: a name and a PMK (op2netd derives it from the password), or no password (open). */
+static uint8_t gWantSsid[32];
+static uint32_t gWantSsidLen;
+static uint8_t gWantPmk[32];
+static bool gWantOpen;
+
+static void
+want_from_build(void)
+{
+	gWantSsidLen = kOp2WifiSsidLen;
+	memcpy(gWantSsid, kOp2WifiSsid, kOp2WifiSsidLen);
+	memcpy(gWantPmk, kOp2WifiPmk, 32u);
+	gWantOpen = kOp2WifiOpen;
+}
+
 extern "C" void read_random(void *buffer, unsigned int numBytes);
 
 #define WMI_TLV_VDEV_START_REQUEST_CMDID  0x5003u
@@ -4208,7 +4224,7 @@ find_target(void)
 	struct bss *best = NULL;
 	for (uint32_t i = 0; i < gNumBss; i++) {
 		struct bss *b = &gBss[i];
-		if (b->ssid_len == kOp2WifiSsidLen && b->have_ies && memcmp(b->raw_ssid, kOp2WifiSsid, kOp2WifiSsidLen) == 0 &&
+		if (b->ssid_len == gWantSsidLen && b->have_ies && memcmp(b->raw_ssid, gWantSsid, gWantSsidLen) == 0 &&
 		    (best == NULL || b->dbm > best->dbm)) {
 			best = b;
 		}
@@ -4233,8 +4249,8 @@ static void
 ssid_print(char *out, size_t n)   /* the configured name, printable */
 {
 	uint32_t i = 0;
-	for (; i < kOp2WifiSsidLen && i + 1u < n; i++) {
-		uint8_t c = kOp2WifiSsid[i];
+	for (; i < gWantSsidLen && i + 1u < n; i++) {
+		uint8_t c = gWantSsid[i];
 		out[i] = (c >= 0x20u && c < 0x7Fu) ? (char)c : '?';
 	}
 	out[i] = 0;
@@ -4259,7 +4275,7 @@ run5(char *res, size_t len)
 	uint32_t t0 = ms_since_power_on();
 	char name[33];
 	ssid_print(name, sizeof(name));
-	if (kOp2WifiSsidLen == 0) {
+	if (gWantSsidLen == 0) {
 		snprintf(res, len, "%s", "STEP 5 FAIL: no network configured (firmware/qca6174/wifi-network.txt: name on the "
 		    "first line, password on the second; see the README), rebuild");
 		return false;
@@ -4269,8 +4285,8 @@ run5(char *res, size_t len)
 	 * then one more listen-only scan of every channel (a hotspot on 5 GHz). */
 	struct bss *b = find_target();
 	uint32_t round = 1, directed = 0;
-	gProbeSsid = kOp2WifiSsid;
-	gProbeSsidLen = kOp2WifiSsidLen;
+	gProbeSsid = gWantSsid;
+	gProbeSsidLen = gWantSsidLen;
 	if (b == NULL) {
 		A_LOG("%s not heard in the scan (%u networks); asking for it by name on 2.4 GHz channels 1-11", name, gNumBss);
 		if (!scan_chan_list(true)) {
@@ -4315,7 +4331,7 @@ run5(char *res, size_t len)
 		if (bad != NULL) {
 			return join_fail(res, len, bad);
 		}
-		if (kOp2WifiOpen) {
+		if (gWantOpen) {
 			return join_fail(res, len, "it needs a password, but none is configured");
 		}
 	}
@@ -4563,7 +4579,7 @@ run6(char *res, size_t len)
 			memcpy(data + 6, mac_lo ? gBssid : gMac, 6u);
 			memcpy(data + 12, nonce_lo ? snonce : anonce, 32u);
 			memcpy(data + 44, nonce_lo ? anonce : snonce, 32u);
-			prf_sha1(kOp2WifiPmk, 32u, "Pairwise key expansion", data, sizeof(data), ptk, 48u);
+			prf_sha1(gWantPmk, 32u, "Pairwise key expansion", data, sizeof(data), ptk, 48u);
 			have_ptk = true;
 			const char *e = send_ek(ver, 2u | KI_PAIRWISE | KI_MIC, replay, snonce, kOurRsn, sizeof(kOurRsn), ptk, &st,
 			    res, len);
@@ -5095,6 +5111,11 @@ static uint32_t gTxsAcked, gTxsNoAck, gTxsDiscarded, gTxsLost, gTxsFrames, gTxsB
 static uint32_t gWlRx, gWlRxBytes, gWlRxOwn, gBeaconMiss;
 static uint32_t gTxsSendFails;
 static bool gWlUp;
+static bool gManager;                     /* wifi=12: the Wi-Fi manager drives steps 5 to 8 (below) */
+static int gMgrNext;
+static int mgr_poll_connected(char *res, size_t len);
+static void mgr_state_net(const char *verb, const char *rest);
+enum { MGR_NONE, MGR_SCAN, MGR_JOIN, MGR_LEAVE, MGR_OFF };
 
 static void
 txs_done(uint32_t slot, uint32_t status)
@@ -5265,6 +5286,11 @@ run8(char *res, size_t len, uint32_t stay_ms)
 	}
 	A_LOG("STEP 8 PASS: wl0 up with %s/%u (router %s, DNS %s): iOS can use it once op2netd (or op2shell) publishes it; staying "
 	    "connected, a status line every 60 s", a, prefix, b, c);
+	if (gManager) {
+		char addr[24];
+		snprintf(addr, sizeof(addr), "%s/%u", a, prefix);
+		mgr_state_net("connected", addr);
+	}
 	/* op2shell publishes wl0 to configd: without it iOS has no route or DNS on wl0. Its boot-time line is long out of
 	 * the ramoops ring by now, so say here (and again whenever it changes) what the kernel's check did. */
 	static char shell[640], shell_was[640];
@@ -5307,6 +5333,20 @@ run8(char *res, size_t len, uint32_t stay_ms)
 			why = gKickout ? "the firmware dropped the access point (station kickout: it stopped answering)" :
 			    gDeauthSubtype == 0xA0u ? "the network disassociated us" : "the network deauthenticated us";
 			break;
+		}
+		if (gManager && it % 32u == 0) {
+			int mc = mgr_poll_connected(res, len);
+			if (gFwDown) {
+				gWlUp = false;
+				op2_wlan_down();
+				return false;
+			}
+			if (mc != MGR_NONE) {
+				gMgrNext = mc;
+				why = mc == MGR_LEAVE ? "op2netd asked to disconnect" : mc == MGR_OFF ? "op2netd turned Wi-Fi off" :
+				    "op2netd asked to join another network";
+				break;
+			}
 		}
 		if (it % 16u == 0 && fw_down("traffic on wl0", res, len)) {
 			gWlUp = false;
@@ -5380,6 +5420,291 @@ leave(void)
 	gDataHook = NULL;
 	gIpHook = NULL;
 	gDrainHook = NULL;
+	gVdevStarted = gVdevUp = gPeerCreated = gAssociated = false;   /* a second leave() sends nothing */
+}
+
+/* Everything one join (steps 5 to 8) leaves behind, so the Wi-Fi manager can join again. leave() has already undone
+ * what the firmware holds (deauthentication, vdev down, peer delete, vdev stop); vdev 0 itself stays (step 4). */
+static void
+join_reset(void)
+{
+	bzero(&gAp, sizeof(gAp));
+	bzero(gBssid, sizeof(gBssid));
+	gJoinOpen = false;
+	gVdevStartResp = gVdevStopped = gVdevStarted = gPeerCreated = gPeerMapped = gVdevUp = gAssociated = false;
+	gVdevStartStatus = gPeerId = 0;
+	gKickout = gRoam = false;
+	gTxPausedIds = 0;
+	gAuthResp = gAssocResp = gDeauth = false;
+	gAuthStatus = gAssocStatus = gAid = gAssocCap = gDeauthReason = gDeauthSubtype = 0;
+	gEapolHead = gEapolTail = 0;
+	gDataFromAp = gDataAfterKeys = 0;
+	gAuthorized = false;
+	gMyIp = gServerIp = gRouterIp = gNetmask = gDns = gLease = 0;
+	gDhcpGot = gDhcpType = gOfferIp = gOfferServer = 0;
+	gRouterMacKnown = false;
+	bzero(gPingSeqSeen, sizeof(gPingSeqSeen));
+	bzero(gPingRtt, sizeof(gPingRtt));
+	bzero(gPingSentAt, sizeof(gPingSentAt));
+	gTxsBusy = 0;
+	gTxsAcked = gTxsNoAck = gTxsDiscarded = gTxsLost = gTxsFrames = gTxsBytes = gTxsDropped = gTxsSendFails = 0;
+	gWlRx = gWlRxBytes = gWlRxOwn = gBeaconMiss = 0;
+	gWlUp = false;
+}
+
+/* ---- the Wi-Fi manager (boot-arg wifi=12): after step 4 the driver stays up and op2netd drives it through the
+ * sysctls of bsd/dev/op2_wlan.c: net.op2wlan_cmd takes "scan", "join <name in hex> <PMK in hex | ->", "leave" or
+ * "off"; net.op2wlan_scan lists what the last scan heard ("<BSSID> <channel> <dBm> <security> <name in hex | ->"
+ * per line, strongest first); net.op2wlan_state says "idle", "scanning", "joining <name>", "connected <name>
+ * <address>/<prefix>", "failed <name> <why>" or "off". The build's network (wifi-network.txt), if there is one, is
+ * joined first; scans repeat every 30 s while not connected. ---- */
+
+static void
+hex_put(char *out, const uint8_t *p, uint32_t n)   /* out: 2n + 1 bytes */
+{
+	static const char d[] = "0123456789abcdef";
+	for (uint32_t i = 0; i < n; i++) {
+		out[2u * i] = d[p[i] >> 4];
+		out[2u * i + 1u] = d[p[i] & 15u];
+	}
+	out[2u * n] = 0;
+}
+
+static int
+hex_digit(char c)
+{
+	return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+}
+
+/* the token at s (up to a space or the end) as bytes; false unless it is 1..max whole bytes of hex */
+static bool
+hex_get(const char *s, uint8_t *out, uint32_t max, uint32_t *n)
+{
+	uint32_t i = 0;
+	for (; s[2u * i] != 0 && s[2u * i] != ' '; i++) {
+		int hi = hex_digit(s[2u * i]), lo = s[2u * i + 1u] != 0 ? hex_digit(s[2u * i + 1u]) : -1;
+		if (i == max || hi < 0 || lo < 0) {
+			return false;
+		}
+		out[i] = (uint8_t)(hi << 4 | lo);
+	}
+	*n = i;
+	return i > 0;
+}
+
+static void
+mgr_state(const char *what)
+{
+	static char was[200];
+	op2_wlan_set_state(what);
+	if (strncmp(what, was, sizeof(was)) != 0) {
+		A_LOG("manager: %s", what);
+		size_t i = 0;
+		for (; i + 1u < sizeof(was) && what[i] != 0; i++) {
+			was[i] = what[i];
+		}
+		was[i] = 0;
+	}
+}
+
+static void
+mgr_state_net(const char *verb, const char *rest)   /* "<verb> <wanted name in hex>[ <rest>]" */
+{
+	char hex[65], st[200];
+	hex_put(hex, gWantSsid, gWantSsidLen);
+	snprintf(st, sizeof(st), "%s %s%s%s", verb, gWantSsidLen ? hex : "-", rest != NULL ? " " : "", rest != NULL ? rest : "");
+	mgr_state(st);
+}
+
+static void
+mgr_publish_scan(void)
+{
+	static char list[SCAN_MAX_BSS * 100u + 1u];
+	size_t o = 0;
+	list[0] = 0;
+	for (uint32_t i = 1; i < gNumBss; i++) {   /* strongest first */
+		struct bss x = gBss[i];
+		uint32_t j = i;
+		for (; j > 0 && gBss[j - 1u].dbm < x.dbm; j--) {
+			gBss[j] = gBss[j - 1u];
+		}
+		gBss[j] = x;
+	}
+	for (uint32_t i = 0; i < gNumBss && o + 100u < sizeof(list); i++) {
+		const struct bss *b = &gBss[i];
+		char hex[65];
+		hex_put(hex, b->raw_ssid, b->ssid_len <= 32u ? b->ssid_len : 32u);
+		int w = snprintf(list + o, sizeof(list) - o, "%02x:%02x:%02x:%02x:%02x:%02x %u %d %s %s\n", b->bssid[0],
+		    b->bssid[1], b->bssid[2], b->bssid[3], b->bssid[4], b->bssid[5], b->chan, b->dbm, b->sec,
+		    b->ssid_len ? hex : "-");
+		if (w <= 0) {
+			break;
+		}
+		o += (size_t)w;
+	}
+	op2_wlan_set_scan(list);
+}
+
+static uint32_t gScanRound = 10;
+
+/* the next command from op2netd; for "join" the network becomes the wanted one */
+static int
+mgr_take(void)
+{
+	char c[200];
+	if (!op2_wlan_take_cmd(c, sizeof(c))) {
+		return MGR_NONE;
+	}
+	if (strncmp(c, "scan", sizeof("scan")) == 0) {
+		return MGR_SCAN;
+	}
+	if (strncmp(c, "leave", sizeof("leave")) == 0) {
+		return MGR_LEAVE;
+	}
+	if (strncmp(c, "off", sizeof("off")) == 0) {
+		return MGR_OFF;
+	}
+	if (strncmp(c, "join ", 5) == 0) {
+		uint8_t ssid[32], pmk[32];
+		uint32_t sn = 0, pn = 0;
+		const char *sp = c + 5, *pp = sp;
+		while (*pp != 0 && *pp != ' ') {
+			pp++;
+		}
+		bool open = *pp == ' ' && strncmp(pp + 1, "-", 2) == 0;
+		if (hex_get(sp, ssid, 32u, &sn) && *pp == ' ' && (open || (hex_get(pp + 1, pmk, 32u, &pn) && pn == 32u))) {
+			memcpy(gWantSsid, ssid, sn);
+			gWantSsidLen = sn;
+			memcpy(gWantPmk, open ? kOp2WifiPmk : pmk, 32u);   /* (an open network never uses it) */
+			gWantOpen = open;
+			bzero(pmk, sizeof(pmk));
+			bzero(c, sizeof(c));
+			return MGR_JOIN;
+		}
+		bzero(c, sizeof(c));
+		A_LOG("%s", "manager: a join command it could not read (join <name in hex> <PMK in hex | ->)");
+		return MGR_NONE;
+	}
+	A_LOG("manager: unknown command \"%.40s\"", c);
+	return MGR_NONE;
+}
+
+/* a listen-only scan of every channel, then the list for op2netd; also while connected (the firmware leaves the
+ * channel for each visit, so traffic stalls for a few seconds) */
+static bool
+mgr_scan(char *res, size_t len)
+{
+	gNumBss = 0;
+	if (!scan_chan_list(false)) {
+		return false;
+	}
+	const char *why = rescan(gScanRound++, false, res, len);
+	mgr_publish_scan();
+	if (why != NULL) {
+		A_LOG("manager: scan: %s", why);
+	}
+	return why == NULL;
+}
+
+/* gMgrNext: the command that ended a connection (join: the next network is already wanted) */
+
+/* run8's loop asks this about every 32 ms: MGR_NONE to stay connected */
+static int
+mgr_poll_connected(char *res, size_t len)
+{
+	int c = mgr_take();
+	if (c == MGR_SCAN) {
+		(void)mgr_scan(res, len);
+		return MGR_NONE;
+	}
+	return c;
+}
+
+static bool
+run_manager(char *res, size_t len, uint32_t limit_ms)
+{
+	gManager = true;
+	gStep = "mgr";
+	mgr_publish_scan();
+	bool pending = gWantSsidLen > 0;   /* the build's network first */
+	A_LOG("Wi-Fi manager up: %u networks heard; %s", gNumBss, pending ? "joining the build's network first" :
+	    "waiting for op2netd (http://127.0.0.1:8080 on the phone)");
+	uint32_t t0 = ms_since_power_on(), last_scan = t0;
+	mgr_state(pending ? "idle" : "idle");
+	for (uint32_t it = 0;; it++) {
+		int c = mgr_take();
+		if (c == MGR_JOIN) {
+			pending = true;
+		} else if (c == MGR_LEAVE) {
+			pending = false;
+			mgr_state("idle");
+		} else if (c == MGR_OFF) {
+			mgr_state("off");
+			snprintf(res, len, "%s", "Wi-Fi manager: turned off by op2netd (until the phone restarts)");
+			return true;
+		}
+		uint32_t now = ms_since_power_on();
+		if (!pending && (c == MGR_SCAN || now - last_scan >= 30000u)) {
+			mgr_state("scanning");
+			(void)mgr_scan(res, len);
+			last_scan = ms_since_power_on();
+			if (gFwDown) {
+				return false;
+			}
+			mgr_state("idle");
+		}
+		if (pending) {
+			pending = false;
+			gMgrNext = MGR_NONE;
+			join_reset();
+			mgr_state_net("joining", NULL);
+			char st[200];
+			bool ok = run5(res, len);
+			if (ok) {
+				A_LOG("%s", res);
+				ok = run6(res, len);
+			}
+			if (ok) {
+				A_LOG("%s", res);
+				ok = run7(res, len);
+			}
+			if (ok) {
+				A_LOG("%s", res);
+				ok = run8(res, len, 0);   /* connected until the network ends it or op2netd says otherwise */
+				A_LOG("%s", res);
+				mgr_state("idle");
+			} else if (!gFwDown) {
+				A_LOG("%s", res);
+				snprintf(st, sizeof(st), "%.150s", res);
+				mgr_state_net("failed", st);
+			}
+			leave();
+			gStep = "mgr";
+			if (gFwDown) {
+				mgr_state("off");
+				return false;
+			}
+			if (gMgrNext == MGR_JOIN) {
+				pending = true;
+			} else if (gMgrNext == MGR_OFF) {
+				mgr_state("off");
+				snprintf(res, len, "%s", "Wi-Fi manager: turned off by op2netd (until the phone restarts)");
+				return true;
+			}
+			last_scan = ms_since_power_on() - 25000u;   /* a fresh list soon after a connection ends */
+			continue;
+		}
+		if (it % 16u == 0 && fw_down("the Wi-Fi manager", res, len)) {
+			mgr_state("off");
+			return false;
+		}
+		if (limit_ms != 0 && ms_since_power_on() - t0 >= limit_ms) {
+			snprintf(res, len, "%s", "Wi-Fi manager: the time set for this run ended");
+			return true;
+		}
+		pump();
+		IOSleep(20);
+	}
 }
 
 static bool
@@ -5482,6 +5807,7 @@ op2_ath10k_step2b(const struct op2_ath10k_bus *bus, char *result, size_t len)
 	gDbi = bus->dbi;
 	gPowerOnAbs = bus->power_on_abs;
 	gColdReset = bus->cold_reset;
+	want_from_build();
 	bool ok = run(result, len);
 	if (ok && bus->boot_firmware) {
 		A_LOG("%s", result);   /* the 2b verdict; the result line becomes 2c's */
@@ -5494,8 +5820,13 @@ op2_ath10k_step2b(const struct op2_ath10k_bus *bus, char *result, size_t len)
 	if (ok && bus->scan) {
 		A_LOG("%s", result);   /* the step 3 verdict; the result line becomes step 4's */
 		ok = run4(result, len);
+		if (bus->manager && (ok || !gFwDown)) {   /* hearing nothing yet is fine for the manager */
+			A_LOG("%s", result);
+			ok = run_manager(result, len, bus->iface_ms);
+			leave();
+		}
 	}
-	if (ok && bus->join) {
+	if (ok && bus->join && !bus->manager) {
 		A_LOG("%s", result);   /* the step 4 verdict (network list above); the result line becomes step 5's */
 		ok = run5(result, len);
 		if (ok && bus->wpa2) {

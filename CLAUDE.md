@@ -51,7 +51,12 @@ use printf/IOLog for anything you need to see.
   writes /usr/sbin/op2netd before launchd and exec_save_path() runs it in place of launchd's /usr/sbin/wifid (it then
   execs the real wifid); op2netd=0 / op2shell_sync=0 off; step 8 logs the state (user's phone: likely no op2shell);
   stays connected, polled loop, 16 tx slots, status every 60 s. Renumbered 2026-11-25: one number per step.
-  Firmware blobs + generated headers stay out of git. Before a phone round: bash tools/wifi-sim/run.sh (simulated chip + OpenSSL access point, 35 scenarios)
+  wifi=12 (2026-11-26, not yet run on the phone): Wi-Fi manager after step 4 (OP2Ath10k.cpp run_manager; gWant* is the
+  network, from op2_wifi_net.h first, then op2netd's "join"); op2netd serves http://127.0.0.1:8080 (list, join with
+  password -> PMK via CommonCrypto, saved networks in /var/root/Library/op2netd/networks, autojoin, leave, forget, off)
+  over sysctls net.op2wlan_cmd/_scan/_state. Tests: wifi-sim scenario 35, tools/op2netd-test/run.sh (host, curl).
+  The clock now syncs over the network (NTP), which fixes the old TLS-date problem while connected.
+  Firmware blobs + generated headers stay out of git. Before a phone round: bash tools/wifi-sim/run.sh (simulated chip + OpenSSL access point, 36 scenarios)
   and tools/wifi-sim/kcheck.sh (XNU warning flags).
 - Safari (2026-11-17): loads/draws normal sites (google, wikipedia) after kernel NECP ADD_FLOW, entitlement
   privileges (kern_priv), AppleM2ScalerCSCDriver stub; WebContent runs on the CPU (OP2Metal: one op2mtl context

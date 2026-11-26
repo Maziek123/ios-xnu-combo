@@ -63,7 +63,7 @@ step was one lower). Without the boot-arg (or `wifi=0`) nothing touches the Wi-F
 after boot, logs a verdict line (`RESULT:`) for each step it passes and the one it stops at, and repeats the last one
 every 60 s so it survives in ramoops: `grep -a 'OP2 WIFI' op2-last-boot.log`.
 Each change is checked first in a host simulation of the chip (and, for steps 5 and 6, of an access point):
-[`tools/wifi-sim`](tools/wifi-sim/README.md) (35 scenarios).
+[`tools/wifi-sim`](tools/wifi-sim/README.md) (36 scenarios); op2netd's page: `tools/op2netd-test/run.sh`.
 
 | Step | `wifi=` (runs the rows above it too) | Result |
 |---|---|---|
@@ -79,8 +79,9 @@ Each change is checked first in a host simulation of the chip (and, for steps 5 
 | **6** WPA2 | 9 | **Passes on the phone** (progress row 20): connected to an iPhone hotspot with WPA2, both keys confirmed by the firmware, the port open, 5 s connected without a deauthentication. Runs step 5 first, then the 4-way handshake (keys from the network name and password, message 3's MIC checked, the group key decrypted; message 4 is not waited for, as wpa_supplicant does), both keys into the chip, the port opened, 5 s connected counting data frames from the network, then it leaves as `wifi=8` does. The crypto (SHA-1, HMAC, the 802.11 PRF, AES key unwrap) is in the driver and checks itself against published test vectors first. |
 | **7** data | 10 | **Passes on the phone** (progress row 21): DHCP lease from the hotspot in under a second, ping to it 3 of 3, 2-3 ms. After step 6, the first data through the keys: DHCP with the network (discover and request sent encrypted by the chip; the offer and ack are the first encrypted frames from the network, decrypted by the chip), then ARP for the router it names and 3 pings to it; ARP requests for our address are answered. The result line has the lease (address, router, DNS) and the ping times. Then it leaves as `wifi=8` does. Not yet a network interface for iOS. |
 | **8** interface for iOS | 11 | **Passes on the phone: Safari loads google.com over Wi-Fi** (2026-11-26; also passes the simulation, scenarios 33 and 34). After step 7, `wl0`, a network interface for iOS (`bsd/dev/op2_wlan.c`, built like the USB link's `ue0`), gets the lease's address; the kernel publishes the lease in the sysctl `net.op2wlan`, and `op2shell` turns it into a configd service with Wi-Fi ahead of USB, so iOS takes its default route and DNS from the hotspot. Frames from iOS go out encrypted by the chip, up to 16 in flight; frames from the network go to iOS (which now answers ARP itself). The phone stays connected until the network ends it or the phone resets, with a status line (frames and bytes each way) every 60 s. Still polled, 802.11a/b/g rates, no power save. iOS learns about wl0 from op2netd, which the kernel puts on the phone and starts itself ([below](#testing-step-8-wi-fi-for-ios)). |
+| **Manager** choose networks on the phone | 12 | **Not run on the phone yet**; passes in the simulation (scenario 35) and op2netd's page in a host test (`tools/op2netd-test/run.sh`). After step 4 the driver stays up and op2netd, which the kernel already starts, serves a Wi-Fi page at `http://127.0.0.1:8080` in Safari ([below](#choosing-a-network-on-the-phone-wifi12)): nearby networks, join with a password, disconnect, forget, Wi-Fi off. Steps 5 to 8 run again for each join. No rebuild for a new network; `wifi-network.txt` becomes optional (if present, that network is joined first). |
 
-Next, after step 8 has run on the phone: reconnecting after the network drops us, DHCP renewal, power save, faster rates (HT), interrupts instead of polling; then Bluetooth.
+Next: the Wi-Fi manager (`wifi=12`) on the phone; then DHCP renewal, power save, faster rates (HT), interrupts instead of polling; then Bluetooth.
 
 #### Progress so far (2026-11-23 to 11-25)
 
@@ -109,7 +110,7 @@ The `wifi=` numbers below are the current ones; the runs themselves used the old
 | 19 | Steps 5 and 6 with in-order rx indications handled, probing by name (`9b1c327`) | Step 5 **PASS** (hotspot in the first scan, 4 beacons; 20 beacons in all now that a stuck buffer no longer blocks the rest). Step 6: message 1 read, message 2 acknowledged, **message 3's MIC checked** (the password and the key derivation are right), message 4 sent - the iPhone showed a connected device - but the firmware never confirmed message 4 and the driver gave up before installing the keys. Two WMI TX_PAUSE events came with message 3 | wpa_supplicant installs the keys right after sending message 4; so does the driver now. |
 | 20 | Step 6 without waiting for message 4's confirmation (2 s at most), a repeated message 3 answered while connected, TX_PAUSE decoded (vdev pauses hold our sends as ath10k stops its queues; the others are only logged) (`45fc46f`) | **STEP 6 PASS**: hotspot in the first scan, joined in 48 ms, messages 1-3, message 4 sent (again never confirmed; an MCC tx pause stop/wake came with message 3), both keys installed and confirmed (also WMI install-key-complete events), port open, 5 s connected, no deauthentication, left cleanly. 0 data frames from the network in those 5 s | The phone is a WPA2 client of the hotspot. A hotspot sends a new client almost nothing until it asks for something (an address over DHCP), so the encrypted data path is not proven yet: that is the first thing for `wifi=10`. |
 | 21 | Step 7, `wifi=10`: DHCP, ARP and ping through the keys; the OnePlus antenna-switch pins (GPIO 120, 121, 122, 124) logged with the other pins, read only (`9ebacc4`) | **STEP 7 PASS**: lease 172.20.10.6/28 (router and DNS 172.20.10.1, one day) 763 ms after the first discover; ARP reply from the router; ping 3 of 3, 2/2/3 ms. The antenna pins are outputs driven low, the state Android's driver sets at probe | The encrypted data path works both ways. The antenna switch is not what makes the noise floor look low. Next: a network interface for iOS and staying connected. |
-| 22 | Step 8, `wifi=11`: `wl0` for iOS, staying connected (`191489d`); the kernel puts op2netd on the phone and starts it in place of `wifid`, since this phone has no op2shell (`b8d732a`) | **STEP 8 PASS**: `wl0` up with the lease; op2netd published it to configd; in the first minute 1,093 frames (977 KB) to iOS and 1,156 (121 KB) from iOS, 25 of them not acknowledged (retried), no drops, no beacon loss. **Safari loaded google.com over Wi-Fi.** (Earlier runs without a publisher: `wl0` up and connected for 19 minutes, but iOS sent only 4-8 frames and Safari said there was no connection.) |
+| 22 | Step 8, `wifi=11`: `wl0` for iOS, staying connected (`191489d`); the kernel puts op2netd on the phone and starts it in place of `wifid`, since this phone has no op2shell (`b8d732a`) | **STEP 8 PASS**: `wl0` up with the lease; op2netd published it to configd; in the first minute 1,093 frames (977 KB) to iOS and 1,156 (121 KB) from iOS, 25 of them not acknowledged (retried), no drops, no beacon loss. **Safari loaded google.com over Wi-Fi.** (Earlier runs without a publisher: `wl0` up and connected for 19 minutes, but iOS sent only 4-8 frames and Safari said there was no connection.) A longer run: connected 1517 s (25 minutes), 9,985 frames (9.2 MB) to iOS and 10,433 (1.1 MB) from iOS, 1.3% retried, no drops or beacon loss, until the hotspot deauthenticated us. |
 
 #### Testing a step
 
@@ -150,6 +151,25 @@ stays on Wi-Fi until the boot's `op2_deadline` (2 h with `tools/build-daily.sh`)
 3. The console (USB serial log) shows `op2netd: wl0 published as primary network (...)` a few seconds after
    `STEP 8 PASS`. Over SSH or the USB shell, `/usr/local/bin/op2net example.com` fetches a page; then try Safari. To be sure it is Wi-Fi and not USB, unplug the cable (or stop the Mac's NAT) and
    watch the hotspot's connected-device count; the status lines in the log afterwards show the traffic.
+
+#### Choosing a network on the phone (`wifi=12`)
+
+1. Boot with `wifi=12` (for example `EXTRA="wifi=12" bash tools/build-daily.sh`). About 2 minutes after boot the
+   driver has scanned; if `wifi-network.txt` names a network it is joined first, as with `wifi=11`.
+2. In Safari open **`http://127.0.0.1:8080`**. The page is served by op2netd on the phone itself, so it opens even with
+   no network. Share, then Add to Home Screen, gives it an icon.
+3. Tap a network, type its password, then Join. The page refreshes every 5 s: "Joining...", then a check mark with the
+   address, or "Could not join" with the driver's reason (a wrong password shows as the 4-way handshake timing out).
+4. Joined networks are saved on the phone (`/var/root/Library/op2netd/networks`: the name and the key derived from the
+   password, never the password itself; root only). After a boot, or when the network goes away and comes back, op2netd
+   joins the strongest saved network it hears. "Disconnect" pauses that until you pick a network; "Forget" removes one;
+   "Turn Wi-Fi off" stops the driver until the next boot.
+5. "Scan again" while connected stalls traffic for a few seconds (the radio visits every channel).
+
+In the log: `OP2 WIFI: mgr: manager: <state>` for every change (`idle`, `scanning`, `joining <name in hex>`, `connected
+<name> <address>`, `failed <name> <why>`, `off`), and the usual step 5 to 8 lines for each join. Underneath, op2netd and
+the driver talk through three sysctls (`bsd/dev/op2_wlan.c`): `net.op2wlan_cmd` (`scan`, `join <name in hex> <key in hex
+| ->`, `leave`, `off`; root only), `net.op2wlan_scan` and `net.op2wlan_state`.
 
 #### Wi-Fi firmware files
 

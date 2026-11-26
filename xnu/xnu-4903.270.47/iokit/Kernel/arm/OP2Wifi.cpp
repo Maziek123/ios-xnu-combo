@@ -26,6 +26,8 @@
  *  10  as 9, then step 7 (OP2Ath10k.cpp): data through the keys: DHCP with the network, ARP and ping its router, leave
  *  11  as 10, then step 8 (OP2Ath10k.cpp + bsd/dev/op2_wlan.c): wl0, a network interface for iOS on that lease;
  *      stays connected until the network ends it or the phone resets (op2shell publishes it to configd)
+ *  12  steps 1-4, then the Wi-Fi manager: scan and join at runtime as op2netd's page asks (net.op2wlan_cmd),
+ *      the build's network (if any) first; steps 5-8 run for each join
  *
  * Runs in its own kernel thread 120 s after the framebuffer starts (RPM is up by then, the UI is running),
  * and repeats a one-line summary every 60 s so it survives in the ramoops ring.
@@ -639,7 +641,7 @@ step2b(void)
 {
 	char line[320];
 	struct op2_ath10k_bus bus = { gBar0, gConf, gDbi, gPowerOnAbs, cold_reset_for_2b, gMode >= 5, gMode >= 6,
-		gMode >= 7, gMode >= 8, gMode >= 9, gMode >= 10, gMode >= 11, 0 };
+		gMode >= 7, gMode >= 8, gMode >= 9, gMode >= 10, gMode >= 11, 0, gMode >= 12 };
 	(void)op2_ath10k_step2b(&bus, line, sizeof(line));
 	summary(line);
 }
@@ -832,7 +834,7 @@ wifi_thread(__unused void *param, __unused wait_result_t wr_)
 		    gMode == 5 ? "steps 1-2b + 2c (firmware boot)" : gMode == 6 ? "steps 1-2c + 3 (WMI, HTT)" :
 		    gMode == 7 ? "steps 1-3 + 4 (listen-only scan)" : gMode == 8 ? "steps 1-4 + 5 (join)" :
 		    gMode == 9 ? "steps 1-5 + 6 (WPA2)" : gMode == 10 ? "steps 1-6 + 7 (DHCP, ping)" :
-		    "steps 1-7 + 8 (wl0 for iOS, stays connected)");
+		    gMode == 11 ? "steps 1-7 + 8 (wl0 for iOS, stays connected)" : "steps 1-4 + the Wi-Fi manager (op2netd)");
 		dump_all("before");
 		if (gMode >= 2) {
 			bringup();

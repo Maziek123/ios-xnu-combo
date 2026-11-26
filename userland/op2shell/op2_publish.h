@@ -82,19 +82,23 @@ set_order(int wifi_first, CFMutableDictionaryRef into)
 	CFRelease(order);
 }
 
+struct publish_state {
+	SCDynamicStoreRef st;
+	char wifi_pub[80];   /* the lease published as op2wifi ("" = none) */
+	int refused;
+};
+
+/* one look at the lease and configd's keys; publishes or removes what changed. Call every few seconds. */
 static void
-publish_net(void)
+publish_step(struct publish_state *ps)
 {
-	SCDynamicStoreRef st = NULL;
-	char wifi_pub[80] = "";   /* the lease published as op2wifi ("" = none) */
-	int refused = 0;
-	for (;;) {
+	char *wifi_pub = ps->wifi_pub;
+	do {
+		if (ps->st == NULL)
+			ps->st = SCDynamicStoreCreate(NULL, CFSTR(PUBLISHER), NULL, NULL);
+		SCDynamicStoreRef st = ps->st;
 		if (st == NULL)
-			st = SCDynamicStoreCreate(NULL, CFSTR(PUBLISHER), NULL, NULL);
-		if (st == NULL) {
-			sleep(3);
-			continue;
-		}
+			return;
 		char ip[16], mask[16], router[16], dns[16], now[80] = "", msg[200];
 		/* Wi-Fi: ready once the kernel has a lease and KernelEventMonitor has seen wl0's address */
 		if (wifi_lease(ip, mask, router, dns) && exists(st, CFSTR("State:/Network/Interface/wl0/IPv4")))
@@ -113,12 +117,12 @@ publish_net(void)
 			CFDictionarySetValue(all, CFSTR("State:/Network/Service/op2wifi/DNS"), dd);
 			set_order(1, all);
 			if (SCDynamicStoreSetMultiple(st, all, NULL, NULL)) {
-				snprintf(wifi_pub, sizeof(wifi_pub), "%s", now);
+				snprintf(wifi_pub, sizeof(ps->wifi_pub), "%s", now);
 				snprintf(msg, sizeof(msg), PUBLISHER ": wl0 published as primary network (%s/%s, router %s, DNS %s)\n",
 				    ip, mask, router, dns);
 				say(msg);
-			} else if (!refused) {
-				refused = 1;
+			} else if (!ps->refused) {
+				ps->refused = 1;
 				snprintf(msg, sizeof(msg), PUBLISHER ": configd refused the wl0 service (uid %d); retrying every 3 s\n",
 				    (int)getuid());
 				say(msg);
@@ -168,6 +172,16 @@ publish_net(void)
 			release_all(2, v4);
 			release_all(1, vd);
 		}
+	} while (0);
+}
+
+static void __attribute__((unused))
+publish_net(void)   /* op2shell: publish forever */
+{
+	struct publish_state ps;
+	memset(&ps, 0, sizeof(ps));
+	for (;;) {
+		publish_step(&ps);
 		sleep(3);
 	}
 }
