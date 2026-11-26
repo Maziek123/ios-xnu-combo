@@ -59,9 +59,14 @@ delegation refusals (dasd) and code-signing "allowing" page notes not logged at 
   wifi=12 (2026-11-26, not yet run on the phone): Wi-Fi manager after step 4 (OP2Ath10k.cpp run_manager; gWant* is the
   network, from op2_wifi_net.h first, only if step 4 heard it, else skipped for the boot; then op2netd's "join"); op2netd serves http://127.0.0.1:8080 (list, join with
   password -> PMK via CommonCrypto, saved networks in /var/root/Library/op2netd/networks, autojoin, leave, forget, off)
-  over sysctls net.op2wlan_cmd/_scan/_state. Tests: wifi-sim scenario 35, tools/op2netd-test/run.sh (host, curl).
+  over sysctls net.op2wlan_cmd/_scan/_state. Tests: wifi-sim scenarios 35-37, tools/op2netd-test/run.sh (host, curl).
+  wifi=12 PASSES on the phone (2026-11-26: home router from the page, Safari, fast.com 8/21 Mbit/s, 11g rates). Page: saved
+  networks join on tap, "..." menu (Advanced, change password, forget), connected network's details dropdown; Advanced =
+  per-network settings in the networks file (auto=0 ip= mask= router= dns=a,b,c dnsauto=0 search=): manual IPv4 rides on
+  "join ... static <ip> <mask> <router> <dns>" (8 hex each; step 7 skips DHCP), DNS/search go to configd via
+  op2_publish.h's publish_state.dns_list/search (op2shell leaves them empty = old behaviour).
   The clock now syncs over the network (NTP), which fixes the old TLS-date problem while connected.
-  Firmware blobs + generated headers stay out of git. Before a phone round: bash tools/wifi-sim/run.sh (simulated chip + OpenSSL access point, 37 scenarios)
+  Firmware blobs + generated headers stay out of git. Before a phone round: bash tools/wifi-sim/run.sh (simulated chip + OpenSSL access point, 38 scenarios)
   and tools/wifi-sim/kcheck.sh (XNU warning flags).
 - Safari (2026-11-17): loads/draws normal sites (google, wikipedia) after kernel NECP ADD_FLOW, entitlement
   privileges (kern_priv), AppleM2ScalerCSCDriver stub; WebContent runs on the CPU (OP2Metal: one op2mtl context

@@ -175,13 +175,28 @@ stays on Wi-Fi until the boot's `op2_deadline` (2 h with `tools/build-daily.sh`)
    join it once on the page to have op2netd remember it).
 2. In Safari open **`http://127.0.0.1:8080`**. The page is served by op2netd on the phone itself, so it opens even with
    no network. Share, then Add to Home Screen, gives it an icon.
-3. Tap a network, type its password, then Join. The page refreshes every 5 s: "Joining...", then a check mark with the
-   address, or "Could not join" with the driver's reason (a wrong password shows as the 4-way handshake timing out).
+3. Tap a network, type its password, then Join. A saved network (or an open one) joins at once when tapped; its
+   "..." menu has "Change password..." and "Forget this network". The page refreshes every 5 s (not while a menu is
+   open): "Joining...", then a check mark with the address, or "Could not join" with the driver's reason (a wrong
+   password shows as the 4-way handshake timing out). An empty password for a WPA2 network is refused, never saved.
+   Tap the connected network at the top for its details: address, subnet mask, router, DNS, security, channel,
+   signal and access point (from the last scan), the phone's Wi-Fi address, data received and sent, time connected.
 4. Joined networks are saved on the phone (`/var/root/Library/op2netd/networks`: the name and the key derived from the
    password, never the password itself; root only). After a boot, or when the network goes away and comes back, op2netd
-   joins the strongest saved network it hears. "Disconnect" pauses that until you pick a network; "Forget" removes one;
-   "Turn Wi-Fi off" stops the driver until the next boot.
-5. "Scan again" while connected stalls traffic for a few seconds (the radio visits every channel).
+   joins the strongest saved network it hears. "Disconnect" pauses that until you pick a network; "Forget" removes one
+   (saved networks not heard now are listed under "Saved, not in range"); "Turn Wi-Fi off" stops the driver until the
+   next boot.
+5. **Advanced** (a saved network's "..." menu, the connected network's details, or a network under "Saved, not in
+   range"): per-network settings, kept with the saved network, like a Linux connection profile:
+   - **Join automatically** on or off.
+   - **IPv4**: Automatic (DHCP) or Manual (address, subnet mask, router). Manual skips DHCP: op2netd's join command
+     carries the address (`join ... static <address> <netmask> <router> <dns>`) and step 7 uses it as it is, then ARPs
+     and pings the router as usual. Changing it while connected joins again.
+   - **DNS**: up to three servers in order, "Also use the network's DNS" (after yours), search domains. They go to iOS
+     (configd's `ServerAddresses` and `SearchDomains`) within 3 s, without reconnecting. With no servers set: the
+     network's own, then 1.1.1.1, as before.
+   Bad values are refused with the reason, and the form comes back as typed.
+6. "Scan again" while connected stalls traffic for a few seconds (the radio visits every channel).
 
 In the log: `OP2 WIFI: mgr: manager: <state>` for every change (`idle`, `scanning`, `joining <name in hex>`, `connected
 <name> <address>`, `failed <name> <why>`, `off`), and the usual step 5 to 8 lines for each join. Underneath, op2netd and

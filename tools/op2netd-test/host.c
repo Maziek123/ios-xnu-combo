@@ -17,11 +17,19 @@ CFDictionaryRef CFDictionaryCreate(CFAllocatorRef a, const void **k, const void 
 CFMutableDictionaryRef CFDictionaryCreateMutable(CFAllocatorRef a, CFIndex n, const CFDictionaryKeyCallBacks *x, const CFDictionaryValueCallBacks *y) { return (CFMutableDictionaryRef)1; }
 void CFDictionarySetValue(CFMutableDictionaryRef d, const void *k, const void *v) {}
 CFArrayRef CFArrayCreate(CFAllocatorRef a, const void **v, CFIndex n, const CFArrayCallBacks *c) { return (CFArrayRef)1; }
-CFStringRef CFStringCreateWithCString(CFAllocatorRef a, const char *s, CFStringEncoding e) { return (CFStringRef)1; }
+/* configd: State:/Network/Interface/wl0/IPv4 exists while the file k/wl0_up does; each publish appends the strings
+ * made for it (addresses, DNS servers, search domains) as one line to k/published */
+static char made[2000];
+CFStringRef CFStringCreateWithCString(CFAllocatorRef a, const char *s, CFStringEncoding e) {
+	size_t l = strlen(made); snprintf(made + l, sizeof made - l, "%s ", s); return (CFStringRef)1; }
 void CFRelease(CFTypeRef x) {}
-SCDynamicStoreRef SCDynamicStoreCreate(CFAllocatorRef a, CFStringRef n, void *x, void *y) { return NULL; }
-CFPropertyListRef SCDynamicStoreCopyValue(SCDynamicStoreRef s, CFStringRef k) { return NULL; }
-Boolean SCDynamicStoreSetMultiple(SCDynamicStoreRef s, CFDictionaryRef a, CFArrayRef b, CFArrayRef c) { return 0; }
+SCDynamicStoreRef SCDynamicStoreCreate(CFAllocatorRef a, CFStringRef n, void *x, void *y) { return (SCDynamicStoreRef)1; }
+CFPropertyListRef SCDynamicStoreCopyValue(SCDynamicStoreRef s, CFStringRef k) {
+	return strcmp((const char *)k, "State:/Network/Interface/wl0/IPv4") == 0 &&
+	    access(OP2NETD_TEST_DIR "/k/wl0_up", F_OK) == 0 ? (CFPropertyListRef)1 : NULL; }
+Boolean SCDynamicStoreSetMultiple(SCDynamicStoreRef s, CFDictionaryRef a, CFArrayRef b, CFArrayRef c) {
+	if (made[0] != '\0') { FILE *f = fopen(OP2NETD_TEST_DIR "/k/published", "a"); fprintf(f, "%s\n", made); fclose(f); }
+	made[0] = '\0'; return 1; }
 int CCKeyDerivationPBKDF(int alg, const char *pw, size_t pwl, const uint8_t *salt, size_t sl, int prf, unsigned rounds, uint8_t *dk, size_t dkl)
 { return PKCS5_PBKDF2_HMAC_SHA1(pw, (int)pwl, salt, (int)sl, (int)rounds, (int)dkl, dk) == 1 ? 0 : -1; }
 static int rdfile(const char *path, void *buf, size_t *len) {

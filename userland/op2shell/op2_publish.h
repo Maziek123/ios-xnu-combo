@@ -12,7 +12,8 @@
  * services' State: keys ourselves.
  *  - op2usb: ue0 (the kernel set 192.168.7.2/24), the Mac (192.168.7.1, NAT) as router.
  *  - op2wifi: wl0, while the Wi-Fi driver (boot-arg wifi=11) has a lease: the kernel's sysctl net.op2wlan says
- *    "wl0 <address> <netmask> <router> <dns>" (empty while down). Wi-Fi comes first in the ServiceOrder.
+ *    "wl0 <address> <netmask> <router> <dns>" (empty while down). Wi-Fi comes first in the ServiceOrder. DNS: the
+ *    lease's server then 1.1.1.1, or the includer's list (op2netd: a network's own DNS and search domain settings).
  * Keys survive our session, not a configd restart, so this child checks every 3 s and re-publishes what is gone.
  */
 #include <CoreFoundation/CoreFoundation.h>
@@ -84,9 +85,24 @@ set_order(int wifi_first, CFMutableDictionaryRef into)
 
 struct publish_state {
 	SCDynamicStoreRef st;
-	char wifi_pub[80];   /* the lease published as op2wifi ("" = none) */
+	char wifi_pub[300];  /* the lease (and the lists below) published as op2wifi ("" = none) */
 	int refused;
+	/* set by the includer before each publish_step (op2netd's per-network settings); "" = the defaults */
+	char dns_list[80];   /* Wi-Fi DNS servers, space-separated, in order (default: the lease's, then 1.1.1.1) */
+	char search[130];    /* Wi-Fi search domains, space-separated (default: none) */
 };
+
+/* up to max space-separated words of s as CFStrings; the count */
+static int
+words(const char *s, const void **out, int max)
+{
+	int n = 0;
+	char w[130];
+	int used = 0;
+	for (const char *p = s; n < max && sscanf(p, "%129s%n", w, &used) == 1; p += used)
+		out[n++] = str(w);
+	return n;
+}
 
 /* one look at the lease and configd's keys; publishes or removes what changed. Call every few seconds. */
 static void
@@ -99,18 +115,23 @@ publish_step(struct publish_state *ps)
 		SCDynamicStoreRef st = ps->st;
 		if (st == NULL)
 			return;
-		char ip[16], mask[16], router[16], dns[16], now[80] = "", msg[200];
+		char ip[16], mask[16], router[16], dns[16], now[300] = "", msg[400], dl[80];
 		/* Wi-Fi: ready once the kernel has a lease and KernelEventMonitor has seen wl0's address */
 		if (wifi_lease(ip, mask, router, dns) && exists(st, CFSTR("State:/Network/Interface/wl0/IPv4")))
-			snprintf(now, sizeof(now), "%s %s %s %s", ip, mask, router, dns);
+			snprintf(now, sizeof(now), "%s %s %s %s|%s|%s", ip, mask, router, dns, ps->dns_list, ps->search);
 		int wl_have = exists(st, CFSTR("State:/Network/Service/op2wifi/IPv4"));
 		if (now[0] != '\0' && (strcmp(now, wifi_pub) != 0 || !wl_have)) {
 			const void *a[] = { str(ip) }, *m[] = { str(mask) }, *r = str(router);
-			const void *dnsv[] = { str(dns), CFSTR("1.1.1.1") };
+			if (ps->dns_list[0] != '\0')
+				snprintf(dl, sizeof(dl), "%s", ps->dns_list);
+			else
+				snprintf(dl, sizeof(dl), "%s 1.1.1.1", dns);
+			const void *dnsv[4], *sd[8];
+			int nd = words(dl, dnsv, 4), ns = words(ps->search, sd, 8);
 			const void *k4[] = { CFSTR("Addresses"), CFSTR("SubnetMasks"), CFSTR("Router"), CFSTR("InterfaceName") };
 			const void *v4[] = { arr(1, a), arr(1, m), r, CFSTR("wl0") };
-			const void *kd[] = { CFSTR("ServerAddresses") }, *vd[] = { arr(2, dnsv) };
-			CFDictionaryRef d4 = dict(4, k4, v4), dd = dict(1, kd, vd);
+			const void *kd[] = { CFSTR("ServerAddresses"), CFSTR("SearchDomains") }, *vd[] = { arr(nd, dnsv), arr(ns, sd) };
+			CFDictionaryRef d4 = dict(4, k4, v4), dd = dict(ns > 0 ? 2 : 1, kd, vd);
 			CFMutableDictionaryRef all = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks,
 			    &kCFTypeDictionaryValueCallBacks);
 			CFDictionarySetValue(all, CFSTR("State:/Network/Service/op2wifi/IPv4"), d4);
@@ -118,8 +139,8 @@ publish_step(struct publish_state *ps)
 			set_order(1, all);
 			if (SCDynamicStoreSetMultiple(st, all, NULL, NULL)) {
 				snprintf(wifi_pub, sizeof(ps->wifi_pub), "%s", now);
-				snprintf(msg, sizeof(msg), PUBLISHER ": wl0 published as primary network (%s/%s, router %s, DNS %s)\n",
-				    ip, mask, router, dns);
+				snprintf(msg, sizeof(msg), PUBLISHER ": wl0 published as primary network (%s/%s, router %s, DNS %s%s%s)\n",
+				    ip, mask, router, dl, ns > 0 ? ", search " : "", ps->search);
 				say(msg);
 			} else if (!ps->refused) {
 				ps->refused = 1;
@@ -131,11 +152,12 @@ publish_step(struct publish_state *ps)
 			CFRelease(d4);
 			CFRelease(dd);
 			release_all(2, v4);
-			release_all(1, vd);
+			release_all(2, vd);
 			release_all(1, a);
 			release_all(1, m);
 			CFRelease(r);
-			CFRelease(dnsv[0]);
+			release_all(nd, dnsv);
+			release_all(ns, sd);
 		} else if (now[0] == '\0' && (wifi_pub[0] != '\0' || wl_have)) {   /* the lease is gone: back to USB */
 			const void *rm[] = { CFSTR("State:/Network/Service/op2wifi/IPv4"), CFSTR("State:/Network/Service/op2wifi/DNS") };
 			CFArrayRef remove = arr(2, rm);
