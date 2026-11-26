@@ -64,9 +64,10 @@ HTT SEC_IND and also a WMI install-key-complete event (0x5003); PEER_STATE event
 
 ## Next
 
-1. ~~Data through the keys~~ (done, step 7). An `ifnet` for iOS like `ue0` (bsd/dev/op2_usb.c), the driver staying
-   connected in its own thread with several frames in flight (step 7 sends one at a time and waits), and configd
-   service publication like `op2shell` does for USB.
+1. ~~Data through the keys~~ (done, step 7). Step 8 (`wifi=11`, written 2026-11-26, passes the simulation, not yet
+   run on the phone): `wl0` in bsd/dev/op2_wlan.c like `ue0`, the lease in sysctl `net.op2wlan`, `op2shell` publishing
+   it to configd ahead of USB, the driver staying connected with up to 16 frames in flight. After it: reconnecting,
+   DHCP renewal, power save, HT rates, interrupts.
 2. ~~GPIO 120-124~~ (read: driven low, as under Android; ruled out).
 3. Noise floor: compare with the firmware's own reports under Android if a log can be had there.
 

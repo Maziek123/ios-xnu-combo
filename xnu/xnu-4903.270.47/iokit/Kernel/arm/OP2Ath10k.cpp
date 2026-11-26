@@ -185,7 +185,7 @@ static const char *gStep = "2b";   /* "2b", "2c" or "3": the step the log lines 
 #define TARGET_CPU_FREQ         176000000u
 
 /* ---- the DMA block; every area on its own 64-byte cache lines ---- */
-#define DMA_SIZE        0x10000u
+#define DMA_SIZE        0x20000u
 #define OFF_CE0_SRC     0x0000u   /* 16 descriptors x 8 B */
 #define OFF_CE1_DST     0x0100u   /* 16 x 8 B */
 #define OFF_CE7_SRC     0x0200u   /*  2 x 8 B */
@@ -201,6 +201,7 @@ static const char *gStep = "2b";   /* "2b", "2c" or "3": the step the log lines 
 #define OFF_WMI_TX      0x3000u   /* 2 KB: WMI commands (CE3) */
 #define OFF_HTC_RX      0x4000u   /* 8 x 2 KB receive buffers for CE1 once the firmware runs */
 #define OFF_WMI_RX      0x8000u   /* 8 x 2 KB for CE2 */
+#define OFF_TXS         0x10000u  /* step 8: 16 transmit slots of 2 KB (fragment list, HTC header, TX_FRM, frame) */
 #define HTC_RX_COUNT    8u
 #define HTC_RX_SIZE     2048u
 #define WMI_RX_COUNT    8u
@@ -3129,6 +3130,11 @@ extern "C" void read_random(void *buffer, unsigned int numBytes);
 #define OFF_TX_BUF                        0xC000u  /* ath10k_htt_txbuf_32: frags[2] (16), HTC header (8), TX_FRM (16) */
 #define OFF_TX_FRAME                      0xC400u  /* the frame being sent */
 #define TX_FRAME_MAX                      1024u
+#define TXS_COUNT                         16u      /* step 8: frames in flight at once */
+#define TXS_SIZE                          0x800u
+#define TXS_FRAME                         64u      /* the frame's offset in its slot */
+#define TXS_ID_BASE                       64u      /* msdu ids 64-79 (htt_tx uses 0-63) */
+#define TXS_TIMEOUT_MS                    3000u    /* a slot whose completion never came is taken back */
 #define EAPOL_MAX                         512u
 #define EAPOL_QUEUE                       4u
 #define KI_VERSION_MASK                   0x0007u  /* EAPOL-Key key information */
@@ -3146,6 +3152,7 @@ extern "C" void read_random(void *buffer, unsigned int numBytes);
 
 static_assert(OFF_TX_FRAME + TX_FRAME_MAX <= DMA_SIZE, "the transmit areas are in the DMA block");
 static_assert(OFF_TX_BUF + 64u <= OFF_TX_FRAME, "the HTT transmit descriptor area");
+static_assert(OFF_TX_FRAME + TX_FRAME_MAX <= OFF_TXS && OFF_TXS + TXS_COUNT * TXS_SIZE <= DMA_SIZE, "the step 8 slots");
 
 static const uint8_t kLlcEapol[8] = { 0xAA, 0xAA, 0x03, 0x00, 0x00, 0x00, 0x88, 0x8E };
 /* our RSN element: version 1, group CCMP, pairwise CCMP, key management PSK, no capabilities (no PMF) */
@@ -3561,6 +3568,7 @@ wb_send(uint32_t cmd, const struct wbuf *w)
 /* ---- events while joining: everything goes through here (also while a WMI command waits for a credit) ---- */
 
 static void on_htt_msg(void);
+static void txs_done(uint32_t slot, uint32_t status);
 
 static void
 on_vdev_start_resp(void)
@@ -3848,9 +3856,12 @@ on_htt_msg(void)
 	case HTT_T2H_MSG_TYPE_TX_COMPL_IND:
 		gTxCompl++;
 		for (uint32_t i = 0; gRxLen >= 4u && i < gRx[2] && 4u + 2u * i + 2u <= gRxLen; i++) {
-			if (le16(gRx + 4 + 2u * i) == gTxWant) {
+			uint32_t mid = le16(gRx + 4 + 2u * i);
+			if (mid == gTxWant) {
 				gTxDone = true;
 				gTxStatus = gRx[1] & 7u;
+			} else if (mid >= TXS_ID_BASE && mid < TXS_ID_BASE + TXS_COUNT) {
+				txs_done(mid - TXS_ID_BASE, gRx[1] & 7u);
 			}
 		}
 		return;
@@ -5069,6 +5080,264 @@ run7(char *res, size_t len)
 	return true;
 }
 
+/* ---- step 8: wl0, a network interface for iOS (bsd/dev/op2_wlan.c), on the lease of step 7; stays connected ----
+ * Ethernet frames from iOS's stack go out as native wifi data frames (to DS, Protected: the chip encrypts them),
+ * up to TXS_COUNT in flight, each in its own DMA slot until its TX_COMPL_IND. Data frames from the network (IPv4,
+ * ARP, IPv6, anything with LLC/SNAP) go to the stack as Ethernet frames; iOS answers ARP for its address itself.
+ * Still polled (no interrupts): the loop sleeps 1 ms while there is traffic, 3 ms after a second of quiet. */
+
+#define ETH_HDR                           14u
+#define ETH_MAX                           1514u    /* header + 1500 */
+
+static uint32_t gTxsBusy;                 /* slots waiting for their completion */
+static uint32_t gTxsAt[TXS_COUNT];
+static uint32_t gTxsAcked, gTxsNoAck, gTxsDiscarded, gTxsLost, gTxsFrames, gTxsBytes, gTxsDropped;
+static uint32_t gWlRx, gWlRxBytes, gWlRxOwn, gBeaconMiss;
+static uint32_t gTxsSendFails;
+static bool gWlUp;
+
+static void
+txs_done(uint32_t slot, uint32_t status)
+{
+	if (slot >= TXS_COUNT || !(gTxsBusy & (1u << slot))) {
+		return;
+	}
+	gTxsBusy &= ~(1u << slot);
+	if (status == 0) {
+		gTxsAcked++;
+	} else if (status == 2u) {
+		gTxsNoAck++;
+	} else {
+		gTxsDiscarded++;
+	}
+}
+
+/* one native wifi data frame into a free slot and onto CE4; false if no slot or CE4 is full */
+static bool
+txs_send(const uint8_t *frame, uint32_t flen)
+{
+	uint32_t i = 0;
+	while (i < TXS_COUNT && (gTxsBusy & (1u << i))) {
+		i++;
+	}
+	if (i == TXS_COUNT || flen > TXS_SIZE - TXS_FRAME || flen < 24u) {
+		return false;
+	}
+	uint8_t *t = gDma + OFF_TXS + i * TXS_SIZE, *f = t + TXS_FRAME;
+	uint32_t tpa = gDmaPhys + OFF_TXS + i * TXS_SIZE, fpa = tpa + TXS_FRAME;
+	memcpy(f, frame, flen);
+	bzero(t, TXS_FRAME);
+	put32(t, fpa);                                    /* frags[0] = the frame; frags[1] = 0, 0 ends the list */
+	put32(t + 4, flen);
+	uint32_t pre = ((flen < HTT_TX_PREFETCH ? flen : HTT_TX_PREFETCH) + 3u) & ~3u;
+	t[16] = gEpHtt;                                   /* HTC header: endpoint, no flags, length */
+	put16(t + 18, 16u + pre);
+	t[24] = HTT_H2T_MSG_TYPE_TX_FRM;
+	t[25] = (uint8_t)(HTT_TX_FLAGS0_MAC_HDR_PRESENT | (HTT_TX_PKT_NATIVE_WIFI << 5));
+	put16(t + 26, (HTT_TX_EXT_TID_NON_QOS << 6) | HTT_TX_FLAGS1_POSTPONED);   /* vdev 0 */
+	put16(t + 28, flen);
+	put16(t + 30, TXS_ID_BASE + i);
+	put32(t + 32, tpa);
+	put16(t + 36, 0xFFFFu);                           /* offchan_tx: HTT_INVALID_PEERID, freq 0 */
+	put16(t + 38, 0u);
+	dma_fence();
+	if (!ce_send2(&gCe4, tpa + 16u, 24u, fpa, pre)) {
+		return false;
+	}
+	gTxsBusy |= 1u << i;
+	gTxsAt[i] = ms_since_power_on();
+	return true;
+}
+
+/* room on CE4 for one more frame (two descriptors, one entry kept free as ce_send2 does) */
+static bool
+ce4_room(void)
+{
+	struct ce_ring *r = &gCe4.src;
+	return ((r->sw_index - 1u - r->write_index) & (r->nentries - 1u)) >= 2u;
+}
+
+/* CE4 descriptors the copy engine has finished with; slots whose completion never came */
+static void
+txs_reap(void)
+{
+	while (ce_send_done(&gCe4)) {
+	}
+	bwr(gCe4.base + CE_HOST_IS, 0x1Fu);
+	uint32_t now = ms_since_power_on();
+	for (uint32_t i = 0; i < TXS_COUNT; i++) {
+		if ((gTxsBusy & (1u << i)) && now - gTxsAt[i] > TXS_TIMEOUT_MS) {
+			gTxsBusy &= ~(1u << i);
+			gTxsLost++;
+		}
+	}
+}
+
+/* from the network (join_data, after the keys): an Ethernet frame for iOS's stack */
+static void
+wl_rx(uint32_t ethertype, const uint8_t *p, uint32_t n, const uint8_t *da, const uint8_t *sa)
+{
+	static uint8_t e[ETH_MAX];
+	if (!gWlUp) {
+		return;
+	}
+	if (memcmp(sa, gMac, 6u) == 0) {
+		gWlRxOwn++;                                   /* our own broadcast, repeated by the access point */
+		return;
+	}
+	if (n > ETH_MAX - ETH_HDR) {
+		n = ETH_MAX - ETH_HDR;
+	}
+	memcpy(e, da, 6u);
+	memcpy(e + 6, sa, 6u);
+	put_be16(e + 12, ethertype);
+	memcpy(e + ETH_HDR, p, n);
+	op2_wlan_input(e, ETH_HDR + n);
+	gWlRx++;
+	gWlRxBytes += ETH_HDR + n;
+}
+
+/* to the network: an Ethernet frame from the stack as a native wifi data frame (to DS, Protected) */
+static bool
+wl_tx(const uint8_t *e, uint32_t n)
+{
+	static uint8_t f[32u + ETH_MAX];
+	uint32_t type = be16(e + 12);
+	if (n < ETH_HDR || type < 0x0600u) {             /* 802.3 length field: not Ethernet II */
+		gTxsDropped++;
+		return true;
+	}
+	uint32_t plen = n - ETH_HDR;
+	bzero(f, 32u);
+	f[0] = 0x08u;
+	f[1] = 0x01u | 0x40u;                             /* to DS, Protected */
+	memcpy(f + 4, gBssid, 6u);
+	memcpy(f + 10, gMac, 6u);
+	memcpy(f + 16, e, 6u);                            /* DA */
+	put16(f + 22, (uint32_t)(gSeq++ & 0xFFFu) << 4);
+	f[24] = 0xAAu;
+	f[25] = 0xAAu;
+	f[26] = 0x03u;
+	put_be16(f + 30, type);
+	memcpy(f + 32, e + ETH_HDR, plen);
+	if (!txs_send(f, 32u + plen)) {
+		return false;
+	}
+	gTxsFrames++;
+	gTxsBytes += n;
+	return true;
+}
+
+static void
+wl_status(char *out, size_t n, uint32_t up_s)
+{
+	snprintf(out, n, "wl0 up %u s: %u frames (%u KB) to iOS, %u frames (%u KB) from iOS (%u acknowledged, %u not, "
+	    "%u discarded, %u unconfirmed; %u dropped, %u queue drops, %u send failures); %u beacon-loss events",
+	    up_s, gWlRx, gWlRxBytes / 1024u, gTxsFrames, gTxsBytes / 1024u, gTxsAcked, gTxsNoAck, gTxsDiscarded, gTxsLost,
+	    gTxsDropped, op2_wlan_drops(), gTxsSendFails, gBeaconMiss);
+}
+
+static bool
+run8(char *res, size_t len, uint32_t stay_ms)
+{
+	gStep = "8";
+	char a[16], b[16], c[16];
+	ip_str(gMyIp, a);
+	ip_str(gRouterIp, b);
+	ip_str(gDns, c);
+	uint32_t prefix = 0;
+	for (uint32_t m = gNetmask; m & 0x80000000u; m <<= 1) {
+		prefix++;
+	}
+	int err = op2_wlan_attach(gMac);
+	if (err != 0) {
+		snprintf(res, len, "STEP 8 FAIL: wl0 could not be created (error %d)", err);
+		return false;
+	}
+	gIpHook = wl_rx;   /* from here on iOS's stack sees everything (and answers ARP) */
+	gWlUp = true;
+	err = op2_wlan_up(gMyIp, gNetmask, gRouterIp, gDns);
+	if (err != 0) {
+		gWlUp = false;
+		gIpHook = NULL;
+		snprintf(res, len, "STEP 8 FAIL: wl0 could not be given %s/%u (error %d)", a, prefix, err);
+		return false;
+	}
+	A_LOG("STEP 8 PASS: wl0 up with %s/%u (router %s, DNS %s): iOS can use it once op2shell publishes it; staying "
+	    "connected, a status line every 60 s", a, prefix, b, c);
+	uint32_t t0 = ms_since_power_on(), last = t0, next_report = t0 + 60000u, roams = 0, rx_seen = gWlRx;
+	static uint8_t e[ETH_MAX];
+	const char *why = NULL;
+	for (uint32_t it = 0;; it++) {
+		pump();
+		txs_reap();
+		bool busy = false;
+		while (gTxPausedIds == 0 && gTxsBusy != (1u << TXS_COUNT) - 1u && ce4_room()) {
+			uint32_t n = op2_wlan_dequeue(e, sizeof(e));
+			if (n == 0) {
+				break;
+			}
+			busy = true;
+			if (!wl_tx(e, n)) {
+				gTxsSendFails++;   /* cannot happen (slot and room checked); counted in case it does */
+				break;
+			}
+		}
+		uint32_t now = ms_since_power_on();
+		if (busy || gTxsBusy != 0 || gWlRx != rx_seen) {
+			last = now;
+			rx_seen = gWlRx;
+		}
+		if (gRoam) {
+			gRoam = false;
+			gBeaconMiss++;
+			if (roams++ < 4u) {
+				A_LOG("firmware roam event, reason %u (1: beacon loss) after %u s; still associated", gRoamReason,
+				    (now - t0) / 1000u);
+			}
+		}
+		if (gDeauth || gKickout) {
+			why = gKickout ? "the firmware dropped the access point (station kickout: it stopped answering)" :
+			    gDeauthSubtype == 0xA0u ? "the network disassociated us" : "the network deauthenticated us";
+			break;
+		}
+		if (it % 16u == 0 && fw_down("traffic on wl0", res, len)) {
+			gWlUp = false;
+			op2_wlan_down();
+			return false;
+		}
+		if ((int32_t)(now - next_report) >= 0) {
+			char st[240];
+			wl_status(st, sizeof(st), (now - t0) / 1000u);
+			A_LOG("%s", st);
+			next_report += 60000u;
+		}
+		if (stay_ms != 0 && now - t0 >= stay_ms) {
+			why = "the time set for this run ended";
+			break;
+		}
+		IOSleep(now - last < 1000u ? 1u : 3u);
+	}
+	uint32_t up_s = (ms_since_power_on() - t0) / 1000u;
+	gWlUp = false;
+	gIpHook = NULL;
+	op2_wlan_down();
+	for (uint32_t t = 0; t < 500u && gTxsBusy != 0; t++) {   /* let the frames in flight finish before leaving */
+		pump();
+		txs_reap();
+		IOSleep(1);
+	}
+	txs_reap();
+	char st[240];
+	wl_status(st, sizeof(st), up_s);
+	if (gDeauth && !gKickout) {
+		snprintf(res, len, "STEP 8 PASS: %s; then %s (reason %u, %s)", st, why, gDeauthReason, reason_name(gDeauthReason));
+	} else {
+		snprintf(res, len, "STEP 8 PASS: %s; then %s", st, why);
+	}
+	return true;
+}
+
 /* Leave politely: deauthenticate (reason 3), vdev down, peer delete, vdev stop - whatever was set up. */
 static void
 leave(void)
@@ -5223,6 +5492,10 @@ op2_ath10k_step2b(const struct op2_ath10k_bus *bus, char *result, size_t len)
 		if (ok && bus->data) {
 			A_LOG("%s", result);
 			ok = run7(result, len);
+		}
+		if (ok && bus->iface) {
+			A_LOG("%s", result);
+			ok = run8(result, len, bus->iface_ms);
 		}
 		leave();
 	}

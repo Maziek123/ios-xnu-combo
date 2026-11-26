@@ -63,7 +63,7 @@ step was one lower). Without the boot-arg (or `wifi=0`) nothing touches the Wi-F
 after boot, logs a verdict line (`RESULT:`) for each step it passes and the one it stops at, and repeats the last one
 every 60 s so it survives in ramoops: `grep -a 'OP2 WIFI' op2-last-boot.log`.
 Each change is checked first in a host simulation of the chip (and, for steps 5 and 6, of an access point):
-[`tools/wifi-sim`](tools/wifi-sim/README.md) (33 scenarios).
+[`tools/wifi-sim`](tools/wifi-sim/README.md) (35 scenarios).
 
 | Step | `wifi=` (runs the rows above it too) | Result |
 |---|---|---|
@@ -78,8 +78,9 @@ Each change is checked first in a host simulation of the chip (and, for steps 5 
 | **5** join | 8 | **Passes on the phone** (progress rows 17 and 19). Finds the network named in `wifi-network.txt` ([below](#wi-fi-firmware-files)): in step 4's scan, else by asking for it by name (probe requests on 2.4 GHz channels 1-11, up to 4 rounds), else in one more listen-only scan. Checks it offers WPA2-PSK with AES (CCMP), starts the chip on its channel, creates the peer, then open authentication and association as a plain 802.11a/b/g station (frames go out through HTT: this firmware has no WMI management transmit). With `wifi=8` the run ends here: the phone leaves the network again (deauthentication, vdev down, peer delete, vdev stop). |
 | **6** WPA2 | 9 | **Passes on the phone** (progress row 20): connected to an iPhone hotspot with WPA2, both keys confirmed by the firmware, the port open, 5 s connected without a deauthentication. Runs step 5 first, then the 4-way handshake (keys from the network name and password, message 3's MIC checked, the group key decrypted; message 4 is not waited for, as wpa_supplicant does), both keys into the chip, the port opened, 5 s connected counting data frames from the network, then it leaves as `wifi=8` does. The crypto (SHA-1, HMAC, the 802.11 PRF, AES key unwrap) is in the driver and checks itself against published test vectors first. |
 | **7** data | 10 | **Passes on the phone** (progress row 21): DHCP lease from the hotspot in under a second, ping to it 3 of 3, 2-3 ms. After step 6, the first data through the keys: DHCP with the network (discover and request sent encrypted by the chip; the offer and ack are the first encrypted frames from the network, decrypted by the chip), then ARP for the router it names and 3 pings to it; ARP requests for our address are answered. The result line has the lease (address, router, DNS) and the ping times. Then it leaves as `wifi=8` does. Not yet a network interface for iOS. |
+| **8** interface for iOS | 11 | **Not run on the phone yet**; passes in the simulation (scenarios 33 and 34). After step 7, `wl0`, a network interface for iOS (`bsd/dev/op2_wlan.c`, built like the USB link's `ue0`), gets the lease's address; the kernel publishes the lease in the sysctl `net.op2wlan`, and `op2shell` turns it into a configd service with Wi-Fi ahead of USB, so iOS takes its default route and DNS from the hotspot. Frames from iOS go out encrypted by the chip, up to 16 in flight; frames from the network go to iOS (which now answers ARP itself). The phone stays connected until the network ends it or the phone resets, with a status line (frames and bytes each way) every 60 s. Still polled, 802.11a/b/g rates, no power save. Needs the updated `op2shell` on the phone ([below](#testing-step-8-wi-fi-for-ios)). |
 
-Next, step 8 (`wifi=11`): staying connected and a network interface for iOS so Safari can use the connection (on top of step 7); later power save, beacon loss and roaming, then Bluetooth.
+Next, after step 8 has run on the phone: reconnecting after the network drops us, DHCP renewal, power save, faster rates (HT), interrupts instead of polling; then Bluetooth.
 
 #### Progress so far (2026-11-23 to 11-25)
 
@@ -124,6 +125,20 @@ grep -a 'OP2 WIFI' op2-last-boot.log | grep -v 'RESULT (repeat)'
 
 The `RESULT:` line is the verdict; the lines before it show where a failing step stopped.
 
+#### Testing step 8 (Wi-Fi for iOS)
+
+`wifi=11` stays connected, so there is no final `RESULT:` line while it runs: look for `STEP 8 PASS: wl0 up with ...`
+and the `wl0 up N s:` status lines that follow every 60 s (the counts grow while iOS uses the connection). The phone
+stays on Wi-Fi until the boot's `op2_deadline` (2 h with `tools/build-daily.sh`) or until you shut it down.
+
+1. Once, with the phone in TWRP: `bash tools/build-op2shell.sh --install` (on the Mac; it needs the dash, toybox and
+   dropbear builds from the USB console setup). The new `op2shell` reads `net.op2wlan` every 3 s and publishes wl0 to
+   configd ahead of USB; an older one leaves wl0 without a default route.
+2. Set `wifi=11`, keep the hotspot's Personal Hotspot screen open, build, boot, and wait about 3 minutes.
+3. The console (USB serial log) shows `op2shell: wl0 published as primary network (...)` a few seconds after
+   `STEP 8 PASS`. Over SSH or the USB shell, `/usr/local/bin/op2net example.com` fetches a page; then try Safari. To be sure it is Wi-Fi and not USB, unplug the cable (or stop the Mac's NAT) and
+   watch the hotspot's connected-device count; the status lines in the log afterwards show the traffic.
+
 #### Wi-Fi firmware files
 
 Step 2c and later (`wifi=5` and up) need two files in `firmware/qca6174/` of the checkout you build from. That folder is in
@@ -138,7 +153,7 @@ Step 2c and later (`wifi=5` and up) need two files in `firmware/qca6174/` of the
 `[wifi-fw] embedding firmware WLAN.RM.4.4.1-...`. Without them the kernel still builds, and step 2c reports that no
 firmware is built in.
 
-Steps 5 to 7 (`wifi=8` to `wifi=10`) join a network you name in a third file in the same folder,
+Steps 5 and later (`wifi=8` and up) join a network you name in a third file in the same folder,
 `firmware/qca6174/wifi-network.txt`: the network's name on the first line, exactly as it appears (upper and lower
 case, spaces and apostrophes count), and its password on the second (leave the second line out for an open network):
 

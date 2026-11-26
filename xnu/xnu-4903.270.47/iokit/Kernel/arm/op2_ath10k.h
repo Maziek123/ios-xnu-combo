@@ -1,7 +1,7 @@
 /*
  * OP2Ath10k.cpp: Wi-Fi step 2b (QCA6174 copy engines, diagnostic window, first BMI command).
  * Called by OP2Wifi.cpp with boot-arg wifi=4 and up once step 2a has read a valid chip ID; the flags below say
- * which later steps run (wifi=5: step 2c, the firmware boot ... wifi=10: step 7, data).
+ * which later steps run (wifi=5: step 2c, the firmware boot ... wifi=11: step 8, the interface).
  * Include after <IOKit/IOLib.h>.
  */
 
@@ -22,7 +22,17 @@ struct op2_ath10k_bus {
 	bool join;                 /* wifi=8: after a step 4 pass, step 5 (join the configured network) */
 	bool wpa2;                 /* wifi=9: after a step 5 pass, step 6 (WPA2-PSK 4-way handshake, keys, 5 s) */
 	bool data;                 /* wifi=10: after a step 6 pass, step 7 (DHCP through the keys, ARP, ping the router) */
+	bool iface;                /* wifi=11: after a step 7 pass, step 8 (wl0 for iOS on the lease; stays connected) */
+	uint32_t iface_ms;         /* step 8: how long to stay (0: until the network ends it or the phone resets) */
 };
+
+/* wl0 (bsd/dev/op2_wlan.c), used by step 8. Addresses as numbers (172.20.10.6 = 0xAC140A06). */
+extern "C" int op2_wlan_attach(const uint8_t mac[6]);          /* create wl0 (once); 0 or an errno */
+extern "C" int op2_wlan_up(uint32_t ip, uint32_t mask, uint32_t router, uint32_t dns);   /* address, up, sysctl */
+extern "C" void op2_wlan_down(void);                           /* sysctl cleared, address removed, queue dropped */
+extern "C" uint32_t op2_wlan_dequeue(uint8_t *frame, uint32_t max);   /* next Ethernet frame from iOS, 0: none */
+extern "C" void op2_wlan_input(const uint8_t *frame, uint32_t len);    /* an Ethernet frame for iOS */
+extern "C" uint32_t op2_wlan_drops(void);                      /* frames iOS queued that were dropped */
 
 /* Runs step 2b (and 2c, 3); writes the last step's one-line result ("STEP 2b PASS: ...", "STEP 3 FAIL: ...")
  * into result. */

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Compile-only check of the Wi-Fi kernel files with XNU's C++ warning flags (-Weverything -Werror minus XNU's own
+# Compile-only check of the Wi-Fi kernel files with XNU's C++ warning flags (and op2_wlan.c, see below) (-Weverything -Werror minus XNU's own
 # exceptions), against the stand-in headers in kstub/. Any clang++. With and without the generated firmware and
 # network headers (made here from a fixed test network if firmware/qca6174/ has the firmware).
 set -euo pipefail
@@ -33,5 +33,23 @@ else
 	echo "OP2Ath10k.cpp, firmware + network: skipped (no firmware in $FW)"
 fi
 clang++ $FLAGS -I"$HERE/kstub" -I"$OUT/kernel" "$OUT/kernel/OP2Wifi.cpp" && echo "OP2Wifi.cpp: OK" || rc=1
+# bsd/dev/op2_wlan.c (wl0, step 8) against the real XNU headers of this checkout, with approximate kernel defines: the
+# headers themselves warn under them, so only diagnostics in op2_wlan.c (and any error at all) count.
+XNU="$REPO/xnu/xnu-4903.270.47"
+if [ -f "$XNU/bsd/sys/param.h" ] && [ -f "$XNU/bsd/dev/op2_wlan.c" ]; then
+	wl=$(cd "$XNU" && clang -fsyntax-only --target=arm64-apple-ios12.0 -nostdinc -std=gnu99 -DKERNEL -DKERNEL_PRIVATE \
+	    -DBSD_KERNEL_PRIVATE -DXNU_KERNEL_PRIVATE -DPRIVATE -DARM64_BOARD_CONFIG_MSM8994 -DCONFIG_EMBEDDED=1 -Wall -Wextra \
+	    -Wshadow -Wmissing-prototypes -Wsign-compare -Wno-unused-parameter -Ibsd -Iosfmk -Iosfmk/libsa -Ilibkern -Iiokit \
+	    -Ipexpert -IEXTERNAL_HEADERS -Isecurity -I. bsd/dev/op2_wlan.c 2>&1 || true)
+	if printf '%s\n' "$wl" | grep -Eq '^bsd/dev/op2_wlan\.c:[0-9]+:[0-9]+: (warning|error)|error:'; then
+		printf '%s\n' "$wl" | grep -E '^bsd/dev/op2_wlan\.c:|error' | head -20
+		echo "op2_wlan.c: FAILED"
+		rc=1
+	else
+		echo "op2_wlan.c: OK"
+	fi
+else
+	echo "op2_wlan.c: skipped (no XNU tree at $XNU)"
+fi
 rm -rf "$OUT"
 exit $rc

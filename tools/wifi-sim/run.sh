@@ -26,7 +26,7 @@ g++ -std=gnu++17 -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=undef
 	-I"$OUT/kernel" "$HERE/harness.cpp" "$OUT/kernel/OP2Ath10k.cpp" -o "$OUT/sim" -lcrypto
 list=("$@")
 if [ ${#list[@]} -eq 0 ]; then
-	list=($(seq 0 32))
+	list=($(seq 0 34))
 fi
 bad=0
 for i in "${list[@]}"; do

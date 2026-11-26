@@ -43,7 +43,7 @@
 #include <utility>
 #include "op2_wifi_fw.h"   /* the same generated header OP2Ath10k.cpp sees (real firmware-6.bin) */
 
-#define DMA_BYTES 0x10000u
+#define DMA_BYTES 0x20000u
 static uint32_t bar[0x200000 / 4], conf[0x1000 / 4], dbi[0x1000 / 4];
 static uint8_t *dma;
 static const uint64_t kDmaPhys = 0x80000000ull, kChunkPhys = 0x90000000ull;
@@ -306,6 +306,116 @@ queue_chan_info(uint32_t mhz, uint32_t flags, int32_t nf, uint32_t rx_clear, uin
 
 #include "ap.inc"
 
+/* ---- step 8: a stand-in for iOS's network stack on wl0 (bsd/dev/op2_wlan.c on the phone) ---- */
+static struct {
+	bool attached, up, down;
+	uint8_t mac[6], router_mac[6];
+	uint32_t ip, mask, router, dns;
+	bool router_known, final_sent;
+} st;
+static std::deque<std::vector<uint8_t>> &st_out = *new std::deque<std::vector<uint8_t>>;
+static uint32_t st_in, st_echo_replies, st_ipv6, st_own, st_arp_answered, st_bad;
+
+static std::vector<uint8_t>
+st_eth(const uint8_t *dst, uint16_t type, const std::vector<uint8_t> &payload)
+{
+	std::vector<uint8_t> e(dst, dst + 6);
+	e.insert(e.end(), kStaMac, kStaMac + 6);
+	be16put(e, type);
+	e.insert(e.end(), payload.begin(), payload.end());
+	return e;
+}
+
+static void
+st_ping(uint16_t id, uint16_t seq, size_t data)
+{
+	std::vector<uint8_t> icmp = { 8, 0, 0, 0, (uint8_t)(id >> 8), (uint8_t)id, (uint8_t)(seq >> 8), (uint8_t)seq };
+	for (size_t i = 0; i < data; i++) icmp.push_back((uint8_t)i);
+	uint16_t c = ap_csum(icmp.data(), icmp.size());
+	icmp[2] = (uint8_t)(c >> 8); icmp[3] = (uint8_t)c;
+	st_out.push_back(st_eth(st.router_mac, 0x0800, ap_ipv4(1, st.ip, st.router, icmp)));
+}
+
+extern "C" int
+op2_wlan_attach(const uint8_t mac[6])
+{
+	assert(!st.attached);
+	st.attached = true;
+	memcpy(st.mac, mac, 6);
+	return 0;
+}
+
+extern "C" int
+op2_wlan_up(uint32_t ip, uint32_t mask, uint32_t router, uint32_t dns)
+{
+	assert(st.attached && !st.up);
+	st.up = true;
+	st.ip = ip; st.mask = mask; st.router = router; st.dns = dns;
+	std::vector<uint8_t> q = { 0, 1, 8, 0, 6, 4, 0, 1 };   /* who has the router */
+	q.insert(q.end(), kStaMac, kStaMac + 6); be32put(q, ip);
+	q.insert(q.end(), 6, 0); be32put(q, router);
+	st_out.push_back(st_eth(kBcast_sim, 0x0806, q));
+	return 0;
+}
+
+extern "C" void op2_wlan_down(void) { assert(st.up); st.down = true; }
+extern "C" uint32_t op2_wlan_drops(void) { return 0; }
+
+extern "C" uint32_t
+op2_wlan_dequeue(uint8_t *frame, uint32_t max)
+{
+	assert(st.up && !st.down);
+	if (st_out.empty()) return 0;
+	std::vector<uint8_t> e = st_out.front();
+	st_out.pop_front();
+	assert(e.size() <= max);
+	memcpy(frame, e.data(), e.size());
+	return (uint32_t)e.size();
+}
+
+extern "C" void
+op2_wlan_input(const uint8_t *e, uint32_t n)
+{
+	assert(st.up && !st.down && n >= 14);
+	st_in++;
+	if (memcmp(e + 6, kStaMac, 6) == 0) { st_own++; return; }
+	uint16_t type = (uint16_t)(e[12] << 8 | e[13]);
+	const uint8_t *p = e + 14;
+	if (type == 0x0806 && n >= 14 + 28) {
+		uint32_t spa = (uint32_t)p[14] << 24 | p[15] << 16 | p[16] << 8 | p[17], tpa = (uint32_t)p[24] << 24 | p[25] << 16 | p[26] << 8 | p[27];
+		if (p[7] == 2 && spa == st.router && memcmp(e, kStaMac, 6) == 0) {
+			memcpy(st.router_mac, p + 8, 6);
+			st.router_known = true;
+			if (scenario == 33) {
+				for (uint16_t i = 1; i <= 20; i++) st_ping(0x5354, i, 1400);
+			} else {
+				st_ping(0x5354, 1, 56);
+				std::vector<uint8_t> odd(46, 0);                 /* an 802.3 frame (length field): the driver drops it */
+				st_out.push_back(st_eth(st.router_mac, 46, odd));
+			}
+		} else if (p[7] == 1 && tpa == st.ip) {
+			std::vector<uint8_t> r = { 0, 1, 8, 0, 6, 4, 0, 2 };
+			r.insert(r.end(), kStaMac, kStaMac + 6); be32put(r, st.ip);
+			r.insert(r.end(), p + 8, p + 14); be32put(r, spa);
+			st_out.push_back(st_eth(p + 8, 0x0806, r));
+			st_arp_answered++;
+		} else {
+			st_bad++;
+		}
+		return;
+	}
+	if (type == 0x0800 && n >= 14 + 28 && p[9] == 1 && p[20] == 0 && p[24] == 0x53 && p[25] == 0x54) {
+		st_echo_replies++;
+		if (scenario == 33 && st_echo_replies == 20 && !st.final_sent) {
+			st.final_sent = true;
+			st_ping(0xd0e1, 99, 8);
+		}
+		return;
+	}
+	if (type == 0x86dd) { st_ipv6++; return; }
+	st_bad++;
+}
+
 /* One host->target message on copy engine ce (HTC control, WMI or HTT), as the firmware sees it. */
 static void
 fw_receive(unsigned ce, const uint8_t *m, uint32_t n, uint32_t dflags)
@@ -540,6 +650,7 @@ chip_step(void)
 	if (in_reset) {
 		return;
 	}
+	ap_tick();
 	if (!intr_at && (bar[0x3a008 / 4] & 0x400u)) {
 		intr_at = now_us;
 	}
@@ -796,7 +907,8 @@ main(int argc, char **argv)
 	st32(0x804, 0x00435000u);           /* hi_failure_state */
 	for (uint32_t i = 0; i < 60; i++) st32(0x35000 + 4 * i, 0xc0de0000u + i);
 	struct op2_ath10k_bus bus = { bar, conf, dbi, 0, cold_reset, scenario >= 6, scenario >= 9, scenario >= 18, ap_scenario(),
-		ap_scenario() && scenario != 27, scenario == 31 || scenario == 32 };
+		ap_scenario() && scenario != 27, scenario >= 31 && scenario <= 34, scenario == 33 || scenario == 34,
+		scenario == 34 ? 61000u : 0u };
 	PKCS5_PBKDF2_HMAC_SHA1(scenario == 25 ? "another-password" : "simulated-ap", scenario == 25 ? 16 : 12, (const unsigned char *)"iPhone", 6, 4096, 32, ap_pmk);
 	fflush(stdout);
 	char res[320];
@@ -948,7 +1060,7 @@ main(int argc, char **argv)
 		}
 		break;
 	}
-	case 22: case 23: case 24: case 25: case 26: case 27: case 28: case 29: case 30: case 31: case 32: {
+	case 22: case 23: case 24: case 25: case 26: case 27: case 28: case 29: case 30: case 31: case 32: case 33: case 34: {
 		CHECK(regd_seen && ring_cfg_before_regd && pdev_params.size() == 7);
 		CHECK(ap_rescans == (scenario == 23 ? 5u : scenario == 28 ? 2u : 0u));
 		CHECK(directed_scans == (scenario == 23 ? 4u : scenario == 28 ? 2u : 0u));
@@ -959,7 +1071,7 @@ main(int argc, char **argv)
 		bool assoc = scenario == 22 || scenario == 25 || scenario >= 27;
 		CHECK(ap_vdev_stops == (joined ? 1u : 0u) && ap_peer_deletes == (joined ? 1u : 0u) && ap_order_ok);
 		CHECK(ap_vdev_downs == (assoc ? 1u : 0u) && ap_vdev_ups == (assoc ? 1u : 0u) && ap_peer_assocs == (assoc ? 1u : 0u));
-		CHECK(ap_deauths == ((scenario == 22 || scenario >= 27) ? 1u : 0u) && (ap_deauths == 0 || ap_deauth_reason == 3));
+		CHECK(ap_deauths == ((scenario == 22 || (scenario >= 27 && scenario != 33)) ? 1u : 0u) && (ap_deauths == 0 || ap_deauth_reason == 3));
 		CHECK(!assoc || ap_pa_ok);
 		CHECK(logbuf.find("left the network: vdev down, peer delete, vdev stop confirmed") != std::string::npos || !joined ||
 		    !assoc);
@@ -985,6 +1097,27 @@ main(int argc, char **argv)
 			CHECK(ap_discovers == 1 && ap_requests == 1 && ap_arp_from_sta == 1 && ap_arp_reply_from_sta == 1 && ap_pings == 3 &&
 			    ap_bad_csum == 0);
 			CHECK(logbuf.find("DHCP offer: 172.20.10.2 from 172.20.10.1") != std::string::npos);
+			break;
+		case 33:
+		case 34:
+			CHECK(ok && strstr(res, "STEP 8 PASS: wl0 up "));
+			CHECK(logbuf.find("STEP 7 PASS: data through WPA2 with iPhone") != std::string::npos);
+			CHECK(logbuf.find("STEP 8 PASS: wl0 up with 172.20.10.2/28 (router 172.20.10.1, DNS 172.20.10.1)") != std::string::npos);
+			CHECK(st.attached && st.up && st.down && memcmp(st.mac, kStaMac, 6) == 0 && st.ip == kStaIp && st.mask == 0xfffffff0u);
+			CHECK(st.router == kApIp && st.dns == kApIp && st.router_known && memcmp(st.router_mac, kApMac, 6) == 0);
+			CHECK(st_own == 0 && st_bad == 0 && st_out.empty() && ap_bad_csum == 0 && ap_pend.empty());
+			if (scenario == 33) {
+				/* to iOS: ARP reply, 20 echo replies, the AP's ARP request, IPv6 (our repeated broadcast not); from iOS: ARP request,
+				 * 20 pings, the last ping, the ARP reply */
+				CHECK(strstr(res, ": 23 frames (28 KB) to iOS, 23 frames (28 KB) from iOS (23 acknowledged, 0 not, 0 discarded, 0 unconfirmed; 0 dropped"));
+				CHECK(strstr(res, "then the network deauthenticated us (reason 4, inactivity)"));
+				CHECK(st_echo_replies == 20 && st_ipv6 == 1 && st_arp_answered == 1 && ap_pings == 3 + 21);
+				CHECK(ap_arp_from_sta == 2 && ap_arp_reply_from_sta == 2 && ap_pend_max >= 4 && ap_multi_compl >= 5);
+			} else {
+				CHECK(strstr(res, "STEP 8 PASS: wl0 up 61 s: 2 frames (0 KB) to iOS, 2 frames (0 KB) from iOS (2 acknowledged") && strstr(res, "1 dropped"));
+				CHECK(strstr(res, "then the time set for this run ended") && st_echo_replies == 1 && ap_pings == 4);
+				CHECK(logbuf.find("8: wl0 up 60 s: ") != std::string::npos);
+			}
 			break;
 		case 32:
 			CHECK(!ok && strstr(res, "STEP 7 FAIL: data with iPhone: no DHCP offer to 4 discovers") && ap_discovers == 4);

@@ -24,6 +24,8 @@
  *      (authentication, association), then leave it
  *   9  as 8, then step 6 (OP2Ath10k.cpp): the WPA2-PSK 4-way handshake, keys into the chip, 5 s connected, leave
  *  10  as 9, then step 7 (OP2Ath10k.cpp): data through the keys: DHCP with the network, ARP and ping its router, leave
+ *  11  as 10, then step 8 (OP2Ath10k.cpp + bsd/dev/op2_wlan.c): wl0, a network interface for iOS on that lease;
+ *      stays connected until the network ends it or the phone resets (op2shell publishes it to configd)
  *
  * Runs in its own kernel thread 120 s after the framebuffer starts (RPM is up by then, the UI is running),
  * and repeats a one-line summary every 60 s so it survives in the ramoops ring.
@@ -625,7 +627,7 @@ step2a(void)
 	return chip_id_valid(chip) && rev == Q_HW32_CHIP_REV;
 }
 
-/* steps 2b to 7 (wifi=4 to 10): copy engines and BMI, firmware boot, WMI/HTT services (OP2Ath10k.cpp) */
+/* steps 2b to 8 (wifi=4 to 11): copy engines and BMI, firmware boot, WMI/HTT services (OP2Ath10k.cpp) */
 static bool
 cold_reset_for_2b(char *why, size_t n)
 {
@@ -637,7 +639,7 @@ step2b(void)
 {
 	char line[320];
 	struct op2_ath10k_bus bus = { gBar0, gConf, gDbi, gPowerOnAbs, cold_reset_for_2b, gMode >= 5, gMode >= 6,
-		gMode >= 7, gMode >= 8, gMode >= 9, gMode >= 10 };
+		gMode >= 7, gMode >= 8, gMode >= 9, gMode >= 10, gMode >= 11, 0 };
 	(void)op2_ath10k_step2b(&bus, line, sizeof(line));
 	summary(line);
 }
@@ -829,7 +831,8 @@ wifi_thread(__unused void *param, __unused wait_result_t wr_)
 		    gMode == 3 ? "steps 1, 2a (chip registers)" : gMode == 4 ? "steps 1, 2a + 2b (DMA, BMI)" :
 		    gMode == 5 ? "steps 1-2b + 2c (firmware boot)" : gMode == 6 ? "steps 1-2c + 3 (WMI, HTT)" :
 		    gMode == 7 ? "steps 1-3 + 4 (listen-only scan)" : gMode == 8 ? "steps 1-4 + 5 (join)" :
-		    gMode == 9 ? "steps 1-5 + 6 (WPA2)" : "steps 1-6 + 7 (DHCP, ping)");
+		    gMode == 9 ? "steps 1-5 + 6 (WPA2)" : gMode == 10 ? "steps 1-6 + 7 (DHCP, ping)" :
+		    "steps 1-7 + 8 (wl0 for iOS, stays connected)");
 		dump_all("before");
 		if (gMode >= 2) {
 			bringup();

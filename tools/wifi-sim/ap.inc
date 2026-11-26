@@ -13,6 +13,12 @@
  * 31: wifi=10: as 22, then data through the keys: DHCP (offer 172.20.10.2/28, router and DNS .1), our ARP for the
  *     router answered, the hotspot ARPs for us (we must answer), 3 pings answered
  * 32: wifi=10, the DHCP server stays silent: STEP 7 FAIL after 4 discovers
+ * 33: wifi=11: as 31, then step 8: wl0 for a stand-in of iOS's stack (harness.cpp): its ARP for the router, 20 pings of
+ *     1400 bytes at once (more than the 16 transmit slots; the AP confirms them 4 at a time in one TX_COMPL_IND), the
+ *     hotspot's ARP for us answered by the stack, an IPv6 frame and our own broadcast repeated by the AP; after a last
+ *     ping the AP deauthenticates us (reason 4): STEP 8 PASS, ended by the network
+ * 34: wifi=11 for 61 s (iface_ms): one ping, a frame with an 802.3 length field (dropped), then quiet; the 60 s status
+ *     line, then the time runs out and we leave (deauthentication reason 3)
  * 28: the hotspot never beacons where we listen but answers our probe request in the second directed round: WPA2 as 22 */
 #include <openssl/hmac.h>
 #include <openssl/evp.h>
@@ -30,7 +36,7 @@ static uint32_t ap_ps_off, ap_vdev_starts, ap_peer_creates, ap_peer_assocs, ap_v
 static bool ap_pa_ok, ap_order_ok = true;
 static uint32_t ap_state;   /* 0 idle, 1 authenticated, 2 associated, 3 msg3 sent, 4 done */
 
-static bool ap_scenario(void) { return scenario >= 22 && scenario <= 32; }
+static bool ap_scenario(void) { return scenario >= 22 && scenario <= 34; }
 
 static std::vector<uint8_t>
 ap_rsn(void)
@@ -170,12 +176,12 @@ static void be16put(std::vector<uint8_t> &v, uint32_t x) { v.push_back((uint8_t)
 /* to the station: native wifi from DS (the chip has decrypted it; Protected left set), LLC/SNAP, as an offloaded
  * in-order buffer like the phone's firmware delivers them */
 static void
-ap_to_sta(const uint8_t da[6], uint16_t ethertype, const std::vector<uint8_t> &payload)
+ap_to_sta(const uint8_t da[6], uint16_t ethertype, const std::vector<uint8_t> &payload, const uint8_t *sa = kApMac)
 {
 	std::vector<uint8_t> f = { 0x08, 0x42, 0, 0 };
 	f.insert(f.end(), da, da + 6);
 	f.insert(f.end(), kApMac, kApMac + 6);
-	f.insert(f.end(), kApMac, kApMac + 6);
+	f.insert(f.end(), sa, sa + 6);
 	f.insert(f.end(), { 0, 0, 0xaa, 0xaa, 0x03, 0, 0, 0 });
 	be16put(f, ethertype);
 	f.insert(f.end(), payload.begin(), payload.end());
@@ -264,6 +270,20 @@ ap_ip(const uint8_t *dst, uint32_t ethertype, const uint8_t *p, uint32_t n)
 	if (p[9] == 1) {                                   /* ICMP echo to 172.20.10.1 */
 		assert(memcmp(dst, kApMac, 6) == 0 && p[20] == 8 && ap_csum(p + 20, n - 20) == 0);
 		ap_pings++;
+		if (scenario == 33 && p[24] == 0xd0 && p[25] == 0xe1) {   /* step 8's last ping: the hotspot sends us away */
+			ap_mgmt_to_sta(0xc0, { 4, 0 }, false);
+			return;
+		}
+		if (scenario == 33 && ap_pings == 4) {         /* the first ping over wl0 */
+			std::vector<uint8_t> q = { 0, 1, 8, 0, 6, 4, 0, 1 };   /* who has 172.20.10.2: iOS's stack answers now */
+			q.insert(q.end(), kApMac, kApMac + 6); be32put(q, kApIp);
+			q.insert(q.end(), 6, 0); be32put(q, kStaIp);
+			ap_to_sta(kBcast_sim, 0x0806, q);
+			std::vector<uint8_t> v6(40, 0);                /* an IPv6 header (router advertisement-like), no payload */
+			v6[0] = 0x60; v6[6] = 58; v6[7] = 255;
+			ap_to_sta(kBcast_sim, 0x86dd, v6);
+			ap_to_sta(kBcast_sim, 0x0806, q, kStaMac);     /* a broadcast from us, repeated by the AP */
+		}
 		std::vector<uint8_t> icmp(p + 20, p + n);
 		icmp[0] = 0; icmp[2] = 0; icmp[3] = 0;
 		uint16_t c = ap_csum(icmp.data(), icmp.size());
@@ -386,6 +406,28 @@ ap_frame(const uint8_t *f, uint32_t n, bool mgmt)
 	}
 }
 
+/* step 8: data frames in slots (msdu ids 64-79) confirmed together, several ids in one TX_COMPL_IND */
+static std::vector<uint16_t> &ap_pend = *new std::vector<uint16_t>;
+static uint64_t ap_pend_since;
+static uint32_t ap_pend_max, ap_multi_compl;
+
+static void
+ap_flush_compl(void)
+{
+	std::vector<uint8_t> m = { 7, 0, (uint8_t)ap_pend.size(), 0 };
+	for (uint16_t i : ap_pend) { m.push_back((uint8_t)i); m.push_back((uint8_t)(i >> 8)); }
+	while (m.size() % 4) m.push_back(0);
+	outq[1].push_back(htc(1, m));
+	ap_multi_compl += ap_pend.size() > 1;
+	ap_pend.clear();
+}
+
+static void
+ap_tick(void)   /* from chip_step */
+{
+	if (!ap_pend.empty() && now_us - ap_pend_since >= 2000) ap_flush_compl();
+}
+
 /* HTT TX_FRM (the HTC payload p, plen bytes): check the descriptor, find the frame, complete it */
 static void
 ap_tx_frm(const uint8_t *p, uint32_t plen)
@@ -415,6 +457,12 @@ ap_tx_frm(const uint8_t *p, uint32_t plen)
 	std::vector<uint8_t> frame(f, f + len);
 	if (type == 3) {   /* management: MGMT_TX_COMPL_IND, 12-byte form as this firmware sends it (desc_id, status 0) */
 		outq[1].push_back(htc(1, { 0xe, 0, 0, 0, (uint8_t)id, (uint8_t)(id >> 8), 0, 0, 0, 0, 0, 0 }));
+	} else if (id >= 64 && (scenario == 33 || scenario == 34)) {   /* step 8 slots: confirmed 4 at a time (or after 2 ms) */
+		assert(id < 80 && std::find(ap_pend.begin(), ap_pend.end(), id) == ap_pend.end());
+		if (ap_pend.empty()) ap_pend_since = now_us;
+		ap_pend.push_back(id);
+		ap_pend_max = ap_pend.size() > ap_pend_max ? (uint32_t)ap_pend.size() : ap_pend_max;
+		if (ap_pend.size() >= 4) ap_flush_compl();
 	} else if (!(scenario == 30 && len == 32 + 99 && f[32 + 5] == 0x03)) {   /* data: TX_COMPL_IND, acknowledged */
 		outq[1].push_back(htc(1, { 7, 0, 1, 0, (uint8_t)id, (uint8_t)(id >> 8), 0, 0 }));
 	}   /* scenario 30: message 4 (key information 0x030a) is never confirmed */
