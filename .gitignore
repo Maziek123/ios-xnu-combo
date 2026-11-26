@@ -2,3 +2,5 @@
 /firmware/qca6174/
 /xnu/xnu-4903.270.47/iokit/Kernel/arm/op2_wifi_fw.h
 /xnu/xnu-4903.270.47/iokit/Kernel/arm/op2_wifi_net.h
+# op2shell built into the kernel (tools/build-xnu.sh)
+/xnu/xnu-4903.270.47/bsd/kern/op2_shell_blob.h

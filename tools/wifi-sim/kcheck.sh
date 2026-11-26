@@ -33,23 +33,32 @@ else
 	echo "OP2Ath10k.cpp, firmware + network: skipped (no firmware in $FW)"
 fi
 clang++ $FLAGS -I"$HERE/kstub" -I"$OUT/kernel" "$OUT/kernel/OP2Wifi.cpp" && echo "OP2Wifi.cpp: OK" || rc=1
-# bsd/dev/op2_wlan.c (wl0, step 8) against the real XNU headers of this checkout, with approximate kernel defines: the
-# headers themselves warn under them, so only diagnostics in op2_wlan.c (and any error at all) count.
+# bsd/dev/op2_wlan.c (wl0, step 8) and bsd/kern/op2_shell_sync.c (op2shell kept current by the kernel, with a stand-in
+# blob) against the real XNU headers of this checkout, with approximate kernel defines: the headers themselves warn
+# under them, so only diagnostics in the file checked (and any error at all) count.
 XNU="$REPO/xnu/xnu-4903.270.47"
-if [ -f "$XNU/bsd/sys/param.h" ] && [ -f "$XNU/bsd/dev/op2_wlan.c" ]; then
-	wl=$(cd "$XNU" && clang -fsyntax-only --target=arm64-apple-ios12.0 -nostdinc -std=gnu99 -DKERNEL -DKERNEL_PRIVATE \
-	    -DBSD_KERNEL_PRIVATE -DXNU_KERNEL_PRIVATE -DPRIVATE -DARM64_BOARD_CONFIG_MSM8994 -DCONFIG_EMBEDDED=1 -Wall -Wextra \
-	    -Wshadow -Wmissing-prototypes -Wsign-compare -Wno-unused-parameter -Ibsd -Iosfmk -Iosfmk/libsa -Ilibkern -Iiokit \
-	    -Ipexpert -IEXTERNAL_HEADERS -Isecurity -I. bsd/dev/op2_wlan.c 2>&1 || true)
-	if printf '%s\n' "$wl" | grep -Eq '^bsd/dev/op2_wlan\.c:[0-9]+:[0-9]+: (warning|error)|error:'; then
-		printf '%s\n' "$wl" | grep -E '^bsd/dev/op2_wlan\.c:|error' | head -20
-		echo "op2_wlan.c: FAILED"
-		rc=1
-	else
-		echo "op2_wlan.c: OK"
-	fi
+if [ -f "$XNU/bsd/sys/param.h" ]; then
+	printf 'x' > "$OUT/blob.bin"
+	printf '#define OP2_SHELL_BLOB_PATH "%s"\n#define OP2_SHELL_BLOB_LEN 1u\n#define OP2_SHELL_BLOB_SHA "0"\n' "$OUT/blob.bin" \
+	    > "$OUT/gen/op2_shell_blob.h"
+	for f in bsd/dev/op2_wlan.c bsd/kern/op2_shell_sync.c bsd/kern/op2_shell_sync.c+blob; do
+		inc=""
+		[ "${f%+blob}" != "$f" ] && inc="-I$OUT/gen"
+		src="${f%+blob}"
+		out=$(cd "$XNU" && clang -fsyntax-only --target=arm64-apple-ios12.0 -nostdinc -std=gnu99 -DKERNEL -DKERNEL_PRIVATE \
+		    -DBSD_KERNEL_PRIVATE -DXNU_KERNEL_PRIVATE -DPRIVATE -DARM64_BOARD_CONFIG_MSM8994 -DCONFIG_EMBEDDED=1 -Wall \
+		    -Wextra -Wshadow -Wmissing-prototypes -Wsign-compare -Wno-unused-parameter -Ibsd -Iosfmk -Iosfmk/libsa \
+		    -Ilibkern -Iiokit -Ipexpert -IEXTERNAL_HEADERS -Isecurity -I. $inc "$src" 2>&1 || true)
+		if printf '%s\n' "$out" | grep -Eq "^${src//./\\.}:[0-9]+:[0-9]+: (warning|error)|error:"; then
+			printf '%s\n' "$out" | grep -E "^$src:|error" | head -20
+			echo "$f: FAILED"
+			rc=1
+		else
+			echo "$f: OK"
+		fi
+	done
 else
-	echo "op2_wlan.c: skipped (no XNU tree at $XNU)"
+	echo "bsd files: skipped (no XNU tree at $XNU)"
 fi
 rm -rf "$OUT"
 exit $rc

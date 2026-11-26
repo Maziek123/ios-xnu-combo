@@ -1080,6 +1080,12 @@ bsdinit_task(void)
 
 	bsd_init_kprintf("bsd_do_post - done");
 
+#if defined(ARM64_BOARD_CONFIG_MSM8994)
+	/* the root filesystem is mounted read-write and launchd has not started: bring op2shell up to date */
+	extern void op2_shell_sync(void);
+	op2_shell_sync();
+#endif
+
 	load_init_program(p);
 	lock_trace = 1;
 }

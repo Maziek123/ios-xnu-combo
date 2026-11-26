@@ -46,7 +46,8 @@ use printf/IOLog for anything you need to see.
   firmware/qca6174/wifi-network.txt (tools/gen-wifi-fw.py -> op2_wifi_net.h: name + PMK only) and runs the 4-way
   handshake (STEP 6 PASS on the phone); wifi=10 adds DHCP/ARP/ping through the keys (STEP 7 PASS). wifi=11 (step 8,
   2026-11-26, not yet run on the phone): wl0 ifnet in bsd/dev/op2_wlan.c, sysctl net.op2wlan = lease, op2shell
-  publishes service op2wifi ahead of op2usb (phone needs the new op2shell: tools/build-op2shell.sh --install in TWRP);
+  publishes service op2wifi ahead of op2usb (build-xnu.sh embeds out/shell/build/op2shell in the kernel; bsd/kern/
+  op2_shell_sync.c rewrites /usr/local/bin/op2-air-run before launchd when it differs, op2shell_sync=0 off);
   stays connected, polled loop, 16 tx slots, status every 60 s. Renumbered 2026-11-25: one number per step.
   Firmware blobs + generated headers stay out of git. Before a phone round: bash tools/wifi-sim/run.sh (simulated chip + OpenSSL access point, 35 scenarios)
   and tools/wifi-sim/kcheck.sh (XNU warning flags).

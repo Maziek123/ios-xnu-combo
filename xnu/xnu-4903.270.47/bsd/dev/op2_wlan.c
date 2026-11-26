@@ -175,6 +175,11 @@ op2_wlan_up(uint32_t ip, uint32_t mask, uint32_t router, uint32_t dns)
 	if (mask == 0) {
 		mask = 0xffffff00u;
 	}
+	/* running first: adding the address sends ARP announcements through wl_if_output at once */
+	lck_mtx_lock(wl_lock);
+	wl_running = 1;
+	wl_ip = ip;
+	lck_mtx_unlock(wl_lock);
 	err = sock_socket(PF_INET, SOCK_DGRAM, 0, NULL, NULL, &so);
 	if (err == 0) {
 		bzero(&ifra, sizeof(ifra));
@@ -190,12 +195,12 @@ op2_wlan_up(uint32_t ip, uint32_t mask, uint32_t router, uint32_t dns)
 	}
 	if (err != 0) {
 		printf("OP2 WIFI: 8: wl0: SIOCAIFADDR failed (%d)\n", err);
+		lck_mtx_lock(wl_lock);
+		wl_running = 0;
+		wl_ip = 0;
+		lck_mtx_unlock(wl_lock);
 		return err;
 	}
-	lck_mtx_lock(wl_lock);
-	wl_running = 1;
-	wl_ip = ip;
-	lck_mtx_unlock(wl_lock);
 	ifnet_set_flags(wl_ifp, IFF_UP | IFF_RUNNING, IFF_UP | IFF_RUNNING);
 	ip_text(t[0], sizeof(t[0]), ip);
 	ip_text(t[1], sizeof(t[1]), mask);
