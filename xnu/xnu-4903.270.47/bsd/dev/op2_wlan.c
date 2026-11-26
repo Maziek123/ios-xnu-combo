@@ -10,7 +10,8 @@
  *
  * The Wi-Fi manager (boot-arg wifi=12) adds three more sysctls, for op2netd's page: net.op2wlan_state (read),
  * net.op2wlan_scan (read: the last scan, one network per line) and net.op2wlan_cmd (root writes "scan",
- * "join <name in hex> <PMK in hex | ->", "leave" or "off"; the driver's thread takes it with op2_wlan_take_cmd).
+ * "join <name in hex> <PMK in hex | -> [static <address> <netmask> <router> <dns>]" (8 hex digits each: a manual
+ * IPv4 setting, step 7 skips DHCP), "leave" or "off"; the driver's thread takes it with op2_wlan_take_cmd).
  */
 #if defined(ARM64_BOARD_CONFIG_MSM8994)
 

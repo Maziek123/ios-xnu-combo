@@ -63,7 +63,7 @@ step was one lower). Without the boot-arg (or `wifi=0`) nothing touches the Wi-F
 after boot, logs a verdict line (`RESULT:`) for each step it passes and the one it stops at, and repeats the last one
 every 60 s so it survives in ramoops: `grep -a 'OP2 WIFI' op2-last-boot.log`.
 Each change is checked first in a host simulation of the chip (and, for steps 5 and 6, of an access point):
-[`tools/wifi-sim`](tools/wifi-sim/README.md) (37 scenarios); op2netd's page: `tools/op2netd-test/run.sh`.
+[`tools/wifi-sim`](tools/wifi-sim/README.md) (38 scenarios); op2netd's page: `tools/op2netd-test/run.sh`.
 
 | Step | `wifi=` (runs the rows above it too) | Result |
 |---|---|---|
@@ -186,7 +186,7 @@ stays on Wi-Fi until the boot's `op2_deadline` (2 h with `tools/build-daily.sh`)
 In the log: `OP2 WIFI: mgr: manager: <state>` for every change (`idle`, `scanning`, `joining <name in hex>`, `connected
 <name> <address>`, `failed <name> <why>`, `off`), and the usual step 5 to 8 lines for each join. Underneath, op2netd and
 the driver talk through three sysctls (`bsd/dev/op2_wlan.c`): `net.op2wlan_cmd` (`scan`, `join <name in hex> <key in hex
-| ->`, `leave`, `off`; root only), `net.op2wlan_scan` and `net.op2wlan_state`.
+| -> [static <address> <netmask> <router> <dns>, 8 hex digits each]`, `leave`, `off`; root only), `net.op2wlan_scan` and `net.op2wlan_state`.
 
 #### Wi-Fi firmware files
 

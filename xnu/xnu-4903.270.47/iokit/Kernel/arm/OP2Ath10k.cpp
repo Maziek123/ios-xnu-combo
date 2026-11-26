@@ -3081,6 +3081,9 @@ static uint8_t gWantSsid[32];
 static uint32_t gWantSsidLen;
 static uint8_t gWantPmk[32];
 static bool gWantOpen;
+/* a manual IPv4 setting from op2netd's "join ... static": step 7 takes it instead of asking DHCP (big-endian) */
+static bool gWantStatic;
+static uint32_t gWantIp, gWantMask, gWantRouter, gWantDns;
 
 static void
 want_from_build(void)
@@ -3089,6 +3092,7 @@ want_from_build(void)
 	memcpy(gWantSsid, kOp2WifiSsid, kOp2WifiSsidLen);
 	memcpy(gWantPmk, kOp2WifiPmk, 32u);
 	gWantOpen = kOp2WifiOpen;
+	gWantStatic = false;
 }
 
 extern "C" void read_random(void *buffer, unsigned int numBytes);
@@ -4968,6 +4972,8 @@ data_fail(char *res, size_t len, const char *what)
 	return false;
 }
 
+static bool run7_dhcp(char *res, size_t len);
+
 static bool
 run7(char *res, size_t len)
 {
@@ -4975,55 +4981,31 @@ run7(char *res, size_t len)
 	char name[33];
 	ssid_print(name, sizeof(name));
 	uint32_t t0 = ms_since_power_on();
-	read_random(&gXid, sizeof(gXid));
 	gIpHook = on_ip;
-
-	/* DHCP: DISCOVER until an OFFER (4 tries, 2 s each), then REQUEST until an ACK or NAK */
-	for (uint32_t i = 0; i < 4u && gDhcpType == 0; i++) {
-		const char *e = dhcp_send(DHCP_DISCOVER, res, len);
-		if (e != NULL) {
-			return gFwDown ? false : data_fail(res, len, e);
-		}
-		A_LOG("DHCP discover %u sent (encrypted, broadcast)", i + 1u);
-		(void)wait_for([]() { return gDhcpType != 0 || gDeauth || gKickout; }, 2000u, "a DHCP offer", res, len);
-		if (gFwDown) {
-			return false;
-		}
-	}
-	if (gDeauth || gKickout) {
-		return data_fail(res, len, gKickout ? "the firmware dropped the access point" : "it deauthenticated us");
-	}
-	if (gDhcpType == 0) {
-		return data_fail(res, len, "no DHCP offer to 4 discovers");
-	}
-	char a[16], b[16], c[16], d[16];
-	ip_str(gOfferIp, a);
-	ip_str(gOfferServer, b);
-	A_LOG("DHCP offer: %s from %s (the first encrypted frame from the network decrypted by the chip)", a, b);
-	for (uint32_t i = 0; i < 4u && gDhcpType == DHCP_OFFER; i++) {
-		const char *e = dhcp_send(DHCP_REQUEST, res, len);
-		if (e != NULL) {
-			return gFwDown ? false : data_fail(res, len, e);
-		}
-		(void)wait_for([]() { return gDhcpType != DHCP_OFFER || gDeauth; }, 2000u, "a DHCP ack", res, len);
-		if (gFwDown) {
-			return false;
-		}
-	}
-	if (gDhcpType != DHCP_ACK) {
-		return data_fail(res, len, gDhcpType == DHCP_NAK ? "the DHCP server refused our request (NAK)" :
-		    "no DHCP ack to 4 requests");
+	if (gWantStatic) {   /* op2netd's manual setting: no DHCP */
+		gMyIp = gWantIp;
+		gNetmask = gWantMask;
+		gRouterIp = gWantRouter;
+		gDns = gWantDns;
+		gLease = 0;
+	} else if (!run7_dhcp(res, len)) {
+		return false;
 	}
 	uint32_t dhcp_ms = ms_since_power_on() - t0;
 	uint32_t prefix = 0;
 	for (uint32_t m = gNetmask; m & 0x80000000u; m <<= 1) {
 		prefix++;
 	}
+	char a[16], b[16], c[16], d[16];
 	ip_str(gMyIp, a);
 	ip_str(gRouterIp, b);
 	ip_str(gDns, c);
 	ip_str(gServerIp, d);
-	A_LOG("DHCP ack: %s/%u, router %s, DNS %s, server %s, lease %u s (%u ms)", a, prefix, b, c, d, gLease, dhcp_ms);
+	if (gWantStatic) {
+		A_LOG("manual address (op2netd): %s/%u, router %s, DNS %s; no DHCP", a, prefix, b, c);
+	} else {
+		A_LOG("DHCP ack: %s/%u, router %s, DNS %s, server %s, lease %u s (%u ms)", a, prefix, b, c, d, gLease, dhcp_ms);
+	}
 
 	/* ARP for the router, then ping it 3 times, 1 s apart */
 	uint32_t replies = 0, rmin = 0xFFFFFFFFu, rmax = 0, rsum = 0;
@@ -5093,8 +5075,56 @@ run7(char *res, size_t len)
 		snprintf(ping, sizeof(ping), "ping %s: %u of %u replies, %u/%u/%u ms", b, replies, PING_COUNT, rmin,
 		    rsum / replies, rmax);
 	}
-	snprintf(res, len, "STEP 7 PASS: data through WPA2 with %s: DHCP lease %s/%u (router %s, DNS %s, %u s) in %u ms; "
-	    "%s; %u ARP requests for us answered", name, a, prefix, b, c, gLease, dhcp_ms, ping, gArpAnswered);
+	if (gWantStatic) {
+		snprintf(res, len, "STEP 7 PASS: data through WPA2 with %s: manual address %s/%u (router %s, DNS %s), no DHCP; "
+		    "%s; %u ARP requests for us answered", name, a, prefix, b, c, ping, gArpAnswered);
+	} else {
+		snprintf(res, len, "STEP 7 PASS: data through WPA2 with %s: DHCP lease %s/%u (router %s, DNS %s, %u s) in %u ms; "
+		    "%s; %u ARP requests for us answered", name, a, prefix, b, c, gLease, dhcp_ms, ping, gArpAnswered);
+	}
+	return true;
+}
+
+/* step 7's DHCP: DISCOVER until an OFFER (4 tries, 2 s each), then REQUEST until an ACK or NAK */
+static bool
+run7_dhcp(char *res, size_t len)
+{
+	read_random(&gXid, sizeof(gXid));
+	for (uint32_t i = 0; i < 4u && gDhcpType == 0; i++) {
+		const char *e = dhcp_send(DHCP_DISCOVER, res, len);
+		if (e != NULL) {
+			return gFwDown ? false : data_fail(res, len, e);
+		}
+		A_LOG("DHCP discover %u sent (encrypted, broadcast)", i + 1u);
+		(void)wait_for([]() { return gDhcpType != 0 || gDeauth || gKickout; }, 2000u, "a DHCP offer", res, len);
+		if (gFwDown) {
+			return false;
+		}
+	}
+	if (gDeauth || gKickout) {
+		return data_fail(res, len, gKickout ? "the firmware dropped the access point" : "it deauthenticated us");
+	}
+	if (gDhcpType == 0) {
+		return data_fail(res, len, "no DHCP offer to 4 discovers");
+	}
+	char a[16], b[16];
+	ip_str(gOfferIp, a);
+	ip_str(gOfferServer, b);
+	A_LOG("DHCP offer: %s from %s (the first encrypted frame from the network decrypted by the chip)", a, b);
+	for (uint32_t i = 0; i < 4u && gDhcpType == DHCP_OFFER; i++) {
+		const char *e = dhcp_send(DHCP_REQUEST, res, len);
+		if (e != NULL) {
+			return gFwDown ? false : data_fail(res, len, e);
+		}
+		(void)wait_for([]() { return gDhcpType != DHCP_OFFER || gDeauth; }, 2000u, "a DHCP ack", res, len);
+		if (gFwDown) {
+			return false;
+		}
+	}
+	if (gDhcpType != DHCP_ACK) {
+		return data_fail(res, len, gDhcpType == DHCP_NAK ? "the DHCP server refused our request (NAK)" :
+		    "no DHCP ack to 4 requests");
+	}
 	return true;
 }
 
@@ -5582,18 +5612,49 @@ mgr_take(void)
 		while (*pp != 0 && *pp != ' ') {
 			pp++;
 		}
-		bool open = *pp == ' ' && strncmp(pp + 1, "-", 2) == 0;
-		if (hex_get(sp, ssid, 32u, &sn) && *pp == ' ' && (open || (hex_get(pp + 1, pmk, 32u, &pn) && pn == 32u))) {
+		bool open = *pp == ' ' && (strncmp(pp + 1, "-", 2) == 0 || strncmp(pp + 1, "- ", 2) == 0);
+		/* optional: " static <address> <netmask> <router> <dns>", each 8 hex digits (big-endian) */
+		const char *xp = *pp == ' ' ? pp + 1 : pp;
+		while (*xp != 0 && *xp != ' ') {
+			xp++;
+		}
+		uint32_t ip4[4] = { 0, 0, 0, 0 };
+		bool fixed = false, extra_ok = *xp == 0;
+		if (*xp == ' ' && strncmp(xp + 1, "static ", 7) == 0) {
+			const char *q = xp + 8;
+			extra_ok = true;
+			for (int k = 0; k < 4 && extra_ok; k++) {
+				uint8_t v[4];
+				uint32_t vn = 0;
+				extra_ok = hex_get(q, v, 4u, &vn) && vn == 4u;
+				ip4[k] = (uint32_t)v[0] << 24 | (uint32_t)v[1] << 16 | (uint32_t)v[2] << 8 | v[3];
+				q += 8;
+				if (k < 3) {
+					extra_ok = extra_ok && *q == ' ';
+					q++;
+				}
+			}
+			extra_ok = extra_ok && *q == 0 && ip4[0] != 0 && ip4[1] != 0;
+			fixed = extra_ok;
+		}
+		if (hex_get(sp, ssid, 32u, &sn) && *pp == ' ' && extra_ok &&
+		    (open || (hex_get(pp + 1, pmk, 32u, &pn) && pn == 32u))) {
 			memcpy(gWantSsid, ssid, sn);
 			gWantSsidLen = sn;
 			memcpy(gWantPmk, open ? kOp2WifiPmk : pmk, 32u);   /* (an open network never uses it) */
 			gWantOpen = open;
+			gWantStatic = fixed;
+			gWantIp = ip4[0];
+			gWantMask = ip4[1];
+			gWantRouter = ip4[2];
+			gWantDns = ip4[3];
 			bzero(pmk, sizeof(pmk));
 			bzero(c, sizeof(c));
 			return MGR_JOIN;
 		}
 		bzero(c, sizeof(c));
-		A_LOG("%s", "manager: a join command it could not read (join <name in hex> <PMK in hex | ->)");
+		A_LOG("%s", "manager: a join command it could not read (join <name in hex> <PMK in hex | -> [static <address> "
+		    "<netmask> <router> <dns>, 8 hex digits each])");
 		return MGR_NONE;
 	}
 	A_LOG("manager: unknown command \"%.40s\"", c);

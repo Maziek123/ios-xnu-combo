@@ -340,7 +340,7 @@ extern "C" int
 op2_wlan_attach(const uint8_t mac[6])
 {
 	if (st.attached) {   /* as op2_wlan.c: wl0 is made once, later calls reuse it */
-		assert(scenario == 35 && memcmp(st.mac, mac, 6) == 0);
+		assert((scenario == 35 || scenario == 37) && memcmp(st.mac, mac, 6) == 0);
 		return 0;
 	}
 	st.attached = true;
@@ -353,7 +353,7 @@ static uint32_t st_ups;
 extern "C" int
 op2_wlan_up(uint32_t ip, uint32_t mask, uint32_t router, uint32_t dns)
 {
-	if (scenario == 35 && st.up && st.down) {   /* the manager joined again */
+	if ((scenario == 35 || scenario == 37) && st.up && st.down) {   /* the manager joined again */
 		st.up = st.down = st.router_known = false;
 	}
 	assert(st.attached && !st.up);
@@ -372,10 +372,10 @@ extern "C" uint32_t op2_wlan_drops(void) { return 0; }
 extern "C" void op2_keep(const char *fmt, ...) { (void)fmt; }   /* the kept log: the sim has only its console */
 extern "C" void op2_shell_status(char *out, size_t n) { snprintf(out, n, "simulated; op2-air-run running (pid 1)"); }
 
-/* the Wi-Fi manager's sysctls (scenario 35): op2netd's side, scripted */
+/* the Wi-Fi manager's sysctls (scenarios 35-37): op2netd's side, scripted */
 static std::vector<std::string> &st_states = *new std::vector<std::string>;
 static std::string &st_scan = *new std::string;
-static uint32_t st_scans, st_mphase;
+static uint32_t st_scans, st_mphase, st_discovers_then;
 
 extern "C" void
 op2_wlan_set_state(const char *text)
@@ -402,6 +402,24 @@ op2_wlan_take_cmd(char *out, uint32_t n)
 	std::string c;
 	static uint32_t scans_then;
 	char pmk[65];
+	if (scenario == 37) {   /* the build's network over DHCP, leave, then again with a manual address (DNS 9.9.9.9) */
+		switch (st_mphase) {
+		case 0: if (is("connected ") && st_echo_replies >= 1) c = "leave"; break;
+		case 1:
+			if (cur == "idle") {
+				for (int i = 0; i < 32; i++) snprintf(pmk + 2 * i, 3, "%02x", ap_pmk[i]);
+				c = std::string("join 6950686f6e65 ") + pmk + " static ac140a02 fffffff0 ac140a01 09090909";
+				st_discovers_then = ap_discovers;
+			}
+			break;
+		case 2: if (is("connected ") && st_ups == 2 && st_echo_replies >= 2) c = "off"; break;
+		default: break;
+		}
+		if (c.empty()) return 0;
+		st_mphase++;
+		snprintf(out, n, "%s", c.c_str());
+		return 1;
+	}
 	switch (st_mphase) {
 	case 0: if (is("connected ") && st_echo_replies >= 1) { c = "scan"; scans_then = st_scans; } break;
 	case 1: if (is("connected ") && st_scans > scans_then) c = "leave"; break;
@@ -612,9 +630,9 @@ fw_receive(unsigned ce, const uint8_t *m, uint32_t n, uint32_t dflags)
 						memcpy(&f[4], kStaMac, 6);
 						queue_ring_frame(f, (1u << 31) | (1u << 8), true, 52);
 					}
-					if ((scenario == 35 || scenario == 36) && !directed) {   /* the manager: the hotspot (not in 36), a cafe */
+					if (scenario >= 35 && !directed) {   /* the manager: the hotspot (not in 36), a cafe */
 						static const uint8_t cafe[6] = { 0x02, 0xca, 0xfe, 0, 0, 1 };
-						if (scenario == 35) queue_ring_frame(ap_beacon(), (1u << 31) | (1u << 8), true, 55);
+						if (scenario != 36) queue_ring_frame(ap_beacon(), (1u << 31) | (1u << 8), true, 55);
 						queue_ring_frame(make_beacon(cafe, "Cafe", 11, false, 0x80), (1u << 31) | (1u << 8), true, 30);
 					} else if (starts == 1 && scenario != 23 && scenario != 28) {
 						queue_ring_frame(ap_beacon(), (1u << 31) | (1u << 8), true, 55);
@@ -1165,6 +1183,21 @@ main(int argc, char **argv)
 		char pk[65];
 		for (int i = 0; i < 32; i++) snprintf(pk + 2 * i, 3, "%02x", ap_pmk[i]);
 		CHECK(logbuf.find(pk) == std::string::npos);                        /* the PMK from the command is not logged */
+		break;
+	}
+	case 37: {   /* the manager: a manual address (op2netd's "join ... static") skips DHCP */
+		auto saw = [&](const char *p) {
+			for (const std::string &x : st_states) if (x.rfind(p, 0) == 0) return true;
+			return false;
+		};
+		CHECK(ok && strstr(res, "Wi-Fi manager: turned off by op2netd"));
+		CHECK(st_mphase == 3 && st_states.back() == "off" && saw("connected 6950686f6e65 172.20.10.2/28"));
+		CHECK(st_discovers_then >= 1 && ap_discovers == st_discovers_then);   /* no DHCP the second time */
+		CHECK(st_ups == 2 && st.ip == 0xAC140A02u && st.mask == 0xFFFFFFF0u && st.router == 0xAC140A01u && st.dns == 0x09090909u);
+		CHECK(st_echo_replies == 2 && st_own == 0 && st_bad == 0);
+		CHECK(logbuf.find("manual address (op2netd): 172.20.10.2/28, router 172.20.10.1, DNS 9.9.9.9; no DHCP") != std::string::npos);
+		CHECK(logbuf.find("STEP 7 PASS: data through WPA2 with iPhone: manual address 172.20.10.2/28 (router 172.20.10.1, DNS "
+		    "9.9.9.9), no DHCP; ping 172.20.10.1: 3 of 3 replies") != std::string::npos);
 		break;
 	}
 	case 22: case 23: case 24: case 25: case 26: case 27: case 28: case 29: case 30: case 31: case 32: case 33: case 34: {

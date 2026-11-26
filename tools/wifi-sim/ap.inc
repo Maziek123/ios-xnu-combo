@@ -25,6 +25,8 @@
  *     an open "Cafe"; the hotspot starts a fresh session at each vdev stop.
  * 36: wifi=12, the build's network not around (only "Cafe"): skipped at once (no probing), a periodic rescan while
  *     idle, then off
+ * 37: wifi=12, a manual address: the build's network over DHCP, leave, then "join ... static 172.20.10.2/28 router
+ *     .1 DNS 9.9.9.9" (no DHCP discover the second time; ARP and ping as usual), off
  * 28: the hotspot never beacons where we listen but answers our probe request in the second directed round: WPA2 as 22 */
 #include <openssl/hmac.h>
 #include <openssl/evp.h>
@@ -42,7 +44,7 @@ static uint32_t ap_ps_off, ap_vdev_starts, ap_peer_creates, ap_peer_assocs, ap_v
 static bool ap_pa_ok, ap_order_ok = true;
 static uint32_t ap_state;   /* 0 idle, 1 authenticated, 2 associated, 3 msg3 sent, 4 done */
 
-static bool ap_scenario(void) { return scenario >= 22 && scenario <= 36; }
+static bool ap_scenario(void) { return scenario >= 22 && scenario <= 37; }
 static uint32_t ap_sessions, ap_authorized_total;
 
 static std::vector<uint8_t>
@@ -548,7 +550,7 @@ ap_wmi(uint32_t id, const uint8_t *p, uint32_t plen)
 	case 0x5006: {
 		assert(tag == 93 && w[1] == 0);
 		ap_vdev_stops++;
-		if (scenario == 35) {   /* the manager joins again: a fresh session */
+		if (scenario == 35 || scenario == 37) {   /* the manager joins again: a fresh session */
 			ap_sessions++;
 			ap_authorized_total += ap_authorized;
 			ap_ps_off = ap_vdev_starts = ap_peer_creates = ap_peer_assocs = ap_msg1s = ap_msg2_ok = ap_msg4_ok = 0;
