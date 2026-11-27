@@ -73,7 +73,8 @@ delegation refusals (dasd) and code-signing "allowing" page notes not logged at 
   matching, notifications, registry paths, opens, property reads once each (IOUserClient.cpp op2_iolog, own 150-line
   budget) and each distinct ioctl with interface name + Apple80211 request words (sys_generic.c op2_wifid_ioctl, 120 max).
   S0 result (2026-11-27): wifid opens AppleKeyStore + IOPMrootDomain, IODeviceTree:/product missing, WAITS for an
-  IO80211Interface to be published; no ioctls. S1 (op2wifid=2, not run yet): OP2Wifid.cpp publishes a stand-in
+  IO80211Interface to be published; only ioctl SIOCGIFMEDIA (lo0: EOPNOTSUPP) = how it finds a Wi-Fi interface. The
+  ioctl trace dedupes per interface name too. S1 (op2wifid=2, not run yet): OP2Wifid.cpp publishes a stand-in
   IO80211Interface (BSD Name wl0, IOMACAddress) when the manager comes up.
   Bluetooth: OP2Wifi.cpp, boot-arg bt=1 probe / bt=2 step 1 (out of reset, chip seen on the UART pins), run before
   Wi-Fi in the same thread, "OP2 BT:" lines. 2026-11-27: chip once found RUNNING (reset already high, RX=1 vs

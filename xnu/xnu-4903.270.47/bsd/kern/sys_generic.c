@@ -811,8 +811,12 @@ op2_wifid_ioctl(int ftype, int fam, const char *vname, u_long com, const uint8_t
 	for (int i = 0; i < 3 && at + 4u * (u_int)i + 4u <= have; i++) {
 		memcpy(&w[i], req + at + 4 * i, 4);
 	}
+	uint32_t key = w[0];   /* and the interface: the same request to lo0, ue0 and wl0 is three lines */
+	for (int i = 0; ifn[i] != 0; i++) {
+		key = key * 31u + (uint8_t)ifn[i];
+	}
 	for (int i = 0; i < nseen && i < 120; i++) {
-		if (seen[i].com == com && seen[i].type == w[0] && seen[i].error == error) {
+		if (seen[i].com == com && seen[i].type == key && seen[i].error == error) {
 			return;
 		}
 	}
@@ -821,7 +825,7 @@ op2_wifid_ioctl(int ftype, int fam, const char *vname, u_long com, const uint8_t
 		return;
 	}
 	seen[k].com = com;
-	seen[k].type = w[0];
+	seen[k].type = key;
 	seen[k].error = error;
 	if (ftype == DTYPE_SOCKET) {
 		snprintf(file, sizeof(file), "socket (family %d)", fam);

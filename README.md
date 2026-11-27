@@ -249,8 +249,10 @@ kept log: the IOKit classes and paths it looks up or waits for, what it opens, t
 (each once), and each distinct ioctl (the interface name, Apple80211's request words, the answer). Boot-arg
 `op2wifid=0` turns it off.
 
-- **S0** (first run, 2026-11-27): `wifid` opens AppleKeyStore and the power root domain, looks for
-  `IODeviceTree:/product` (not there), and **waits for an `IO80211Interface` to be published**. No ioctls seen.
+- **S0** (2026-11-27): `wifid` opens AppleKeyStore and the power root domain, reads the battery's properties, looks
+  for `IODeviceTree:/product` (not there), and **waits for an `IO80211Interface` to be published**. Its only network
+  ioctl is `SIOCGIFMEDIA` (an interface's medium; `lo0` answers "not supported"): how it would recognize a Wi-Fi
+  interface, so `wl0` will have to report an 802.11 medium.
 - **S1** (`op2wifid=2`, not run yet): when the Wi-Fi manager comes up, the kernel publishes a stand-in
   `IO80211Interface` (`iokit/Kernel/arm/OP2Wifid.cpp`: BSD name `wl0`, the chip's MAC, nothing else yet), and the
   trace shows what `wifid` asks of it next. Without the boot-arg nothing is published.
