@@ -76,9 +76,10 @@ delegation refusals (dasd) and code-signing "allowing" page notes not logged at 
   IO80211Interface to be published; no ioctls. S1 (op2wifid=2, not run yet): OP2Wifid.cpp publishes a stand-in
   IO80211Interface (BSD Name wl0, IOMACAddress) when the manager comes up.
   Bluetooth: OP2Wifi.cpp, boot-arg bt=1 probe / bt=2 step 1 (out of reset, chip seen on the UART pins), run before
-  Wi-Fi in the same thread, "OP2 BT:" lines. First run 2026-11-27: chip found RUNNING (reset already high, RX=1 vs
-  pull-down) but silent for 1 s after our reset; Wi-Fi fine with BT held in reset. Now: 200 ms as found, 5 s after
-  reset, then a retry right after Wi-Fi raises WLAN_EN (bt_after_wlan_en in bringup()). UART = BLSP2 UART2 0xf995e000 (ttyHS0), pins 45-48
+  Wi-Fi in the same thread, "OP2 BT:" lines. 2026-11-27: chip once found RUNNING (reset already high, RX=1 vs
+  pull-down; likely left on by Android) but silent after our reset: 1 s, then cold starts silent for 5 s, also with
+  WLAN_EN high. Wi-Fi fine with BT held in reset, BUT a BT reset toggle + 5 s wait inside Wi-Fi's bringup() (after
+  WLAN_EN, before PCIe) broke PCIe link training: never touch BT between WLAN_EN and the PCIe link. Retry removed. UART = BLSP2 UART2 0xf995e000 (ttyHS0), pins 45-48
   TX/RX/CTS/RFR func 2, GCC blsp2 ahb 0x0944 (vote 0x1484 bit 15), uart2 apps CBCR 0x0a44, RCG 0x0a4c; reset PM8994
   GPIO 19 (0xd200, mode 0x10 low / 0x11 high, vin 2). Plan: own HCI driver + op2netd page; iOS bluetoothd not used.
   The clock now syncs over the network (NTP), which fixes the old TLS-date problem while connected.

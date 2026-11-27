@@ -26,7 +26,7 @@ clone it to `xnu/xnu-4903.270.47` inside this checkout.
 | **Internet over USB** | Through the Mac's NAT: configd makes `ue0` primary, DNS + HTTP verified from the phone ([setup](docs/SETUP.md)) | `op2net example.com` → `200 OK` |
 | Safari | Loads sites over HTTPS with JavaScript (JIT on): Google, Wikipedia, YouTube, apple.com (heavy sites still rough) | photos on the phone |
 | **Wi-Fi (QCA6174 on PCIe)** | **iOS uses it: Safari over Wi-Fi**, networks chosen on the phone (`wifi=12`, a page at `http://127.0.0.1:8080`: join, details, per-network IPv4/DNS settings); fast.com 8 Mbit/s down, 21 up. Scan, join, WPA2, DHCP, then `wl0`, a network interface iOS routes through, all encrypted by the chip. Still 802.11g rates, polled; no status-bar icon yet ([below](#wi-fi-bring-up-step-by-step)) | `OP2 WIFI: 8: STEP 8 PASS` and `op2netd: wl0 published` |
-| Bluetooth (same chip, over a UART) | Step 1 (`bt=2`, [below](#bluetooth-bring-up)): the chip was found running on its UART lines, but did not restart within 1 s after a reset; a second version (5 s, then after WLAN_EN) is ready | `OP2 BT: RESULT` |
+| Bluetooth (same chip, over a UART) | Step 1 (`bt=2`, [below](#bluetooth-bring-up)): the chip was once found running on its UART lines, but after our reset it stays silent (5 s, also with WLAN_EN high) | `OP2 BT: RESULT` |
 | Not working yet | Bluetooth beyond step 1, the Wi-Fi icon and Settings' Wi-Fi switch (iOS's own `wifid` sees no Wi-Fi hardware), RTC (clock does not keep time) | [docs/NEXT-PLAN.md](docs/NEXT-PLAN.md) |
 | Known issues | brief pale/partial frames while scrolling; logd SIGBUS/SIGSEGV loop, Spotlight extensions SIGABRT loop, occasional SpringBoard SIGSEGV | [CLAUDE.md](CLAUDE.md) |
 
@@ -265,7 +265,7 @@ kept log; works with or without `wifi=`.
 | Step | `bt=` | What it does | State |
 |---|---|---|---|
 | probe | 1 | Reads the pins, the reset line, the supplies and the UART's clocks (its registers only if those run) | not run yet |
-| **1** out of reset | 2 | Supplies on; RX and CTS as plain inputs (pulled down / up); 200 ms watching the lines as found; reset low 50 ms, then high, 5 s watching for the chip's TX going high (idle) and its RTS going low (ready); if nothing moved (and `wifi=2` or more), the same again right after Wi-Fi raises WLAN_EN; back in reset | First run (2026-11-27, 1 s version): **the chip was found running** (reset line already high, RX at 1 against a pull-down: its TX idling, so pin 46 is its TX), but after a reset nothing for 1 s. Wi-Fi unaffected. Second version not run yet. |
+| **1** out of reset | 2 | Supplies on; RX and CTS as plain inputs (pulled down / up); 200 ms watching the lines as found; reset low 50 ms, then high, 5 s watching for the chip's TX going high (idle) and its RTS going low (ready); back in reset | **FAIL so far.** First run (2026-11-27): the chip was found running (reset line already high, RX at 1 against a pull-down: its TX idling, so pin 46 is its TX; probably left on by an earlier Android boot), but after a reset nothing for 1 s. Two more runs started it cold (reset low, `bt_vreg` off): nothing in 5 s, nor in 5 s after Wi-Fi raised WLAN_EN. That retry, done inside Wi-Fi's power-up, broke Wi-Fi's PCIe link training for that boot, so it is removed. The device tree asks for nothing more than these supplies and the reset line. |
 
 Next: the UART clocked (BLSP2 UART2 clock source, 115200 baud), HCI reset and the chip's version, then Qualcomm's
 patch and configuration download, then scanning; the phone's own page (op2netd) for pairing, as for Wi-Fi.

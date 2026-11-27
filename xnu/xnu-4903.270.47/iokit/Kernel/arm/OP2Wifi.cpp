@@ -40,8 +40,8 @@
  *   2  step 1: supplies on; the chip's side of the UART watched on the pins (as plain inputs): its TX (our RX, pin
  *      46) high = idle, its RTS (our CTS, pin 47) low = ready. First 200 ms as found (the first run, 2026-11-27,
  *      found the reset line already high and RX at 1: the chip running), then reset low 50 ms, high, and 5 s of
- *      watching; if nothing moved and wifi=2 or more, the same again right after Wi-Fi raises WLAN_EN (the chip may
- *      need it to start). No UART clock, no data: success is one line. The chip is put back in reset.
+ *      watching. No UART clock, no data: success is one line. The chip is put back in reset. (A retry right after
+ *      Wi-Fi raised WLAN_EN, 2026-11-27, saw nothing either and broke Wi-Fi's PCIe link training: removed.)
  *
  * Sequence and values from the OnePlus msm8994 kernel (OnePlus2_14_A.12_160226):
  *   drivers/pci/host/pci-msm.c       msm_pcie_enable(), pcie_phy_init() (20nm QMP, 19.2 MHz),
@@ -850,8 +850,6 @@ bt_cycle(const char *what)
 	return bt_watch(what, 5000);
 }
 
-static int gBtAgain;   /* 1: bringup() tries again once WLAN_EN is high (step 1 saw nothing before it) */
-
 static void
 bt_result(bool alive, const char *when)
 {
@@ -892,26 +890,7 @@ bt_step1(void)
 	bool found = bt_watch("as found", 200);
 	bool alive = bt_cycle("reset, before Wi-Fi");
 	bt_dump("after");
-	if (alive) {
-		bt_result(true, "before Wi-Fi powers the chip");
-	} else if (gMode >= 2) {
-		gBtAgain = 1;
-		B_LOG("nothing in 5 s (as found: %s): trying again once Wi-Fi has raised WLAN_EN", found ? "alive" : "silent");
-		bt_summary("BT STEP 1: no sign of the chip yet; tried again after WLAN_EN (next lines)");
-	} else {
-		bt_result(false, "before Wi-Fi; wifi=2 or more also tries after WLAN_EN");
-	}
-}
-
-/* from bringup(), right after WLAN_EN goes high */
-static void
-bt_after_wlan_en(void)
-{
-	if (gBtAgain != 1) {
-		return;
-	}
-	gBtAgain = 2;
-	bt_result(bt_cycle("reset, after WLAN_EN"), "after Wi-Fi raised WLAN_EN");
+	bt_result(alive, found ? "before Wi-Fi; it was running as found" : "before Wi-Fi; silent as found too");
 }
 
 static void
@@ -941,7 +920,6 @@ bringup(void)
 	clock_get_uptime(&gPowerOnAbs);
 	IOSleep(10);
 	W_LOG("%s", "chip power on: bt_vreg, L30, bootstrap, WLAN_EN");
-	bt_after_wlan_en();   /* Bluetooth step 1's second try, if it needs one */
 
 	/* 3. RC1 supplies (msm_pcie_vreg_info): vreg-1.8 = L12 1.8 V 14 mA, vreg-0.9 = L28 1.0 V 40 mA. */
 	if (!ldo_on(12, 1800000, 14) || !ldo_on(28, 1000000, 40)) {
