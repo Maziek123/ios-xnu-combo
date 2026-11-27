@@ -41,6 +41,13 @@ op2_wifi_publish_80211(const uint8_t mac[6], char *out, size_t n)
 		snprintf(out, n, "wifid: IO80211Interface already published");
 		return;
 	}
+	/* wl0 must exist when wifid looks up the name it reads here (2026-11-27: it read "BSD Name" and stopped; wl0
+	 * only appeared at step 8). Down and without an address until a network is joined. */
+	int werr = op2_wlan_attach(mac);
+	if (werr != 0) {
+		snprintf(out, n, "wifid: wl0 could not be created early (error %d): no IO80211Interface", werr);
+		return;
+	}
 	IO80211Interface *nub = OSTypeAlloc(IO80211Interface);
 	IOService *res = IOService::getResourceService();
 	if (nub == NULL || res == NULL || !nub->init()) {
@@ -61,8 +68,9 @@ op2_wifi_publish_80211(const uint8_t mac[6], char *out, size_t n)
 	nub->registerService();
 	nub->release();   /* the registry keeps it */
 	done = true;
-	snprintf(out, n, "wifid: IO80211Interface published (wl0, %02x:%02x:%02x:%02x:%02x:%02x): its next requests show as "
-	    "\"IOK wifid:\" and \"OP2 WIFID:\" lines", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+	snprintf(out, n, "wifid: wl0 created (down, Wi-Fi subfamily, 802.11 media) and IO80211Interface published (%02x:%02x:"
+	    "%02x:%02x:%02x:%02x): wifid's next requests show as \"IOK wifid:\" and \"OP2 WIFID:\" lines", mac[0], mac[1],
+	    mac[2], mac[3], mac[4], mac[5]);
 }
 
 #endif /* ARM64_BOARD_CONFIG_MSM8994 */

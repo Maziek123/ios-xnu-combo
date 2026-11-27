@@ -1653,6 +1653,68 @@ sysctl_create_user_req(struct sysctl_req *req, struct proc *p, user_addr_t oldp,
 	return;
 }
 
+#if defined(ARM64_BOARD_CONFIG_MSM8994)
+#include <pexpert/pexpert.h>
+#include <libkern/OSAtomic.h>
+void op2_keep(const char *fmt, ...) __printflike(1, 2);
+/*
+ * OnePlus 2: what Apple's wifid reads through sysctl (interface lists, interface indexes, ...): each distinct MIB or
+ * name once with its result, at most 60, on the console and in the kept log ("OP2 WIFID: sysctl ...").
+ * Boot-arg op2wifid=0 turns it off. Its ioctls: sys_generic.c; its IOKit calls: IOUserClient.cpp.
+ */
+static void
+op2_wifid_sysctl(const int *mib, u_int n, const char *byname, int error)
+{
+	static int on = -1;
+	static volatile SInt32 nseen;
+	static uint32_t seen[60];
+	char who[32], line[160];
+	if (on < 0) {
+		int v = 1;
+		(void)PE_parse_boot_argn("op2wifid", &v, sizeof(v));
+		on = v;
+	}
+	if (!on || nseen >= 60) {
+		return;
+	}
+	proc_selfname(who, sizeof(who));
+	if (strncmp(who, "wifid", 6) != 0) {
+		return;
+	}
+	uint32_t h = 2166136261u ^ (uint32_t)error;
+	if (byname != NULL) {
+		for (const char *c = byname; *c; c++) {
+			h = (h ^ (uint8_t)*c) * 16777619u;
+		}
+	} else {
+		for (u_int i = 0; i < n; i++) {
+			h = (h ^ (uint32_t)mib[i]) * 16777619u;
+		}
+	}
+	for (SInt32 i = 0; i < nseen && i < 60; i++) {
+		if (seen[i] == h) {
+			return;
+		}
+	}
+	SInt32 k = OSIncrementAtomic(&nseen);
+	if (k >= 60) {
+		return;
+	}
+	seen[k] = h;
+	if (byname != NULL) {
+		snprintf(line, sizeof(line), "OP2 WIFID: sysctl %.80s -> error %d", byname, error);
+	} else {
+		int o = snprintf(line, sizeof(line), "OP2 WIFID: sysctl");
+		for (u_int i = 0; i < n && i < 8 && o < (int)sizeof(line) - 24; i++) {
+			o += snprintf(line + o, sizeof(line) - (size_t)o, " %d", mib[i]);
+		}
+		snprintf(line + o, sizeof(line) - (size_t)o, " -> error %d", error);
+	}
+	printf("%s\n", line);
+	op2_keep("%s", line);
+}
+#endif
+
 int
 sysctl(proc_t p, struct sysctl_args *uap, __unused int32_t *retval)
 {
@@ -1712,6 +1774,9 @@ sysctl(proc_t p, struct sysctl_args *uap, __unused int32_t *retval)
 	}
 
 	error = userland_sysctl(FALSE, namestring, namestringlen, name, uap->namelen, &req, &oldlen);
+#if defined(ARM64_BOARD_CONFIG_MSM8994)
+	op2_wifid_sysctl(name, uap->namelen, NULL, error);
+#endif
 
 	FREE(namestring, M_TEMP);
 
@@ -1780,6 +1845,9 @@ sysctlbyname(proc_t p, struct sysctlbyname_args *uap, __unused int32_t *retval)
 	sysctl_create_user_req(&req, p, uap->old, oldlen, uap->new, newlen);
 
 	error = userland_sysctl(TRUE, name, namelen + 1, oid, CTL_MAXNAME, &req, &oldlen);
+#if defined(ARM64_BOARD_CONFIG_MSM8994)
+	op2_wifid_sysctl(NULL, 0, name, error);
+#endif
 
 	FREE(name, M_TEMP);
 

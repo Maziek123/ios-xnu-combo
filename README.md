@@ -253,9 +253,13 @@ kept log: the IOKit classes and paths it looks up or waits for, what it opens, t
   for `IODeviceTree:/product` (not there), and **waits for an `IO80211Interface` to be published**. Its only network
   ioctl is `SIOCGIFMEDIA` (an interface's medium; `lo0` answers "not supported"): how it would recognize a Wi-Fi
   interface, so `wl0` will have to report an 802.11 medium.
-- **S1** (`op2wifid=2`, not run yet): when the Wi-Fi manager comes up, the kernel publishes a stand-in
-  `IO80211Interface` (`iokit/Kernel/arm/OP2Wifid.cpp`: BSD name `wl0`, the chip's MAC, nothing else yet), and the
-  trace shows what `wifid` asks of it next. Without the boot-arg nothing is published.
+- **S1** (`op2wifid=2`, 2026-11-27): when the Wi-Fi manager comes up, the kernel publishes a stand-in
+  `IO80211Interface` (`iokit/Kernel/arm/OP2Wifid.cpp`: BSD name `wl0`, the chip's MAC). On the phone `wifid` read its
+  `BSD Name` at once and then did nothing more: `wl0` itself only appeared at step 8, after the first join.
+- **S2** (`op2wifid=2`, not run yet): `wl0` is created (down, no address) just before the stand-in is published, as a
+  Wi-Fi interface (XNU's `IFNET_SUBFAMILY_WIFI`, functional type "Wi-Fi infrastructure") that answers `SIOCGIFMEDIA`
+  with 802.11 (active while connected). The trace also logs `wifid`'s sysctls (interface lists and indexes go
+  through them). Without the boot-arg, `wl0` is as before.
 
 ### Bluetooth bring-up
 

@@ -74,8 +74,11 @@ delegation refusals (dasd) and code-signing "allowing" page notes not logged at 
   budget) and each distinct ioctl with interface name + Apple80211 request words (sys_generic.c op2_wifid_ioctl, 120 max).
   S0 result (2026-11-27): wifid opens AppleKeyStore + IOPMrootDomain, IODeviceTree:/product missing, WAITS for an
   IO80211Interface to be published; only ioctl SIOCGIFMEDIA (lo0: EOPNOTSUPP) = how it finds a Wi-Fi interface. The
-  ioctl trace dedupes per interface name too. S1 (op2wifid=2, not run yet): OP2Wifid.cpp publishes a stand-in
-  IO80211Interface (BSD Name wl0, IOMACAddress) when the manager comes up.
+  ioctl trace dedupes per interface name too. S1 (op2wifid=2, run 2026-11-27): OP2Wifid.cpp publishes a stand-in
+  IO80211Interface (BSD Name wl0, IOMACAddress) when the manager comes up; wifid read "BSD Name" and stopped (wl0 did
+  not exist until step 8). S2 (op2wifid=2, not run yet): OP2Wifid.cpp creates wl0 first (op2_wlan_attach, down);
+  op2_wlan.c gives it IFNET_SUBFAMILY_WIFI + SIOCGIFMEDIA = IFM_IEEE80211 (IFM_ACTIVE while connected);
+  kern_newsysctl.c traces wifid's sysctls ("OP2 WIFID: sysctl <mib> -> error", 60 max).
   Bluetooth: OP2Wifi.cpp, boot-arg bt=1 probe / bt=2 step 1 (out of reset, chip seen on the UART pins), run before
   Wi-Fi in the same thread, "OP2 BT:" lines. 2026-11-27: chip once found RUNNING (reset already high, RX=1 vs
   pull-down; likely left on by Android) but silent after our reset: 1 s, then cold starts silent for 5 s, also with

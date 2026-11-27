@@ -25,6 +25,8 @@
 #include <sys/kpi_socket.h>
 #include <net/if.h>
 #include <net/if_types.h>
+#include <net/if_media.h>
+#include <pexpert/pexpert.h>
 #include <net/ethernet.h>
 #include <net/if_ether.h>
 #include <net/ether_if_module.h>
@@ -131,10 +133,36 @@ wl_if_output(ifnet_t ifp, mbuf_t m)
 	return 0;
 }
 
+/* boot-arg op2wifid=2: wl0 looks like a Wi-Fi interface to Apple's wifid (README "The status-bar Wi-Fi icon") */
+static int
+wl_wifi_look(void)
+{
+	static int v = -1;
+	if (v < 0) {
+		int b = 1;
+		(void)PE_parse_boot_argn("op2wifid", &b, sizeof(b));
+		v = b >= 2;
+	}
+	return v;
+}
+
 static errno_t
-wl_if_ioctl(ifnet_t ifp, unsigned long cmd, __unused void *data)
+wl_if_ioctl(ifnet_t ifp, unsigned long cmd, void *data)
 {
 	switch (cmd) {
+	case SIOCGIFMEDIA32:
+	case SIOCGIFMEDIA64: {   /* the fields used here sit at the same offsets in both layouts */
+		struct ifmediareq32 *ifmr = (struct ifmediareq32 *)data;
+		if (!wl_wifi_look()) {
+			return EOPNOTSUPP;
+		}
+		ifmr->ifm_current = IFM_IEEE80211 | IFM_AUTO;
+		ifmr->ifm_mask = 0;
+		ifmr->ifm_status = IFM_AVALID | (wl_running ? IFM_ACTIVE : 0);
+		ifmr->ifm_active = IFM_IEEE80211 | IFM_AUTO;
+		ifmr->ifm_count = 0;
+		return 0;
+	}
 	case SIOCSIFADDR:
 	case SIOCAIFADDR:
 		ifnet_set_flags(ifp, IFF_UP, IFF_UP);
@@ -174,6 +202,9 @@ op2_wlan_attach(const uint8_t mac[6])
 	init.name = "wl";
 	init.unit = 0;
 	init.family = IFNET_FAMILY_ETHERNET;
+	if (wl_wifi_look()) {
+		init.subfamily = IFNET_SUBFAMILY_WIFI;   /* functional type "Wi-Fi infrastructure" */
+	}
 	init.type = IFT_ETHER;
 	init.output = wl_if_output;
 	init.demux = ether_demux;
