@@ -67,13 +67,18 @@ delegation refusals (dasd) and code-signing "allowing" page notes not logged at 
   per-network settings in the networks file (auto=0 ip= mask= router= dns=a,b,c dnsauto=0 search=): manual IPv4 rides on
   "join ... static <ip> <mask> <router> <dns>" (8 hex each; step 7 skips DHCP), DNS/search go to configd via
   op2_publish.h's publish_state.dns_list/search (op2shell leaves them empty = old behaviour). Page settings work on the
-  phone (user's report, README progress row 24). Built, not run yet: wifid trace (666c8a0) + Bluetooth step 1 (5c3a7fe).
-  Status-bar Wi-Fi icon / Settings Wi-Fi (plan: make Apple's wifid see a Wi-Fi device, never patch SpringBoard): S0 =
-  trace what wifid asks for, kept log lines "OP2 WIFID:" (boot-arg op2wifid=0 off): its IOKit matching, notifications,
-  registry paths and opens (IOUserClient.cpp op2_iolog, own 150-line budget) and each distinct ioctl with interface
-  name + Apple80211 request words (sys_generic.c op2_wifid_ioctl, 120 max).
-  Bluetooth (2026-11-26, not run yet): OP2Wifi.cpp, boot-arg bt=1 probe / bt=2 step 1 (out of reset, chip seen on the
-  UART pins), run before Wi-Fi in the same thread, "OP2 BT:" lines. UART = BLSP2 UART2 0xf995e000 (ttyHS0), pins 45-48
+  phone (user's report, README progress row 24).
+  Status-bar Wi-Fi icon / Settings Wi-Fi (plan: make Apple's wifid see a Wi-Fi device, never patch SpringBoard): trace
+  of what wifid asks for, "IOK wifid:" / "OP2 WIFID:" lines on the console + kept log (boot-arg op2wifid=0 off): IOKit
+  matching, notifications, registry paths, opens, property reads once each (IOUserClient.cpp op2_iolog, own 150-line
+  budget) and each distinct ioctl with interface name + Apple80211 request words (sys_generic.c op2_wifid_ioctl, 120 max).
+  S0 result (2026-11-27): wifid opens AppleKeyStore + IOPMrootDomain, IODeviceTree:/product missing, WAITS for an
+  IO80211Interface to be published; no ioctls. S1 (op2wifid=2, not run yet): OP2Wifid.cpp publishes a stand-in
+  IO80211Interface (BSD Name wl0, IOMACAddress) when the manager comes up.
+  Bluetooth: OP2Wifi.cpp, boot-arg bt=1 probe / bt=2 step 1 (out of reset, chip seen on the UART pins), run before
+  Wi-Fi in the same thread, "OP2 BT:" lines. First run 2026-11-27: chip found RUNNING (reset already high, RX=1 vs
+  pull-down) but silent for 1 s after our reset; Wi-Fi fine with BT held in reset. Now: 200 ms as found, 5 s after
+  reset, then a retry right after Wi-Fi raises WLAN_EN (bt_after_wlan_en in bringup()). UART = BLSP2 UART2 0xf995e000 (ttyHS0), pins 45-48
   TX/RX/CTS/RFR func 2, GCC blsp2 ahb 0x0944 (vote 0x1484 bit 15), uart2 apps CBCR 0x0a44, RCG 0x0a4c; reset PM8994
   GPIO 19 (0xd200, mode 0x10 low / 0x11 high, vin 2). Plan: own HCI driver + op2netd page; iOS bluetoothd not used.
   The clock now syncs over the network (NTP), which fixes the old TLS-date problem while connected.

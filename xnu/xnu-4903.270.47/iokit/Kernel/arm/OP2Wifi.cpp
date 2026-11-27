@@ -37,9 +37,11 @@
  *   0  (default) nothing
  *   1  read-only probe: the UART pins, the reset line, the supplies, the UART's clocks (its registers only if
  *      they run: an unclocked UART hangs the bus)
- *   2  step 1: supplies on, then the reset line low, then high, and watch the chip's side of the UART on the
- *      pins (as plain inputs): its TX (our RX, pin 46) goes high (idle) and its RTS (our CTS, pin 47) low (ready)
- *      when it comes out of reset. No UART clock, no data: success is one line. The chip is put back in reset.
+ *   2  step 1: supplies on; the chip's side of the UART watched on the pins (as plain inputs): its TX (our RX, pin
+ *      46) high = idle, its RTS (our CTS, pin 47) low = ready. First 200 ms as found (the first run, 2026-11-27,
+ *      found the reset line already high and RX at 1: the chip running), then reset low 50 ms, high, and 5 s of
+ *      watching; if nothing moved and wifi=2 or more, the same again right after Wi-Fi raises WLAN_EN (the chip may
+ *      need it to start). No UART clock, no data: success is one line. The chip is put back in reset.
  *
  * Sequence and values from the OnePlus msm8994 kernel (OnePlus2_14_A.12_160226):
  *   drivers/pci/host/pci-msm.c       msm_pcie_enable(), pcie_phy_init() (20nm QMP, 19.2 MHz),
@@ -803,10 +805,69 @@ pin_in(uint32_t p, uint32_t pull)
 	wr(gTlmm, TLMM_CFG(p), (2u << 6) | (pull & 3));
 }
 
+/* watch the chip's TX (our RX, pin 46) and RTS (our CTS, pin 47) for ms milliseconds; true: either moved */
+static bool
+bt_watch(const char *what, uint32_t ms)
+{
+	uint32_t rx0 = rd(gTlmm, TLMM_IO(PIN_BT_RX)) & 1, cts0 = rd(gTlmm, TLMM_IO(PIN_BT_CTS)) & 1;
+	uint32_t rx = rx0, cts = cts0, rx_changes = 0;
+	int rx_hi = rx0 ? 0 : -1, cts_lo = cts0 ? -1 : 0;
+	for (uint32_t t = 0; t < ms; t++) {
+		uint32_t r = rd(gTlmm, TLMM_IO(PIN_BT_RX)) & 1, c = rd(gTlmm, TLMM_IO(PIN_BT_CTS)) & 1;
+		if (r != rx) {
+			rx_changes++;
+			rx = r;
+		}
+		if (rx_hi < 0 && r) {
+			rx_hi = (int)t;
+		}
+		if (cts_lo < 0 && !c) {
+			cts_lo = (int)t;
+		}
+		cts = c;
+		IODelay(1000);
+	}
+	B_LOG("%s: %u ms: rx %u->%u (high at %d ms, %u changes), cts %u->%u (low at %d ms)", what, ms, rx0, rx, rx_hi,
+	    rx_changes, cts0, cts, cts_lo);
+	return rx_hi >= 0 || cts_lo >= 0;
+}
+
+/* reset low 50 ms, then high, then watch 5 s */
+static bool
+bt_cycle(const char *what)
+{
+	if (!bt_reset_line(false)) {
+		B_LOG("%s: SPMI access to PM8994 GPIO 19 failed", what);
+		return false;
+	}
+	IOSleep(50);
+	uint32_t rx = rd(gTlmm, TLMM_IO(PIN_BT_RX)) & 1, cts = rd(gTlmm, TLMM_IO(PIN_BT_CTS)) & 1;
+	B_LOG("%s: in reset: rx %u cts %u (expected: rx 0, cts 1, from the pulls)", what, rx, cts);
+	if (!bt_reset_line(true)) {
+		B_LOG("%s: SPMI write to PM8994 GPIO 19 failed", what);
+		return false;
+	}
+	return bt_watch(what, 5000);
+}
+
+static int gBtAgain;   /* 1: bringup() tries again once WLAN_EN is high (step 1 saw nothing before it) */
+
+static void
+bt_result(bool alive, const char *when)
+{
+	char line[240];
+	(void)bt_reset_line(false);   /* back in reset until the next step needs it */
+	if (alive) {
+		snprintf(line, sizeof(line), "BT STEP 1 PASS: the chip came out of reset (%s); held in reset again", when);
+	} else {
+		snprintf(line, sizeof(line), "BT STEP 1 FAIL: no sign of the chip on its UART lines in 5 s after reset (%s)", when);
+	}
+	bt_summary(line);
+}
+
 static void
 bt_step1(void)
 {
-	char line[240];
 	/* 1. Supplies (bt_power.c: vdd-io S4 1.8 V always on, vdd-xtal L30 1.8 V, vdd-pa bt_vreg). */
 	if (!ldo_on(30, 1800000, 0)) {
 		bt_summary("FAIL: RPM did not ack L30 (vdd-bt-xtal)");
@@ -823,51 +884,34 @@ bt_step1(void)
 	pin_out(PIN_BT_RFR, 1, false);
 	pin_in(PIN_BT_RX, 1);
 	pin_in(PIN_BT_CTS, 3);
-	/* 3. Reset: low for 50 ms, look at the lines, then high and watch them for 1 s. */
-	if (!bt_reset_line(false)) {
-		bt_summary("FAIL: SPMI access to PM8994 GPIO 19 (Bluetooth reset)");
-		return;
-	}
-	IOSleep(50);
-	uint32_t rx0 = rd(gTlmm, TLMM_IO(PIN_BT_RX)) & 1, cts0 = rd(gTlmm, TLMM_IO(PIN_BT_CTS)) & 1;
-	B_LOG("in reset: rx %u cts %u (expected: rx 0, cts 1, from the pulls)", rx0, cts0);
-	if (!bt_reset_line(true)) {
-		bt_summary("FAIL: SPMI write to PM8994 GPIO 19 (Bluetooth reset)");
-		return;
-	}
-	uint64_t t0;
-	clock_get_uptime(&t0);
-	int rx_ms = -1, cts_ms = -1;
-	uint32_t rx = rx0, cts = cts0, rx_changes = 0;
-	for (int ms = 0; ms < 1000; ms++) {
-		uint32_t r = rd(gTlmm, TLMM_IO(PIN_BT_RX)) & 1, c = rd(gTlmm, TLMM_IO(PIN_BT_CTS)) & 1;
-		if (r != rx) {
-			rx_changes++;
-			rx = r;
-		}
-		if (rx_ms < 0 && r == 1) {
-			rx_ms = ms;
-		}
-		if (cts_ms < 0 && c == 0) {
-			cts_ms = ms;
-		}
-		cts = c;
-		IODelay(1000);
-	}
-	B_LOG("out of reset: rx %u (high after %d ms, %u changes: a byte from the chip shows as changes), cts %u (low after "
-	    "%d ms)", rx, rx_ms, rx_changes, cts, cts_ms);
+	IOSleep(20);
+	/* 3. As found (2026-11-27: the reset line was already high and RX read 1: the chip was running), then a reset. */
+	uint8_t m = 0;
+	(void)op2_spmi_read(PM_SID, PMGPIO19_BASE + PM_MODE_CTL, &m, 1);
+	B_LOG("as found: reset line %s (mode %02x)", m == 0x11 ? "high (running)" : m == 0x10 ? "low (in reset)" : "?", m);
+	bool found = bt_watch("as found", 200);
+	bool alive = bt_cycle("reset, before Wi-Fi");
 	bt_dump("after");
-	/* 4. Back in reset until the next step needs it. */
-	(void)bt_reset_line(false);
-	if (rx_ms >= 0 || cts_ms >= 0) {
-		snprintf(line, sizeof(line), "BT STEP 1 PASS: the chip came out of reset: its TX %s, its RTS %s (pins 46/47 as "
-		    "inputs); held in reset again", rx_ms >= 0 ? "went high (idle)" : "stayed low",
-		    cts_ms >= 0 ? "went low (ready)" : "stayed high");
+	if (alive) {
+		bt_result(true, "before Wi-Fi powers the chip");
+	} else if (gMode >= 2) {
+		gBtAgain = 1;
+		B_LOG("nothing in 5 s (as found: %s): trying again once Wi-Fi has raised WLAN_EN", found ? "alive" : "silent");
+		bt_summary("BT STEP 1: no sign of the chip yet; tried again after WLAN_EN (next lines)");
 	} else {
-		snprintf(line, sizeof(line), "BT STEP 1 FAIL: no sign of the chip on the UART pins in 1 s after reset (rx %u, cts "
-		    "%u): reset line, supplies or pin order?", rx, cts);
+		bt_result(false, "before Wi-Fi; wifi=2 or more also tries after WLAN_EN");
 	}
-	bt_summary(line);
+}
+
+/* from bringup(), right after WLAN_EN goes high */
+static void
+bt_after_wlan_en(void)
+{
+	if (gBtAgain != 1) {
+		return;
+	}
+	gBtAgain = 2;
+	bt_result(bt_cycle("reset, after WLAN_EN"), "after Wi-Fi raised WLAN_EN");
 }
 
 static void
@@ -897,6 +941,7 @@ bringup(void)
 	clock_get_uptime(&gPowerOnAbs);
 	IOSleep(10);
 	W_LOG("%s", "chip power on: bt_vreg, L30, bootstrap, WLAN_EN");
+	bt_after_wlan_en();   /* Bluetooth step 1's second try, if it needs one */
 
 	/* 3. RC1 supplies (msm_pcie_vreg_info): vreg-1.8 = L12 1.8 V 14 mA, vreg-0.9 = L28 1.0 V 40 mA. */
 	if (!ldo_on(12, 1800000, 14) || !ldo_on(28, 1000000, 40)) {
