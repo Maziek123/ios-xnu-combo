@@ -133,18 +133,22 @@ The `RESULT:` line is the verdict; the lines before it show where a failing step
 
 The console ring holds only the last 256 KB, and a frozen screen or GPU timeouts can flood it within a minute. The
 important lines (every Wi-Fi line except the once-a-minute repeats, the Wi-Fi manager, op2netd, the kernel's helper
-checks) also go to a **kept log**: a ramoops zone of its own that nothing else writes under iOS
-(`bsd/dev/op2_keeplog.c`, each line with the time since boot). In TWRP:
+checks, what `wifid` asks for, Bluetooth) also go to a **kept log**: ramoops record zones that nothing else writes
+under iOS (`bsd/dev/op2_keeplog.c`, each line with the time since boot). TWRP's ramoops (read on the phone
+2026-11-27) is 1 MB at `0xac000000`: 190 record zones of 4 KB, then the 256 KB console, then 4 KB each of ftrace and
+pmsg. The kernel writes the zone headers itself (the first version looked for TWRP's and found none, so nothing was
+kept) and fills zones 0 to 63 in order (256 KB; the last one keeps the newest lines once they are all full). In
+TWRP they show as `dmesg-ramoops-0`, `-1`, ...; to get them in order:
 
 ```bash
-adb shell ls /sys/fs/pstore                   # dmesg-ramoops-0 (or pmsg-ramoops-0 when there is no record zone)
-adb pull /sys/fs/pstore/dmesg-ramoops-0 ./op2-kept.log
+adb shell 'cd /sys/fs/pstore && i=0; while [ -f dmesg-ramoops-$i ]; do cat dmesg-ramoops-$i; i=$((i+1)); done' > op2-kept.log
 ```
 
 The console ring itself is kept quieter by boot-arg `op2quiet` (on by default, no need to set it; `op2quiet=0` shows everything): in a 2026-11-26 log 61% of the ring was NECP delegation refusals (mostly `dasd`), 8% code-signing page notes and about 17% three lines per crash. Quiet, the first two are not logged at all, and a crash is one line (`PROC_EXIT_CRASH (sig N): pid, name, registers`; 3 per process name instead of 24). FB, Wi-Fi, thermal, touch (`OP2I2C`), AKS and the other `OP2` lines are unchanged.
 
 It holds this boot's lines only (emptied at the first line of each boot). The console says where it went, early in the
-boot: `OP2 KEEP: important lines also go to the ramoops zone at ...`. Boot-arg `op2keep=0` turns it off.
+boot: `OP2 KEEP: important lines also go to ramoops record zones 0-63 at ac000000 ...`. Boot-arg `op2keep=0` turns it
+off.
 
 #### Testing step 8 (Wi-Fi for iOS)
 

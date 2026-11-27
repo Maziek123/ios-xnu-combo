@@ -1,17 +1,18 @@
 /*
- * op2_keeplog.c: a second, small log for the lines that matter (Wi-Fi bring-up, the Wi-Fi manager, op2netd,
- * the kernel's helper-program checks), kept apart from the console so a flood of other messages (a frozen screen,
- * GPU timeouts) cannot push them out before the phone is pulled.
+ * op2_keeplog.c: a second log for the lines that matter (Wi-Fi bring-up, the Wi-Fi manager, op2netd, the kernel's
+ * helper-program checks, what wifid asks for, Bluetooth), kept apart from the console so a flood of other messages
+ * (a frozen screen, GPU timeouts) cannot push them out before the phone is pulled.
  *
- * The 1 MB ramoops region (0xac000000) is laid out by the recovery kernel (TWRP, Linux ramoops): record ("dump")
- * zones, then the 256 KB console we already write (ADT op2-fbcon, 0xac0be000), then ftrace and pmsg. Every zone
- * starts with Linux's persistent_ram_buffer header { 'DBGC', start, size }, and Linux keeps each zone's old
- * contents for /sys/fs/pstore at its next boot. Nothing writes the record zones under iOS, so the first one becomes
- * this log: at the first line of a boot it is found by its header (scanning 4 KB steps below the console; pmsg
- * above it if there is none), emptied, and filled as a ring in the same format, so TWRP shows it as
- * /sys/fs/pstore/dmesg-ramoops-0 (pmsg-ramoops-0 for the fallback). Its size is the distance between two
- * zone headers, so it never runs past what Linux thinks the zone is (Linux discards a zone whose size field is
- * larger). No header found: nothing is kept, said once on the console.
+ * The 1 MB ramoops region at 0xac000000 is outside the RAM iOS manages (tools/mkadt.py: DRAM ends there). TWRP's
+ * ramoops (its /sys/module/ramoops/parameters, read on the phone 2026-11-27: mem_size 1 MB, record_size 4 KB,
+ * console 256 KB, ftrace 4 KB, pmsg 4 KB) lays it out as 190 record ("dump") zones of 4 KB, then the console we
+ * already write (ADT op2-fbcon, 0xac0be000 = base + 0xbe000), then ftrace and pmsg. Each zone starts with Linux's
+ * persistent_ram_buffer header { 'DBGC', start, size }; at its next boot Linux keeps a zone whose header is valid
+ * and shows it in /sys/fs/pstore. The headers are not there when iOS starts (something between TWRP and this
+ * kernel clears them), so this file writes them itself: the first 64 record zones (256 KB) are emptied at the first
+ * kept line and filled in order, each beginning with a "====seconds.microseconds" line as Linux's own records do;
+ * when they are full, the last one becomes a ring of the newest lines. TWRP shows them as dmesg-ramoops-0, -1, ...
+ * (read them in number order; Linux stops at the first empty one).
  *
  * op2_keep(fmt, ...) from kernel code; sysctl kern.op2keep (root writes a line) from op2netd. Each line gets the
  * time since boot. Boot-arg op2keep=0 turns it off.
@@ -35,20 +36,41 @@ void op2_keep_line(const char *line);
 
 #define SIG          0x43474244u   /* "DBGC" */
 #define HDR          12u
-#define BELOW        0xbe000u      /* record zones: from the region's start to the console */
-#define ABOVE        0x2000u       /* ftrace + pmsg after the console */
-#define CAP_MAX      (128u * 1024u)
+#define BELOW        0xbe000u      /* the console's offset in the region: 190 record zones of 4 KB before it */
+#define ZONE         0x1000u       /* TWRP's record_size */
+#define ZONES        64u           /* the ones used here: 256 KB */
+#define DATA         (ZONE - HDR)
 
 struct prb {
 	volatile uint32_t sig, start, size;
 	volatile char data[];
 };
 
-static struct prb *keep;
-static uint32_t keep_cap;
-static volatile UInt32 keep_state;   /* 0 not looked yet, 1 ready, 2 being looked for, 3 none / off */
+static volatile uint8_t *keep_base;   /* zone 0 */
+static uint32_t keep_zone;            /* the zone being written */
+static volatile UInt32 keep_state;    /* 0 not set up yet, 1 ready, 2 being set up, 3 off */
 static lck_spin_t *keep_lock;
-static uint64_t keep_phys;
+
+static struct prb *
+zone(uint32_t i)
+{
+	return (struct prb *)(uintptr_t)(keep_base + (size_t)i * ZONE);
+}
+
+static void
+zone_begin(uint32_t i)
+{
+	struct prb *z = zone(i);
+	char h[40];
+	uint64_t ns;
+	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+	int n = snprintf(h, sizeof(h), "====%llu.%06llu\n", ns / 1000000000ull, (ns / 1000ull) % 1000000ull);
+	for (int k = 0; k < n; k++) {
+		z->data[k] = h[k];
+	}
+	z->start = (uint32_t)n;
+	z->size = (uint32_t)n;
+}
 
 static void
 keep_find(void)
@@ -63,69 +85,58 @@ keep_find(void)
 		keep_state = 3;
 		return;
 	}
-	uint64_t console = reg[0], console_size = reg[1];
-	if (console < BELOW) {
+	uint64_t console = reg[0];
+	if (console != 0xac0be000ull) {   /* the layout above is TWRP's for this console address only */
 		keep_state = 3;
+		printf("OP2 KEEP: the console is at %llx, not 0xac0be000: no kept log\n", console);
 		return;
 	}
-	/* the record zones below the console */
-	volatile uint32_t *low = (volatile uint32_t *)ml_io_map((vm_offset_t)(console - BELOW), BELOW);
-	uint32_t at[2] = { 0, 0 }, found = 0;
-	for (uint32_t off = 0; low != NULL && off < BELOW && found < 2; off += 0x1000u) {
-		if (low[off / 4u] == SIG) {
-			at[found++] = off;
-		}
-	}
-	if (found >= 1) {
-		/* zone 0 runs to the next header (zone 1, or the console when there is only one) */
-		uint32_t zone = (found == 2 ? at[1] : BELOW) - at[0];
-		keep = (struct prb *)(uintptr_t)((vm_offset_t)low + at[0]);
-		keep_cap = zone - HDR < CAP_MAX ? zone - HDR : CAP_MAX;
-		keep_phys = console - BELOW + at[0];
-	} else {
-		/* pmsg (or ftrace) above the console: the last header there */
-		volatile uint32_t *high = (volatile uint32_t *)ml_io_map((vm_offset_t)(console + console_size), ABOVE);
-		for (uint32_t off = 0; high != NULL && off < ABOVE; off += 0x1000u) {
-			if (high[off / 4u] == SIG) {
-				keep = (struct prb *)(uintptr_t)((vm_offset_t)high + off);
-				keep_cap = ABOVE - off - HDR;
-				keep_phys = console + console_size + off;
-			}
-		}
-	}
-	if (keep == NULL || keep_cap < 1024u) {
-		keep = NULL;
+	keep_base = (volatile uint8_t *)ml_io_map((vm_offset_t)(console - BELOW), ZONES * ZONE);
+	if (keep_base == NULL) {
 		keep_state = 3;
-		printf("OP2 KEEP: no ramoops zone header found next to the console; important lines only on the console\n");
+		printf("OP2 KEEP: ml_io_map failed: no kept log\n");
 		return;
 	}
-	keep->start = 0;
-	keep->size = 0;
+	for (uint32_t i = 0; i < ZONES; i++) {   /* empty: Linux ignores a zone of size 0 */
+		struct prb *z = zone(i);
+		z->sig = SIG;
+		z->start = 0;
+		z->size = 0;
+	}
+	keep_zone = 0;
+	zone_begin(0);
 	__asm__ volatile("dmb oshst" ::: "memory");
 	keep_lock = lck_spin_alloc_init(lck_grp_alloc_init("op2-keep", LCK_GRP_ATTR_NULL), LCK_ATTR_NULL);
 	keep_state = 1;
-	printf("OP2 KEEP: important lines also go to the ramoops zone at %llx (%u bytes; %s in TWRP's /sys/fs/pstore)\n",
-	    keep_phys, keep_cap, found ? "dmesg-ramoops-0" : "pmsg-ramoops-0");
+	printf("OP2 KEEP: important lines also go to ramoops record zones 0-%u at %llx (%u KB; TWRP: "
+	    "/sys/fs/pstore/dmesg-ramoops-0, -1, ...)\n", ZONES - 1, console - BELOW, ZONES * ZONE / 1024u);
 }
 
+/* one line (it fits in a zone): into the current zone, or the next one; the last zone wraps */
 static void
 keep_put(const char *s, size_t n)
 {
-	uint32_t start = keep->start, size = keep->size;
-	if (start >= keep_cap) {
-		start = 0;
+	if (n > DATA - 40u) {
+		n = DATA - 40u;
 	}
+	struct prb *z = zone(keep_zone);
+	if (keep_zone + 1u < ZONES && z->size + n > DATA) {
+		keep_zone++;
+		zone_begin(keep_zone);
+		z = zone(keep_zone);
+	}
+	uint32_t start = z->start, size = z->size;
 	for (size_t i = 0; i < n; i++) {
-		keep->data[start++] = s[i];
-		if (start >= keep_cap) {
+		if (start >= DATA) {
 			start = 0;
 		}
-		if (size < keep_cap) {
+		z->data[start++] = s[i];
+		if (size < DATA) {
 			size++;
 		}
 	}
-	keep->start = start;
-	keep->size = size;
+	z->start = start >= DATA ? 0 : start;
+	z->size = size;
 	__asm__ volatile("dmb oshst" ::: "memory");
 }
 
@@ -138,17 +149,14 @@ op2_keep_line(const char *line)
 	if (keep_state != 1 || line == NULL) {
 		return;
 	}
-	char ts[24];
+	char buf[560];
 	uint64_t ns;
 	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
-	int tn = snprintf(ts, sizeof(ts), "[%5llu.%03llu] ", ns / 1000000000ull, (ns / 1000000ull) % 1000ull);
 	size_t n = strnlen(line, 512);
+	int tn = snprintf(buf, sizeof(buf), "[%5llu.%03llu] %.*s%s", ns / 1000000000ull, (ns / 1000000ull) % 1000ull,
+	    (int)n, line, (n == 0 || line[n - 1] != '\n') ? "\n" : "");
 	lck_spin_lock(keep_lock);
-	keep_put(ts, (size_t)tn);
-	keep_put(line, n);
-	if (n == 0 || line[n - 1] != '\n') {
-		keep_put("\n", 1);
-	}
+	keep_put(buf, (size_t)(tn < (int)sizeof(buf) ? tn : (int)sizeof(buf) - 1));
 	lck_spin_unlock(keep_lock);
 }
 
