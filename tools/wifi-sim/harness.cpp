@@ -371,6 +371,8 @@ extern "C" void op2_wlan_down(void) { assert(st.up); st.down = true; }
 extern "C" uint32_t op2_wlan_drops(void) { return 0; }
 extern "C" void op2_keep(const char *fmt, ...) { (void)fmt; }   /* the kept log: the sim has only its console */
 extern "C" void op2_shell_status(char *out, size_t n) { snprintf(out, n, "simulated; op2-air-run running (pid 1)"); }
+extern "C" void op2_wifi_publish_80211(const uint8_t mac[6], char *out, size_t n) {
+	snprintf(out, n, "wifid: no IO80211Interface for it (simulated, mac %02x...)", mac[0]); }
 
 /* the Wi-Fi manager's sysctls (scenarios 35-37): op2netd's side, scripted */
 static std::vector<std::string> &st_states = *new std::vector<std::string>;

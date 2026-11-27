@@ -239,13 +239,20 @@ the WPA2 key (as `wpa_passphrase` does) and the kernel only gets that key, in a 
 with the boot image can still join that network, so don't share images built with it. For an iPhone hotspot, keep
 **Maximize Compatibility** on (2.4 GHz, WPA2) and the Personal Hotspot screen open while the phone boots.
 
-#### The status-bar Wi-Fi icon (S0: what `wifid` asks for)
+#### The status-bar Wi-Fi icon (what `wifid` asks for)
 
 SpringBoard's Wi-Fi icon and Settings' Wi-Fi switch come from Apple's `wifid`, which finds no Apple Wi-Fi driver here.
-The plan is to have the kernel answer it as that driver would (never patching SpringBoard). First, every boot records
-what `wifid` asks the kernel for, in the kept log as `OP2 WIFID:` lines: the IOKit classes and paths it looks up or
-waits for, what it opens, and each distinct ioctl (the interface name, Apple80211's request words, the answer).
-Boot-arg `op2wifid=0` turns it off.
+The plan is to have the kernel answer it as that driver would (never patching SpringBoard), one request at a time.
+Every boot records what `wifid` asks the kernel for, as `IOK wifid:` and `OP2 WIFID:` lines on the console and in the
+kept log: the IOKit classes and paths it looks up or waits for, what it opens, the registry properties it reads
+(each once), and each distinct ioctl (the interface name, Apple80211's request words, the answer). Boot-arg
+`op2wifid=0` turns it off.
+
+- **S0** (first run, 2026-11-27): `wifid` opens AppleKeyStore and the power root domain, looks for
+  `IODeviceTree:/product` (not there), and **waits for an `IO80211Interface` to be published**. No ioctls seen.
+- **S1** (`op2wifid=2`, not run yet): when the Wi-Fi manager comes up, the kernel publishes a stand-in
+  `IO80211Interface` (`iokit/Kernel/arm/OP2Wifid.cpp`: BSD name `wl0`, the chip's MAC, nothing else yet), and the
+  trace shows what `wifid` asks of it next. Without the boot-arg nothing is published.
 
 ### Bluetooth bring-up
 

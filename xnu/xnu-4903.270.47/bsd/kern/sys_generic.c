@@ -777,7 +777,7 @@ void op2_keep(const char *fmt, ...) __printflike(1, 2);
  * OnePlus 2: Apple's Wi-Fi daemon (wifid) and what it asks the kernel for (the way to the status-bar Wi-Fi icon:
  * the kernel must answer it as Apple's Wi-Fi driver would). Each distinct ioctl it makes (the file it was made on,
  * the request, for an interface request its name and the first words after it: an Apple80211 request's type) and
- * the answer go to the kept log (op2_keep), at most 120; boot-arg op2wifid=0 turns this off. Its IOKit calls are
+ * the answer go to the console and the kept log (op2_keep), at most 120; boot-arg op2wifid=0 turns this off. Its IOKit calls are
  * traced in iokit/Kernel/IOUserClient.cpp.
  */
 static void
@@ -830,9 +830,12 @@ op2_wifid_ioctl(int ftype, int fam, const char *vname, u_long com, const uint8_t
 	} else {
 		snprintf(file, sizeof(file), "fd type %d", ftype);
 	}
-	op2_keep("OP2 WIFID: ioctl on %s: 0x%08lx ('%c' %lu, %u bytes)%s%s words %u %u %u -> error %d", file, com,
-	    (grp >= 0x20 && grp < 0x7f) ? grp : '?', (unsigned long)(com & 0xff), size, ifn[0] ? " interface " : "", ifn,
-	    w[0], w[1], w[2], error);
+	char line[200];
+	snprintf(line, sizeof(line), "OP2 WIFID: ioctl on %s: 0x%08lx ('%c' %lu, %u bytes)%s%s words %u %u %u -> error %d",
+	    file, com, (grp >= 0x20 && grp < 0x7f) ? grp : '?', (unsigned long)(com & 0xff), size, ifn[0] ? " interface " : "",
+	    ifn, w[0], w[1], w[2], error);
+	printf("%s\n", line);   /* the console too: the kept log can be missing */
+	op2_keep("%s", line);
 }
 #endif
 

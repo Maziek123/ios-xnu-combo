@@ -40,6 +40,8 @@ extern "C" void op2_wlan_set_scan(const char *text);           /* sysctl net.op2
 extern "C" int op2_wlan_take_cmd(char *out, uint32_t n);       /* the newest net.op2wlan_cmd, once: 1, else 0 */
 /* bsd/kern/op2_shell_sync.c: what the boot-time op2shell check did, and whether op2-air-run (op2shell) runs */
 extern "C" void op2_shell_status(char *out, size_t n);
+/* OP2Wifi.cpp: with boot-arg op2wifid=2, an IO80211Interface for Apple's wifid (it waits for one); one line why not */
+extern "C" void op2_wifi_publish_80211(const uint8_t mac[6], char *out, size_t n);
 /* bsd/dev/op2_keeplog.c: the line also into the kept log (a ramoops zone of its own, safe from console floods) */
 extern "C" void op2_keep(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 

@@ -17,5 +17,6 @@ iokit/Kernel/arm/OP2I2C.cpp					optional iokitcpp
 iokit/Kernel/arm/OP2GPU.cpp					optional iokitcpp
 iokit/Kernel/arm/OP2Wifi.cpp					optional iokitcpp
 iokit/Kernel/arm/OP2Ath10k.cpp					optional iokitcpp
+iokit/Kernel/arm/OP2Wifid.cpp					optional iokitcpp
 
 iokit/Kernel/arm/OP2Scaler.cpp					optional iokitcpp

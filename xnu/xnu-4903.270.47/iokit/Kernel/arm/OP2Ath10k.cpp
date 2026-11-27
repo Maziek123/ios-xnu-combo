@@ -5707,6 +5707,11 @@ run_manager(char *res, size_t len, uint32_t limit_ms)
 	    pending ? "joining the build's network " : "the build's network ", gWantSsidLen ? name : "",
 	    gWantSsidLen == 0 || pending ? "" : " not heard: skipped for this boot");
 	A_LOG("%s", "op2netd's page: http://127.0.0.1:8080 on the phone");
+	{
+		char why[160];
+		op2_wifi_publish_80211(gMac, why, sizeof(why));   /* toward the status-bar icon: what wifid does next */
+		A_LOG("%s", why);
+	}
 	uint32_t t0 = ms_since_power_on(), last_scan = t0;
 	mgr_state("idle");
 	for (uint32_t it = 0;; it++) {

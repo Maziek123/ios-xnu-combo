@@ -2353,6 +2353,31 @@ extern "C" void op2_keep(const char *fmt, ...) __printflike(1, 2);
 	} \
 } while (0)
 
+/* wifid's property reads: each (class, property) once, so a polling loop cannot use up the budget */
+static bool
+op2_wifid_prop_new(const char *cls, const char *prop)
+{
+	static uint32_t seen[96];
+	static uint32_t nseen;
+	uint32_t h = 2166136261u;
+	for (const char *p = cls; *p; p++) {
+		h = (h ^ (uint8_t)*p) * 16777619u;
+	}
+	h = (h ^ '/') * 16777619u;
+	for (const char *p = prop; *p; p++) {
+		h = (h ^ (uint8_t)*p) * 16777619u;
+	}
+	for (uint32_t i = 0; i < nseen && i < 96; i++) {
+		if (seen[i] == h) {
+			return false;
+		}
+	}
+	if (nseen < 96) {
+		seen[nseen++] = h;
+	}
+	return true;
+}
+
 static bool
 op2_iolog(char *name, size_t len)
 {
@@ -3578,6 +3603,16 @@ is_io_registry_entry_get_properties_bin(
 	}
 #endif
 
+#if defined(ARM64_BOARD_CONFIG_MSM8994)
+	{
+		char sname[32];
+		const char *cls = entry->getMetaClass()->getClassName();
+		proc_selfname(sname, sizeof(sname));
+		if (strncmp(sname, "wifid", 6) == 0 && op2_wifid_prop_new(cls, "*") && op2_iolog(sname, sizeof(sname))) {
+			OP2_IOK(sname, "all properties of %s", cls);
+		}
+	}
+#endif
 	s = OSSerialize::binaryWithCapacity(4096, editor, editRef);
 	if (!s) {
 		return kIOReturnNoMemory;
@@ -3640,6 +3675,16 @@ is_io_registry_entry_get_property_bin(
 	}
 
 	sym->release();
+#if defined(ARM64_BOARD_CONFIG_MSM8994)
+	{
+		char sname[32];
+		const char *cls = entry->getMetaClass()->getClassName();
+		proc_selfname(sname, sizeof(sname));
+		if (strncmp(sname, "wifid", 6) == 0 && op2_wifid_prop_new(cls, property_name) && op2_iolog(sname, sizeof(sname))) {
+			OP2_IOK(sname, "property %s of %s -> %s", property_name, cls, obj ? "found" : "none");
+		}
+	}
+#endif
 	if (!obj) {
 		return kIOReturnNotFound;
 	}
