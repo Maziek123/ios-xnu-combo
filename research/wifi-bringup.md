@@ -1,10 +1,10 @@
-# Wi-Fi bring-up research digest (2026-11-23 to 11-25)
+# Wi-Fi bring-up research digest (2026-11-23 to 11-26)
 
 What was learned bringing up the QCA6174 under XNU, from the phone's own device tree, Qualcomm's and Linux's drivers,
 and the phone's logs. The step-by-step results are in the main README ("Wi-Fi bring-up, step by step", progress
-rows 1-21); the code is `iokit/Kernel/arm/OP2Wifi.cpp` + `OP2Ath10k.cpp`, checked with `tools/wifi-sim`.
-State at the end of this period: **WPA2 connection to an iPhone hotspot works and carries data** (`wifi=10`, STEP 7
-PASS: DHCP lease, ping 2-3 ms, all encrypted by the chip); iOS has no network interface for it yet.
+rows 1-24); the code is `iokit/Kernel/arm/OP2Wifi.cpp` + `OP2Ath10k.cpp`, checked with `tools/wifi-sim`.
+State at the end of this period: **iOS uses Wi-Fi**: `wl0` carries Safari's traffic (`wifi=11`, step 8), and networks
+are chosen and configured on the phone (`wifi=12`, op2netd's page: fast.com 8 Mbit/s down, 21 up, 802.11g rates).
 
 ## Hardware truth (research/hardware/live.dts, OnePlus2_14_A.12_160226 kernel)
 
@@ -66,8 +66,9 @@ HTT SEC_IND and also a WMI install-key-complete event (0x5003); PEER_STATE event
 
 1. ~~Data through the keys~~ (done, step 7). Step 8 (`wifi=11`, 2026-11-26: **passes on the phone, Safari loaded
    google.com over Wi-Fi**): `wl0` in bsd/dev/op2_wlan.c like `ue0`, the lease in sysctl `net.op2wlan`, `op2shell` publishing
-   it to configd ahead of USB, the driver staying connected with up to 16 frames in flight. After it: reconnecting,
-   DHCP renewal, power save, HT rates, interrupts.
+   it to configd ahead of USB, the driver staying connected with up to 16 frames in flight. Then the Wi-Fi manager
+   (`wifi=12`, passes on the phone). Still open: HT rates, DHCP renewal, the range extender that never answers DHCP
+   (EAPOL version 1), the status-bar icon (Apple's `wifid` sees no Wi-Fi driver), power save, interrupts.
 2. ~~GPIO 120-124~~ (read: driven low, as under Android; ruled out).
 3. Noise floor: compare with the firmware's own reports under Android if a log can be had there.
 

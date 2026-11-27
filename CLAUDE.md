@@ -46,7 +46,7 @@ delegation refusals (dasd) and code-signing "allowing" page notes not logged at 
   publishes service op2usb (State:/Network/Service/op2usb/IPv4+DNS, router 192.168.7.1, DNS 1.1.1.1/8.8.8.8;
   re-published every 15 s if configd loses it). Mac must NAT: pfctl anchor com.apple/op2nat (docs/SETUP.md 6).
   Test: /usr/local/bin/op2net example.com.
-- Wi-Fi (2026-11-25): QCA6174 on PCIe, ath10k ported in iokit/Kernel/arm/OP2Wifi.cpp + OP2Ath10k.cpp, boot-arg wifi=N
+- Wi-Fi (2026-11-26): QCA6174 on PCIe, ath10k ported in iokit/Kernel/arm/OP2Wifi.cpp + OP2Ath10k.cpp, boot-arg wifi=N
   (each N runs all lower steps; README "Wi-Fi bring-up"). wifi=9 joins a WPA2 hotspot named in the gitignored
   firmware/qca6174/wifi-network.txt (tools/gen-wifi-fw.py -> op2_wifi_net.h: name + PMK only) and runs the 4-way
   handshake (STEP 6 PASS on the phone); wifi=10 adds DHCP/ARP/ping through the keys (STEP 7 PASS). wifi=11 (step 8,
@@ -56,7 +56,7 @@ delegation refusals (dasd) and code-signing "allowing" page notes not logged at 
   writes /usr/sbin/op2netd before launchd and exec_save_path() runs it in place of launchd's /usr/sbin/wifid (it then
   execs the real wifid); op2netd=0 / op2shell_sync=0 off; step 8 logs the state (user's phone: likely no op2shell);
   stays connected, polled loop, 16 tx slots, status every 60 s. Renumbered 2026-11-25: one number per step.
-  wifi=12 (2026-11-26, not yet run on the phone): Wi-Fi manager after step 4 (OP2Ath10k.cpp run_manager; gWant* is the
+  wifi=12 (2026-11-26): Wi-Fi manager after step 4 (OP2Ath10k.cpp run_manager; gWant* is the
   network, from op2_wifi_net.h first, only if step 4 heard it, else skipped for the boot; then op2netd's "join"); op2netd serves http://127.0.0.1:8080 (list, join with
   password -> PMK via CommonCrypto, saved networks in /var/root/Library/op2netd/networks, autojoin, leave, forget, off)
   over sysctls net.op2wlan_cmd/_scan/_state. Tests: wifi-sim scenarios 35-37, tools/op2netd-test/run.sh (host, curl).
@@ -64,7 +64,8 @@ delegation refusals (dasd) and code-signing "allowing" page notes not logged at 
   networks join on tap, "..." menu (Advanced, change password, forget), connected network's details dropdown; Advanced =
   per-network settings in the networks file (auto=0 ip= mask= router= dns=a,b,c dnsauto=0 search=): manual IPv4 rides on
   "join ... static <ip> <mask> <router> <dns>" (8 hex each; step 7 skips DHCP), DNS/search go to configd via
-  op2_publish.h's publish_state.dns_list/search (op2shell leaves them empty = old behaviour).
+  op2_publish.h's publish_state.dns_list/search (op2shell leaves them empty = old behaviour). Page settings work on the
+  phone (user's report, README progress row 24). Built, not run yet: wifid trace (666c8a0) + Bluetooth step 1 (5c3a7fe).
   Status-bar Wi-Fi icon / Settings Wi-Fi (plan: make Apple's wifid see a Wi-Fi device, never patch SpringBoard): S0 =
   trace what wifid asks for, kept log lines "OP2 WIFID:" (boot-arg op2wifid=0 off): its IOKit matching, notifications,
   registry paths and opens (IOUserClient.cpp op2_iolog, own 150-line budget) and each distinct ioctl with interface

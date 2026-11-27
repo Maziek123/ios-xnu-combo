@@ -158,5 +158,5 @@ XNU truncates the command line at 255 bytes; the script refuses at 250.
 Boots to the Lock Screen and Home Screen, unlocks, touch and Home work, the UI is composited on the Adreno
 (`metal=3`). ~8 ms per present, SwapWait timeouts 0, ~1 % kernel CPU when idle, ~61 °C at 768 MHz.
 Serial shell + SSH over USB work. Open: brief partial frames while scrolling (being re-checked with double
-buffering back on), internet over USB works through the Mac's NAT (Wi-Fi: joins a WPA2 network since 2026-11-25 but is not a network interface for iOS yet, see README), no RTC, the crash loops listed in
+buffering back on), internet over USB works through the Mac's NAT (Wi-Fi: a network for iOS since 2026-11-26, networks chosen on the phone, see README), no RTC, the crash loops listed in
 `CLAUDE.md`. Next work: `docs/NEXT-PLAN.md`.
