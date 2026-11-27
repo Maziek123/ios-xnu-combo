@@ -83,7 +83,12 @@ delegation refusals (dasd) and code-signing "allowing" page notes not logged at 
   Wi-Fi in the same thread, "OP2 BT:" lines. 2026-11-27: chip once found RUNNING (reset already high, RX=1 vs
   pull-down; likely left on by Android) but silent after our reset: 1 s, then cold starts silent for 5 s, also with
   WLAN_EN high. Wi-Fi fine with BT held in reset, BUT a BT reset toggle + 5 s wait inside Wi-Fi's bringup() (after
-  WLAN_EN, before PCIe) broke PCIe link training: never touch BT between WLAN_EN and the PCIe link. Retry removed. UART = BLSP2 UART2 0xf995e000 (ttyHS0), pins 45-48
+  WLAN_EN, before PCIe) broke PCIe link training: never touch BT between WLAN_EN and the PCIe link. Retry removed.
+  bt=3 = step 2 (not run yet): bt_step2() clocks the UART (vote 0x1484 b15; RCG 0x0a4c ROOT_EN, M 192 N ~(15625-192)
+  D ~15625 CFG 0x2101 = GPLL0/1 dual edge -> 7.3728 MHz; CBCR 0x0a44), pins 45-48 func 2 16 mA, UART_DM v1.4 offsets
+  (msm_serial_hs_hwreg.h: CSR a0 SR a4 CR a8 IMR b0 ISR b4 TF 100 RF 140 NCF_TX 40 DMRX 34 RXFS 50), CSR 0xCC = 115200,
+  MR2 0x34, MR1 0 (RFR by command 0xD0), polled; chip reset released after; logs bytes by itself, to EDL getver
+  (01 00 fc 01 19) and HCI_Reset (01 03 0c 00). UART = BLSP2 UART2 0xf995e000 (ttyHS0), pins 45-48
   TX/RX/CTS/RFR func 2, GCC blsp2 ahb 0x0944 (vote 0x1484 bit 15), uart2 apps CBCR 0x0a44, RCG 0x0a4c; reset PM8994
   GPIO 19 (0xd200, mode 0x10 low / 0x11 high, vin 2). Plan: own HCI driver + op2netd page; iOS bluetoothd not used.
   The clock now syncs over the network (NTP), which fixes the old TLS-date problem while connected.

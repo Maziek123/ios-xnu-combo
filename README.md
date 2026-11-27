@@ -272,9 +272,10 @@ kept log; works with or without `wifi=`.
 |---|---|---|---|
 | probe | 1 | Reads the pins, the reset line, the supplies and the UART's clocks (its registers only if those run) | not run yet |
 | **1** out of reset | 2 | Supplies on; RX and CTS as plain inputs (pulled down / up); 200 ms watching the lines as found; reset low 50 ms, then high, 5 s watching for the chip's TX going high (idle) and its RTS going low (ready); back in reset | **FAIL so far.** First run (2026-11-27): the chip was found running (reset line already high, RX at 1 against a pull-down: its TX idling, so pin 46 is its TX; probably left on by an earlier Android boot), but after a reset nothing for 1 s. Two more runs started it cold (reset low, `bt_vreg` off): nothing in 5 s, nor in 5 s after Wi-Fi raised WLAN_EN. That retry, done inside Wi-Fi's power-up, broke Wi-Fi's PCIe link training for that boot, so it is removed. The device tree asks for nothing more than these supplies and the reset line. |
+| **2** talk to it | 3 | The UART clocked (BLSP2 AHB vote; UART2 clock 7.3728 MHz = GPLL0 × 192/15625), pins 45-48 on function 2, UART_DM v1.4 at 115200 8N1, polled, our RFR asserted. Chip held in reset while that is set up, then released: 500 ms of whatever it sends by itself, then Qualcomm's "get version" (`01 00 fc 01 19`, what Linux's `hci_qca` sends first) and HCI Reset (`01 03 0c 00`; the answer is `04 0e 04 01 03 0c 00`), all logged in hex. Back in reset. Runs instead of step 1. | not run yet |
 
-Next: the UART clocked (BLSP2 UART2 clock source, 115200 baud), HCI reset and the chip's version, then Qualcomm's
-patch and configuration download, then scanning; the phone's own page (op2netd) for pairing, as for Wi-Fi.
+Next: if step 2 gets no answer, the 32 kHz sleep clock the chip may need; if it answers, Qualcomm's patch and
+configuration download (step 3), then scanning; the phone's own page (op2netd) for pairing, as for Wi-Fi.
 
 ---
 

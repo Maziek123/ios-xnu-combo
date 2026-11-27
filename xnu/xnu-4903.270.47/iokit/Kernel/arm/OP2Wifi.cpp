@@ -42,6 +42,12 @@
  *      found the reset line already high and RX at 1: the chip running), then reset low 50 ms, high, and 5 s of
  *      watching. No UART clock, no data: success is one line. The chip is put back in reset. (A retry right after
  *      Wi-Fi raised WLAN_EN, 2026-11-27, saw nothing either and broke Wi-Fi's PCIe link training: removed.)
+ *   3  step 2: talk to it. The UART clocked (BLSP2 AHB vote, UART2 RCG 7.3728 MHz from GPLL0 = M/N 192/15625, branch on),
+ *      pins 45-48 on function 2, UART_DM v1.4 (msm_serial_hs_hwreg.h offsets) at 115200 8N1 (CSR 0xCC = /4), FIFO mode,
+ *      polled, our RFR asserted by command (no automatic flow control). With the chip held in reset first, then
+ *      released: whatever it sends by itself, then Qualcomm's "get version" (01 00 fc 01 19, what Linux's hci_qca
+ *      sends first) and HCI Reset (01 03 0c 00; the answer is 04 0e 04 01 03 0c 00), each with 500 ms for the
+ *      answer, logged in hex. Back in reset at the end. Runs instead of step 1.
  *
  * Sequence and values from the OnePlus msm8994 kernel (OnePlus2_14_A.12_160226):
  *   drivers/pci/host/pci-msm.c       msm_pcie_enable(), pcie_phy_init() (20nm QMP, 19.2 MHz),
@@ -132,10 +138,37 @@ extern "C" void op2_wifi_start(void);   /* called from op2_threaddump_start (osf
 #define W_BTUART_PHYS   0xf995e000ULL       /* UART_DM v1.4 (msm_serial_hs) */
 #define UDM_MR1         0x00
 #define UDM_MR2         0x04
+#define UDM_DMRX        0x34
+#define UDM_DMEN        0x3C
+#define UDM_NCF_TX      0x40
 #define UDM_TXFS        0x4C
 #define UDM_RXFS        0x50
+#define UDM_CSR         0xA0
 #define UDM_SR          0xA4
+#define UDM_CR          0xA8
+#define UDM_IMR         0xB0
 #define UDM_ISR         0xB4
+#define UDM_TF          0x100
+#define UDM_RF          0x140
+#define UDM_SR_RXRDY    (1u << 0)
+#define UDM_SR_TXRDY    (1u << 2)
+#define UDM_SR_TXEMT    (1u << 3)
+#define UDM_ISR_TXREADY (1u << 7)
+#define UDM_ISR_CTS     (1u << 6)   /* the current state of our CTS input = the chip's RTS */
+#define UDM_CR_RX_EN    (1u << 0)
+#define UDM_CR_RX_DIS   (1u << 1)
+#define UDM_CR_TX_EN    (1u << 2)
+#define UDM_CR_TX_DIS   (1u << 3)
+#define UDM_CMD_RESET_RX        0x10
+#define UDM_CMD_RESET_TX        0x20
+#define UDM_CMD_RESET_ERR       0x30
+#define UDM_CMD_RESET_BRK       0x40
+#define UDM_CMD_RESET_CTS       0x70
+#define UDM_CMD_RESET_STALE     0x80
+#define UDM_CMD_RFR_LOW         0xD0   /* RFR asserted: the chip may send */
+#define UDM_CMD_CLEAR_TX_READY  0x300
+#define UDM_CMD_FORCE_STALE     0x400
+#define UDM_CMD_STALE_ENABLE    0x500
 
 /* ---- PM8994 (SPMI SID 0) ---- */
 #define PM_SID          0
@@ -893,6 +926,246 @@ bt_step1(void)
 	bt_result(alive, found ? "before Wi-Fi; it was running as found" : "before Wi-Fi; silent as found too");
 }
 
+/* ---------------------------------------------------------------------------------------------------- */
+/* Bluetooth step 2 (bt=3): the UART and the first HCI commands                                          */
+
+static volatile uint32_t *gBtUart;
+
+static bool
+wait_bits(volatile uint32_t *b, uint32_t off, uint32_t mask, bool set, uint32_t us)
+{
+	for (uint32_t t = 0; t < us; t += 10) {
+		if (((rd(b, off) & mask) != 0) == set) {
+			return true;
+		}
+		IODelay(10);
+	}
+	return ((rd(b, off) & mask) != 0) == set;
+}
+
+/* BLSP2 AHB (voted) and UART2 core clock at 7.3728 MHz: GPLL0 (600 MHz, src 1) * 192 / 15625, dual-edge M/N */
+static bool
+bt_uart_clocks(char *why, size_t n)
+{
+	wr(gGcc, GCC_APCS_BRANCH_VOTE, rd(gGcc, GCC_APCS_BRANCH_VOTE) | (1u << 15));
+	if (!wait_bits(gGcc, GCC_BLSP2_AHB_CBCR, CBCR_OFF, false, 1000)) {
+		snprintf(why, n, "BLSP2 AHB clock stays off (cbcr %08x)", rd(gGcc, GCC_BLSP2_AHB_CBCR));
+		return false;
+	}
+	uint32_t r = GCC_BLSP2_UART2_CMD_RCGR;
+	wr(gGcc, r, rd(gGcc, r) | 2u);                  /* CMD: root enable (the update needs a running root) */
+	if (!wait_bits(gGcc, r, 1u << 31, false, 1000)) {
+		snprintf(why, n, "UART2 clock root stays off (cmd %08x cfg %08x): GPLL0?", rd(gGcc, r), rd(gGcc, r + 4));
+		return false;
+	}
+	wr(gGcc, r + 8, 192u);                          /* M */
+	wr(gGcc, r + 12, ~(15625u - 192u) & 0xffffu);   /* N: ~(n - m) */
+	wr(gGcc, r + 16, ~15625u & 0xffffu);            /* D: ~n */
+	wr(gGcc, r + 4, 1u | (1u << 8) | (2u << 12));   /* CFG: pre-divider 1, source GPLL0, dual edge */
+	wr(gGcc, r, rd(gGcc, r) | 1u);                  /* CMD: update */
+	if (!wait_bits(gGcc, r, 1u, false, 1000)) {
+		snprintf(why, n, "UART2 clock: the RCG update never finished (cmd %08x cfg %08x)", rd(gGcc, r), rd(gGcc, r + 4));
+		return false;
+	}
+	wr(gGcc, GCC_BLSP2_UART2_APPS_CBCR, rd(gGcc, GCC_BLSP2_UART2_APPS_CBCR) | 1u);
+	if (!wait_bits(gGcc, GCC_BLSP2_UART2_APPS_CBCR, CBCR_OFF, false, 1000)) {
+		snprintf(why, n, "UART2 core clock stays off (cbcr %08x, rcg cmd %08x cfg %08x)",
+		    rd(gGcc, GCC_BLSP2_UART2_APPS_CBCR), rd(gGcc, r), rd(gGcc, r + 4));
+		return false;
+	}
+	B_LOG("2: clocks on: blsp2 ahb %08x, uart2 apps %08x, rcg cmd %08x cfg %08x m %08x n %08x d %08x (7.3728 MHz)",
+	    rd(gGcc, GCC_BLSP2_AHB_CBCR), rd(gGcc, GCC_BLSP2_UART2_APPS_CBCR), rd(gGcc, r), rd(gGcc, r + 4),
+	    rd(gGcc, r + 8), rd(gGcc, r + 12), rd(gGcc, r + 16));
+	return true;
+}
+
+/* UART_DM v1.4, FIFO mode, polled: 115200 8N1, no automatic flow control, RFR asserted */
+static void
+bt_uart_init(void)
+{
+	volatile uint32_t *u = gBtUart;
+	wr(u, UDM_CR, UDM_CR_RX_DIS | UDM_CR_TX_DIS);
+	wr(u, UDM_CR, UDM_CMD_RESET_RX);
+	wr(u, UDM_CR, UDM_CMD_RESET_TX);
+	wr(u, UDM_CR, UDM_CMD_RESET_ERR);
+	wr(u, UDM_CR, UDM_CMD_RESET_BRK);
+	wr(u, UDM_CR, UDM_CMD_RESET_CTS);
+	wr(u, UDM_CR, UDM_CMD_RESET_STALE);
+	wr(u, UDM_DMEN, 0);
+	wr(u, UDM_IMR, 0);
+	wr(u, UDM_MR1, 0);
+	wr(u, UDM_MR2, 0x34u);   /* 8 bits, 1 stop bit, no parity */
+	wr(u, UDM_CSR, 0xCCu);   /* 7.3728 MHz / 16 / 4 = 115200 */
+	wr(u, UDM_CR, UDM_CMD_RFR_LOW);
+	wr(u, UDM_DMRX, 0xFFFFFFu);
+	wr(u, UDM_CR, UDM_CMD_STALE_ENABLE);
+	wr(u, UDM_CR, UDM_CR_RX_EN | UDM_CR_TX_EN);
+}
+
+static bool
+bt_uart_send(const uint8_t *b, uint32_t n)
+{
+	volatile uint32_t *u = gBtUart;
+	for (uint32_t t = 0; t < 20000 && !(rd(u, UDM_SR) & UDM_SR_TXEMT); t += 10) {
+		if (rd(u, UDM_ISR) & UDM_ISR_TXREADY) {
+			break;
+		}
+		IODelay(10);
+	}
+	wr(u, UDM_CR, UDM_CMD_CLEAR_TX_READY);
+	wr(u, UDM_NCF_TX, n);
+	(void)rd(u, UDM_NCF_TX);
+	for (uint32_t i = 0; i < n; i += 4) {
+		if (!wait_bits(u, UDM_SR, UDM_SR_TXRDY, true, 20000)) {
+			return false;
+		}
+		uint32_t w = 0;
+		for (uint32_t k = 0; k < 4 && i + k < n; k++) {
+			w |= (uint32_t)b[i + k] << (8 * k);
+		}
+		wr(u, UDM_TF, w);
+	}
+	return wait_bits(u, UDM_SR, UDM_SR_TXEMT, true, 20000);   /* gone out of the shifter (at 115200: 87 us a byte) */
+}
+
+/* whatever arrives in ms milliseconds (full FIFO words, then a partial word pushed out by a forced stale event) */
+static uint32_t
+bt_uart_recv(uint8_t *out, uint32_t max, uint32_t ms)
+{
+	volatile uint32_t *u = gBtUart;
+	uint32_t got = 0, quiet = 0;
+	for (uint32_t t = 0; t < ms * 10; t++) {   /* 100 us steps */
+		if (rd(u, UDM_SR) & UDM_SR_RXRDY) {
+			uint32_t w = rd(u, UDM_RF);
+			for (uint32_t k = 0; k < 4 && got < max; k++) {
+				out[got++] = (uint8_t)(w >> (8 * k));
+			}
+			quiet = 0;
+			continue;
+		}
+		uint32_t pend = (rd(u, UDM_RXFS) >> 7) & 7u;   /* characters in the packing buffer (less than a word) */
+		if (pend != 0 && ++quiet >= 20) {           /* 2 ms with no new word: the rest of a message */
+			wr(u, UDM_CR, UDM_CMD_FORCE_STALE);
+			IODelay(50);
+			uint32_t w = rd(u, UDM_RF);
+			for (uint32_t k = 0; k < pend && k < 4 && got < max; k++) {
+				out[got++] = (uint8_t)(w >> (8 * k));
+			}
+			wr(u, UDM_CR, UDM_CMD_RESET_STALE);
+			wr(u, UDM_DMRX, 0xFFFFFFu);
+			wr(u, UDM_CR, UDM_CMD_STALE_ENABLE);
+			quiet = 0;
+		}
+		IODelay(100);
+	}
+	return got;
+}
+
+static void
+hex_line(char *out, size_t n, const uint8_t *b, uint32_t len)
+{
+	size_t o = 0;
+	out[0] = '\0';
+	for (uint32_t i = 0; i < len && o + 4 < n; i++) {
+		o += (size_t)snprintf(out + o, n - o, "%s%02x", i ? " " : "", b[i]);
+	}
+	if (len == 0) {
+		snprintf(out, n, "nothing");
+	}
+}
+
+/* send a command, log the answer; the number of bytes that came back */
+static uint32_t
+bt_hci(const char *what, const uint8_t *cmd, uint32_t n, uint8_t *ans, uint32_t max)
+{
+	char h[200], a[220];
+	hex_line(h, sizeof(h), cmd, n);
+	if (!bt_uart_send(cmd, n)) {
+		B_LOG("2: %s: sending %s: the UART did not take it (sr %08x isr %08x txfs %08x)", what, h, rd(gBtUart, UDM_SR),
+		    rd(gBtUart, UDM_ISR), rd(gBtUart, UDM_TXFS));
+		return 0;
+	}
+	uint32_t got = bt_uart_recv(ans, max, 500);
+	hex_line(a, sizeof(a), ans, got);
+	B_LOG("2: %s: sent %s; %u bytes back: %s (sr %08x, cts %s)", what, h, got, a, rd(gBtUart, UDM_SR),
+	    (rd(gBtUart, UDM_ISR) & UDM_ISR_CTS) ? "1" : "0");
+	return got;
+}
+
+static void
+bt_step2(void)
+{
+	char why[200], a[220];
+	uint8_t ans[96];
+	if (!ldo_on(30, 1800000, 0)) {
+		bt_summary("BT STEP 2 FAIL: RPM did not ack L30 (vdd-bt-xtal)");
+		return;
+	}
+	const char *vr = bt_vreg_on(true);
+	if (vr != NULL) {
+		bt_summary(vr);
+		return;
+	}
+	if (!bt_reset_line(false)) {   /* the chip held in reset while the UART is set up */
+		bt_summary("BT STEP 2 FAIL: SPMI access to PM8994 GPIO 19 (Bluetooth reset)");
+		return;
+	}
+	if (!bt_uart_clocks(why, sizeof(why))) {
+		snprintf(a, sizeof(a), "BT STEP 2 FAIL: %s", why);
+		bt_summary(a);
+		return;
+	}
+	if (gBtUart == NULL) {
+		gBtUart = (volatile uint32_t *)ml_io_map(W_BTUART_PHYS, 0x1000);
+	}
+	if (gBtUart == NULL) {
+		bt_summary("BT STEP 2 FAIL: ml_io_map of the UART");
+		return;
+	}
+	for (uint32_t p = PIN_BT_TX; p <= PIN_BT_RFR; p++) {   /* blsp2_uart2_active: function 2, 16 mA, no pull */
+		wr(gTlmm, TLMM_CFG(p), (2u << 2) | (7u << 6));
+	}
+	bt_uart_init();
+	IOSleep(50);
+	B_LOG("2: UART up (115200 8N1, polled): sr %08x isr %08x mr1 %08x mr2 %08x rxfs %08x; chip in reset, cts %s",
+	    rd(gBtUart, UDM_SR), rd(gBtUart, UDM_ISR), rd(gBtUart, UDM_MR1), rd(gBtUart, UDM_MR2), rd(gBtUart, UDM_RXFS),
+	    (rd(gBtUart, UDM_ISR) & UDM_ISR_CTS) ? "1" : "0");
+	uint32_t junk = bt_uart_recv(ans, sizeof(ans), 20);   /* line noise from the pin change */
+	if (!bt_reset_line(true)) {
+		bt_summary("BT STEP 2 FAIL: SPMI write to PM8994 GPIO 19 (Bluetooth reset)");
+		return;
+	}
+	uint32_t got = bt_uart_recv(ans, sizeof(ans), 500);
+	hex_line(a, sizeof(a), ans, got);
+	B_LOG("2: out of reset (%u bytes of noise before): 500 ms: %u bytes by itself: %s (sr %08x, cts %s)", junk, got, a,
+	    rd(gBtUart, UDM_SR), (rd(gBtUart, UDM_ISR) & UDM_ISR_CTS) ? "1" : "0");
+	static const uint8_t getver[] = { 0x01, 0x00, 0xfc, 0x01, 0x19 };   /* Qualcomm EDL_PATCH_GETVER */
+	static const uint8_t reset[] = { 0x01, 0x03, 0x0c, 0x00 };          /* HCI_Reset */
+	uint32_t v = bt_hci("get version", getver, sizeof(getver), ans, sizeof(ans));
+	uint32_t r = bt_hci("HCI reset", reset, sizeof(reset), ans, sizeof(ans));
+	bool reset_ok = false;
+	for (uint32_t i = 0; i + 7 <= r; i++) {
+		if (ans[i] == 0x04 && ans[i + 1] == 0x0e && ans[i + 3] == 0x01 && ans[i + 4] == 0x03 && ans[i + 5] == 0x0c) {
+			reset_ok = ans[i + 6] == 0x00;
+			snprintf(a, sizeof(a), "BT STEP 2 PASS: the chip answers over the UART: HCI Reset complete (status %02x)%s",
+			    ans[i + 6], v ? ", get version answered too" : "");
+			break;
+		}
+	}
+	if (!reset_ok) {
+		if (v + r + got > 0) {
+			snprintf(a, sizeof(a), "BT STEP 2: the chip sends something (%u, %u and %u bytes) but no HCI Reset complete: "
+			    "see the lines above", got, v, r);
+		} else {
+			snprintf(a, sizeof(a), "BT STEP 2 FAIL: no byte from the chip at 115200 (by itself, to get version, to HCI "
+			    "Reset); cts %s", (rd(gBtUart, UDM_ISR) & UDM_ISR_CTS) ? "1" : "0");
+		}
+	}
+	(void)bt_reset_line(false);   /* back in reset until the next step needs it */
+	wr(gBtUart, UDM_CR, UDM_CR_RX_DIS | UDM_CR_TX_DIS);
+	bt_summary(a);
+}
+
 static void
 bringup(void)
 {
@@ -1055,9 +1328,12 @@ wifi_thread(__unused void *param, __unused wait_result_t wr_)
 	gDbi = (volatile uint32_t *)ml_io_map(W_DBI_PHYS, 0x1000);
 	gConf = (volatile uint32_t *)ml_io_map(W_CONF_PHYS, 0x1000);
 	if (gGcc && gTlmm && gBtMode >= 1) {
-		B_LOG("mode %u (%s)", gBtMode, gBtMode == 1 ? "read-only probe" : "step 1: out of reset, the UART lines");
+		B_LOG("mode %u (%s)", gBtMode, gBtMode == 1 ? "read-only probe" : gBtMode == 2 ?
+		    "step 1: out of reset, the UART lines" : "step 2: the UART, HCI commands");
 		bt_dump("before");
-		if (gBtMode >= 2) {
+		if (gBtMode >= 3) {
+			bt_step2();
+		} else if (gBtMode == 2) {
 			bt_step1();
 		} else {
 			bt_summary("probe only (bt=1): states above; bt=2 takes the chip out of reset");
